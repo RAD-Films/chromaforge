@@ -50,6 +50,19 @@ fn lut_at(o: u32, x: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// Process V8's Highlights / Shadows shift at base tone `ev` (`tone_lift::Lift::at`).
+fn lift_at(ev: f32) -> f32 {
+    let o = pu(F_LIFT_OFF);
+    let n = pu(F_LIFT_N);
+    var f = clamp((ev - pf(F_LIFT_LO)) / pf(F_LIFT_STEP), 0.0, f32(n - 1u));
+    if (!(f == f)) {
+        f = 0.0;
+    }
+    let i = min(u32(f), n - 2u);
+    let t = f - f32(i);
+    return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
 // `finish::eval_curves` on one channel: for HDR renders (`hdr`) a value above SDR white continues
 // with slope 1 from the curve's end point.
 fn lut_hdr(o: u32, x: f32, hdr: bool) -> f32 {
@@ -804,8 +817,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shift = l1 - l0;
     let base = base_p[i] + ev + shift;
     var delta = 0.0;
-    let hh = pf(F_HL) + lt[4];
-    let ss = pf(F_SH) + lt[5];
+    var hh = pf(F_HL) + lt[4];
+    var ss = pf(F_SH) + lt[5];
+    // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
+    if (pu(F_LIFT) != 0u) {
+        delta += lift_at(base);
+        hh = lt[4];
+        ss = lt[5];
+    }
     if (hh != 0.0 || ss != 0.0) {
         let ws = 1.0 - sstep(-4.8, 0.3, base);
         let wh = sstep(-2.4, 1.0, base) * (1.0 - 0.7 * sstep(1.4, 3.2, base));

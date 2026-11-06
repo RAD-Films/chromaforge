@@ -222,6 +222,16 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.grading.blending = 70.0;
             s.grading.balance = 20.0;
         }),
+        ("highlights/shadows ±100 (V8 curve)", |s| {
+            s.process = lcc_develop::Process::V8.version();
+            s.light.shadows = 100.0;
+            s.light.highlights = -100.0;
+        }),
+        ("highlights/shadows (V7 response)", |s| {
+            s.process = lcc_develop::Process::V7.version();
+            s.light.shadows = 70.0;
+            s.light.highlights = -70.0;
+        }),
         ("tone curves", |s| {
             s.curve.highlights = -30.0;
             s.curve.shadows = 25.0;
@@ -1808,8 +1818,9 @@ fn refine_edges_and_feather_match() {
         check(&format!("refine {refine} feather {feather}"), &src, &raw, &s, &RenderRequest::fit(640, 640));
         let gpu = |s: &DevelopSettings| lcc_gpu::render(&src, &raw, s, &RenderRequest::fit(640, 640), None).expect("gpu render").image;
         let plain = DevelopSettings { masks: s.masks.iter().map(|m| Mask { refine: 0.0, feather: 0.0, ..m.clone() }).collect(), ..s.clone() };
-        // (a light refine barely moves a soft radial edge; a strong one or a feather visibly does)
-        assert!(refine < 50.0 && feather == 0.0 || diff(&gpu(&s), &gpu(&plain)).1 > 3, "refine {refine} / feather {feather} change the mask");
+        // (a light refine barely moves a soft radial edge; a strong one or a feather visibly does: process V8's
+        // Highlights / Shadows curve, which compresses this scene's tones a little more than V7's, leaves 3 levels)
+        assert!(refine < 50.0 && feather == 0.0 || diff(&gpu(&s), &gpu(&plain)).1 >= 3, "refine {refine} / feather {feather} change the mask");
     }
 }
 

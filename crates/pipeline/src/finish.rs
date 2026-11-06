@@ -299,6 +299,10 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     pub hl: f32,
     pub sh: f32,
+    /// Process V8's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
+    /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
+    /// render's plan.
+    pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -374,7 +378,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 => true,
+            Process::V7 | Process::V8 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -405,6 +409,7 @@ impl FinishParams {
             proof: None,
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
+            lift: None,
             clar,
             tex,
             dehaze,
@@ -458,17 +463,34 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     base_tone_at(s, info, peak)
 }
 
+/// Whether `s` tones `info`'s source as a raw (scene-referred): a Source filter that renders a finished picture (a
+/// negative conversion) is shown as it is, like a JPEG, not toned again as a raw.
+fn tones_as_raw(s: &DevelopSettings, info: &SourceInfo) -> bool {
+    info.raw
+        && !(crate::plugin_filters::any_active(s)
+            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone())
+}
+
+/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V8's
+/// Highlights / Shadows curve is applied in ([`crate::tone_lift`]); `None` for a display-referred source.
+pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
+    if !tones_as_raw(s, info) {
+        return None;
+    }
+    let mut d = s.clone();
+    d.light.contrast = 0.0;
+    d.light.whites = 0.0;
+    d.light.blacks = 0.0;
+    Some(base_tone_at(&d, info, 1.0))
+}
+
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     let l = &s.light;
-    // a Source filter that renders a finished picture (a negative conversion) is shown as it is,
-    // like a JPEG, not toned again as a raw
-    let raw = info.raw
-        && !(crate::plugin_filters::any_active(s)
-            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone());
+    let raw = tones_as_raw(s, info);
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
             match info.camera_tone.as_ref().filter(|_| raw) {
                 Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
                 None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
@@ -533,6 +555,7 @@ pub(crate) fn finish(
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -563,6 +586,7 @@ pub(crate) fn finish_deep(
     use lcc_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -629,6 +653,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let sharpen_v4 = *sharpen_v4;
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
+    let lift = fp.lift.as_deref();
     let (sharpen_limit, sharpen_fade) = (*sharpen_limit, *sharpen_fade);
     let mut terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     with_tone(&mut terms, &p.mask_tone);
@@ -755,7 +780,13 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let shift = l1 - l0;
             let base = p.base.data[i] + ev + shift;
             let mut delta = 0.0f32;
-            let (hh, ss) = (hl + l_hl, sh + l_sh);
+            // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
+            let (hh, ss) = if let Some(lf) = lift {
+                delta += lf.at(base);
+                (l_hl, l_sh)
+            } else {
+                (hl + l_hl, sh + l_sh)
+            };
             if hh != 0.0 || ss != 0.0 {
                 let ws = 1.0 - smooth(-4.8, 0.3, base);
                 // Highlights reach down into the upper midtones and ease off towards white (fitted to

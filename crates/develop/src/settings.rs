@@ -237,6 +237,9 @@ pub enum Process {
     /// with Size Variation, Clumping, Color and Response, calibrated against Lightroom Classic exports
     /// (OneSlips); V1–V6 keep their value-noise grain.
     V7,
+    /// The global Highlights and Shadows follow Lightroom Classic's: one tone curve per picture, its shape taken from
+    /// the picture's own histogram (fitted to Lightroom Classic exports of our own procedural pictures; OneSlips).
+    V8,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -246,14 +249,14 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V8 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 7] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7];
-    pub const LATEST: Process = Process::V7;
+    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8];
+    pub const LATEST: Process = Process::V8;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -264,6 +267,7 @@ impl Process {
             Process::V5 => ProcessVersion(5),
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
+            Process::V8 => ProcessVersion(8),
         }
     }
 }

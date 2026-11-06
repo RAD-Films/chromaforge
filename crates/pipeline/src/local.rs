@@ -381,7 +381,7 @@ pub const DEHAZE_PATCH_MAX: usize = 64;
 pub fn dehaze_patch_radius(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 | Process::V2 => 0,
-        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {
+        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
             ((DEHAZE_PATCH * px_per_long).round().max(1.0) as usize).min(DEHAZE_PATCH_MAX)
         }
     }
@@ -440,7 +440,7 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => base_detail_radius(px_per_long),
+        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => base_detail_radius(px_per_long),
     }
 }
 
@@ -984,7 +984,21 @@ pub(crate) fn prepare(
             e
         }
     };
-    Prepared { img, log_l, base, clarity_blur, texture_blur, sharpen_blur, dark, chroma_blur, air, masks, mask_tone: Vec::new(), px_per_long }
+    Prepared {
+        img,
+        log_l,
+        base,
+        clarity_blur,
+        texture_blur,
+        sharpen_blur,
+        dark,
+        chroma_blur,
+        air,
+        masks,
+        mask_tone: Vec::new(),
+        tone_lift: None,
+        px_per_long,
+    }
 }
 
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):

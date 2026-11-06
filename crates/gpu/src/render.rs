@@ -835,6 +835,7 @@ pub fn render(
 
     // 5. per-pixel stage
     let mut fp = FinishParams::new(s, &plan.frame, info, w, h, plan.px_per_long, prep.air, req.space);
+    fp.lift = plan.tone_lift.clone();
     // soft proofing as the CPU's `finish` sets it up (an output-device table never gets here: see `render`)
     fp.proof = req.proof.map(|pr| pr.params(req.space));
     // (a deep render is in the output space, as on the CPU: `finish::finish_deep`)
