@@ -7,6 +7,7 @@ use serde_json::json;
 use crate::headless::Headless;
 use crate::panels::edit::StackedCurve;
 use crate::{LccApp, Services};
+use lcc_develop::Process;
 use lcc_pipeline::ParametricCurve;
 
 const T: Duration = Duration::from_secs(20);
@@ -271,7 +272,7 @@ fn the_parametric_graph_paints_the_model_the_renderer_uses() {
     assert_eq!(settings, c, "the sliders hold the folded shape");
     let graph = curve_graph_rect(&mut h);
     let painted = painted_param_curve(&h, graph);
-    let model = ParametricCurve::new(&c);
+    let model = ParametricCurve::for_process(&c, Process::LATEST);
     let mut checked = 0;
     for i in 0..=24 {
         let x = i as f64 / 24.0;
@@ -300,7 +301,7 @@ fn the_parametric_graph_shows_the_point_curve_preset() {
     assert!(dark < 0.22 && light > 0.78, "the line is the preset's S-curve: {dark} at 0.25, {light} at 0.75");
     let r = curve_graph_rect(&mut h);
     let painted = painted_param_curve(&h, r);
-    let model = StackedCurve::new(&c);
+    let model = StackedCurve::new(&c, Process::LATEST);
     for i in 0..=24 {
         let x = i as f64 / 24.0;
         assert!((painted(x) - model.at(x)).abs() < 0.02, "the painted curve is the stacked one at {x}: {} vs {}", painted(x), model.at(x));
@@ -318,7 +319,7 @@ fn dragging_the_curve_over_a_point_curve_preset_moves_the_region_slider() {
     h.step();
     let r = curve_graph_rect(&mut h);
     let c = develop(&h).curve;
-    let model = StackedCurve::new(&c);
+    let model = StackedCurve::new(&c, Process::LATEST);
     let (x, fx) = (r[0] + 0.625 * r[2], 0.625);
     let y = r[1] + (1.0 - model.at(fx) as f32) * r[3];
     let to = y - 0.05 * r[3];
@@ -340,13 +341,13 @@ fn dragging_the_curve_over_a_point_curve_preset_moves_the_region_slider() {
 fn the_stacked_curve_inverts_its_point_curve() {
     let master = [(0.0, 0.0), (0.25, 0.2), (0.5, 0.5), (0.75, 0.8), (1.0, 1.0)].map(|(x, y)| lcc_geom::Point::new(x, y)).to_vec();
     let c = lcc_develop::ToneCurve { master, ..Default::default() };
-    let s = StackedCurve::new(&c);
+    let s = StackedCurve::new(&c, Process::LATEST);
     for i in 1..20 {
         let y = i as f64 / 20.0;
         let back = s.master_at(s.param_level(y));
         assert!((back - y).abs() < 1e-6, "the master curve takes param_level({y}) back to {y}: {back}");
     }
-    assert_eq!(StackedCurve::new(&lcc_develop::ToneCurve::default()).param_level(0.3), 0.3, "no point curve, no change");
+    assert_eq!(StackedCurve::new(&lcc_develop::ToneCurve::default(), Process::LATEST).param_level(0.3), 0.3, "no point curve, no change");
 }
 
 /// The graph rect as `[left, top, width, height]` plus a reader for the painted curve's height at a
@@ -459,7 +460,7 @@ fn one_graph_drag_that_moves_several_regions_is_one_undo_step() {
 
 /// The screen point where a drag should grab the curve: graph fraction `fx`, on the line itself.
 fn on_curve(r: [f32; 4], c: &lcc_develop::ToneCurve, fx: f32) -> [f32; 2] {
-    let y = ParametricCurve::new(c).at(fx as f64);
+    let y = ParametricCurve::for_process(c, Process::LATEST).at(fx as f64);
     [r[0] + fx * r[2], r[1] + (1.0 - y as f32) * r[3]]
 }
 
@@ -487,7 +488,7 @@ fn dragging_the_curve_moves_the_region_slider() {
     // the graph really is redrawn below where the line was
     let graph = curve_graph_rect(&mut h);
     let painted = painted_param_curve(&h, graph)(0.625);
-    let before_level = ParametricCurve::new(&c).at(0.625);
+    let before_level = ParametricCurve::for_process(&c, Process::LATEST).at(0.625);
     assert!(painted < before_level - 0.02, "the painted line followed the drag down: {painted} vs before {before_level}");
     // and Undo takes the whole gesture back to where it started
     exec(&mut h, "edit.undo", json!({}));
@@ -531,7 +532,10 @@ fn dragging_the_curve_up_raises_the_region_slider() {
     let after = develop(&h).curve;
     assert!(after.darks > 0.0, "the Darks slider follows the line up: {}", after.darks);
     assert_eq!((after.shadows, after.lights, after.highlights), (0.0, 0.0, 0.0), "the other regions stay put: {after:?}");
-    assert!(ParametricCurve::new(&after).at(0.375) > ParametricCurve::new(&c).at(0.375), "the curve is drawn bent up at the Darks region");
+    assert!(
+        ParametricCurve::for_process(&after, Process::LATEST).at(0.375) > ParametricCurve::for_process(&c, Process::LATEST).at(0.375),
+        "the curve is drawn bent up at the Darks region"
+    );
 }
 
 /// Which region a drag moves is decided by where on the line it is grabbed: the same drag gesture
@@ -544,7 +548,7 @@ fn the_region_dragged_is_the_one_under_the_pointer() {
         let mut h = curve_open("parametric");
         let r = curve_graph_rect(&mut h);
         let c = develop(&h).curve;
-        assert_eq!(ParametricCurve::new(&c).region_at(fx as f64), region, "x = {fx} belongs to {control}");
+        assert_eq!(ParametricCurve::for_process(&c, Process::LATEST).region_at(fx as f64), region, "x = {fx} belongs to {control}");
         let [x, y] = on_curve(r, &c, fx);
         let d = h.request("ui.drag", json!({"x": x, "y": y, "toX": x, "toY": y - 0.06 * r[3], "steps": 6}), T);
         assert_eq!(d["ok"], true, "{d}");
@@ -611,21 +615,30 @@ fn hovering_the_line_names_the_region_it_would_move() {
 #[test]
 fn a_curve_level_and_its_amount_are_inverses() {
     let c = lcc_develop::ToneCurve { shadows: 20.0, lights: 40.0, ..Default::default() };
-    let model = ParametricCurve::new(&c);
-    for region in 0..4 {
-        let centre = model.region_x(region);
-        // the region's window centre, and a point off-centre inside the same window
-        for x in [centre, centre + (model.split_x(region) - centre) * 0.5] {
-            for amount in [-100.0, -40.0, 0.0, 30.0, 100.0] {
-                let level = model.handle_level_at(region, amount, x);
-                let back = model.amount_at_level(region, level, x);
-                assert!((back - amount).abs() <= 1.0, "region {region} at {x}: {amount} → {level} → {back}");
+    for process in [Process::V7, Process::LATEST] {
+        let model = ParametricCurve::for_process(&c, process);
+        for region in 0..4 {
+            let centre = model.region_x(region);
+            // the region's window centre, and a point off-centre inside the same window
+            for x in [centre, centre + (model.split_x(region) - centre) * 0.5] {
+                for amount in [-100.0, -40.0, 0.0, 30.0, 100.0] {
+                    let level = model.handle_level_at(region, amount, x);
+                    let back = model.amount_at_level(region, level, x);
+                    // where V8's curve is pinned at white or black several amounts give the level: any of them will do
+                    let same = (model.handle_level_at(region, back, x) - level).abs() < 2e-3;
+                    assert!((back - amount).abs() <= 1.0 || same, "region {region} at {x}: {amount} → {level} → {back}");
+                }
             }
         }
+        let centre = model.region_x(3);
+        // V8's Highlights reach white before +100: any amount that puts the line there is the answer
+        let (hi, lo) = (model.amount_at_level(3, 1.0, centre), model.amount_at_level(3, 0.0, centre));
+        assert!(hi == 100.0 || (model.handle_level_at(3, hi, centre) - 1.0).abs() < 2e-3, "a level above the region's reach saturates high: {hi}");
+        assert!(
+            lo == -100.0 || model.handle_level_at(3, lo, centre) <= model.handle_level_at(3, -100.0, centre) + 2e-3,
+            "and one below saturates low: {lo}"
+        );
     }
-    let centre = model.region_x(3);
-    assert_eq!(model.amount_at_level(3, 1.0, centre), 100.0, "a level above the region's reach saturates high");
-    assert_eq!(model.amount_at_level(3, 0.0, centre), -100.0, "and one below saturates low");
 }
 
 /// The four regions tile the graph: every position belongs to exactly one of them, in order, so a

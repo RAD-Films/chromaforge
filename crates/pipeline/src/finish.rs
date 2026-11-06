@@ -82,7 +82,7 @@ fn eval_curves(l: &[Lut1; 3], e: [f32; 3], hdr: bool) -> [f32; 3] {
 }
 
 /// Parametric region curve (encoded domain) composed with the master point curve.
-fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
+fn curve_luts(c: &ToneCurve, process: Process) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
     let master = !ToneCurve::point_curve_is_identity(&c.master);
     let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
@@ -90,7 +90,7 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         return None;
     }
     const N: usize = CURVE_LUT_N;
-    let mut base = crate::curve::ParametricCurve::new(c).to_lut();
+    let mut base = crate::curve::ParametricCurve::for_process(c, process).to_lut();
     let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
     if master {
         base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);
@@ -400,7 +400,7 @@ impl FinishParams {
             ops: ColorOps::new(s),
             local_points: crate::colorops::mask_point_ks(s),
             local_mixers: crate::colorops::mask_mixer_ks(s),
-            curves: curve_luts(&s.curve),
+            curves: curve_luts(&s.curve, s.process.process()),
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),
