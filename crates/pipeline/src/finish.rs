@@ -490,6 +490,8 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
+        // V8: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
+        Process::V8 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
             match info.camera_tone.as_ref().filter(|_| raw) {
                 Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),

@@ -8,6 +8,12 @@
 //! neutral settings (an unedited JPEG renders exactly as the file), with contrast/whites/blacks as
 //! S-curve adjustments in a gamma-2.2 perceptual domain and a short shoulder above 0.95.
 
+mod lrc_tables;
+
+use std::sync::OnceLock;
+
+use lcc_color::spline::MonotoneCurve;
+
 pub const GREY: f32 = 0.18;
 /// The tone LUT spans `LUT_MIN_EV..LUT_MAX_EV` around grey in `LUT_N` steps.
 pub const LUT_MIN_EV: f32 = -14.0;
@@ -233,6 +239,36 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
+    /// Process V8's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
+    /// follow Lightroom Classic's responses measured on a grey wedge of our own ([`lrc_tables`]); Contrast is
+    /// [`ToneMap::display`]'s. `exposure` (EV) is the gain already in the luminance this table is read at, so a
+    /// brighter Exposure rolls the highlights off as Lightroom does instead of clipping them. Exposure down stays a
+    /// plain gain (not measured). Identity at neutral settings.
+    pub fn display_lrc(contrast: f64, whites: f64, blacks: f64, exposure: f64) -> ToneMap {
+        let c = if contrast.is_finite() { (contrast.clamp(-100.0, 100.0) / 100.0) as f32 } else { 0.0 };
+        let (w, b) = (whites.clamp(-100.0, 100.0), blacks.clamp(-100.0, 100.0));
+        let (w, b) = (if w.is_nan() { 0.0 } else { w }, if b.is_nan() { 0.0 } else { b });
+        let e = if exposure.is_finite() { exposure.clamp(-10.0, 10.0) as f32 } else { 0.0 };
+        let gain = e.exp2();
+        let m = GREY.powf(1.0 / 2.2);
+        let lut = (0..LUT_N)
+            .map(|i| {
+                let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
+                let y = GREY * 2f32.powf(ev);
+                // the source's own value, before the Exposure gain
+                let x = y / gain;
+                let shown = if e > 0.0 && x <= 1.0 { lrc_exposure(e, x) } else { y };
+                let mut p = shown.max(0.0).powf(1.0 / 2.2);
+                if p <= 1.0 {
+                    p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
+                }
+                p = lrc_w_b(p.clamp(0.0, 1.0), w, b);
+                p.clamp(0.0, 1.0).powf(2.2)
+            })
+            .collect();
+        ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
+    }
+
     /// Fits an HDR tone map reaching `peak` into SDR (own design, issue #69). Display values up to
     /// the knee `k` ([`ROLLOFF_KNEE`]) stay as they are; above it the shoulder works in stops over
     /// the knee, `v = log2(o/k)`, which run from 0 to `V = log2(peak/k)` and are fitted into
@@ -324,6 +360,77 @@ fn w_b_shift(p: f32, w: f32, b: f32) -> f32 {
         d += b.abs() * wb_at(if b > 0.0 { &BLACKS_UP } else { &BLACKS_DOWN }, p);
     }
     d
+}
+
+/// The measured responses as monotone splines: Exposure (sRGB in → sRGB out) at [`lrc_tables::EXP_EV`], then
+/// Whites and Blacks (display value in → out) at −100, −50, +50, +100.
+struct Lrc {
+    exposure: Vec<MonotoneCurve>,
+    w_b: [[MonotoneCurve; 4]; 2],
+}
+
+fn lrc() -> &'static Lrc {
+    static CURVES: OnceLock<Lrc> = OnceLock::new();
+    CURVES.get_or_init(|| {
+        let pts = |xs: &[f32], ys: &[f32], shift: bool| -> MonotoneCurve {
+            let p: Vec<(f64, f64)> = xs.iter().zip(ys).map(|(&x, &y)| (x as f64, if shift { x + y } else { y } as f64)).collect();
+            MonotoneCurve::new(&p)
+        };
+        Lrc {
+            exposure: lrc_tables::EXP_Y.iter().map(|ys| pts(&lrc_tables::EXP_X, ys, false)).collect(),
+            w_b: std::array::from_fn(|s| {
+                std::array::from_fn(|a| {
+                    lrc_tables::WB_SHIFT.get(s).and_then(|t| t.get(a)).map_or_else(MonotoneCurve::identity, |ys| pts(&lrc_tables::WB_P, ys, true))
+                })
+            }),
+        }
+    })
+}
+
+/// Linear value `x` (0..1) of a display-referred source after Lightroom's Exposure `e` (> 0 EV): read off the
+/// curves measured at 0.5, 1 and 2 EV, straight between them (from the unchanged picture at 0); above 2 EV the
+/// 2 EV curve is read at the value the remaining gain gives.
+fn lrc_exposure(e: f32, x: f32) -> f32 {
+    let srgb = |v: f32| lcc_color::transfer::linear_to_srgb(v.clamp(0.0, 1.0));
+    let curves = &lrc().exposure;
+    let at = |k: usize, v: f32| curves.get(k).map_or(srgb(v), |c| c.eval(srgb(v) as f64) as f32);
+    let evs = lrc_tables::EXP_EV;
+    let out = if e >= evs[2] {
+        at(2, x * (e - evs[2]).exp2())
+    } else {
+        let (mut lo_e, mut lo) = (0.0, srgb(x));
+        let mut res = lo;
+        for (k, &ek) in evs.iter().enumerate() {
+            let hi = at(k, x);
+            if e <= ek {
+                res = lo + (hi - lo) * (e - lo_e) / (ek - lo_e);
+                break;
+            }
+            (lo_e, lo) = (ek, hi);
+            res = hi;
+        }
+        res
+    };
+    lcc_color::transfer::srgb_to_linear(out.clamp(0.0, 1.0))
+}
+
+/// Display value `p` (gamma 2.2, 0..1) after Lightroom's Whites `w` and Blacks `b` (−100..100): each slider's
+/// measured shift, straight between 0, ±50 and ±100, summed.
+fn lrc_w_b(p: f32, w: f64, b: f64) -> f32 {
+    let curves = &lrc().w_b;
+    let shift = |s: usize, a: f64| -> f64 {
+        if a == 0.0 {
+            return 0.0;
+        }
+        let d = |k: usize| curves.get(s).and_then(|c| c.get(k)).map_or(0.0, |c| c.eval(p as f64) - p as f64);
+        match a {
+            a if a >= 50.0 => d(2) + (a - 50.0) / 50.0 * (d(3) - d(2)),
+            a if a >= 0.0 => a / 50.0 * d(2),
+            a if a >= -50.0 => -a / 50.0 * d(1),
+            a => d(1) + (-a - 50.0) / 50.0 * (d(0) - d(1)),
+        }
+    };
+    (p as f64 + shift(0, w) + shift(1, b)) as f32
 }
 
 /// Running maximum: strong Whites lift the upper tones past white, which must not fold back.
@@ -483,6 +590,63 @@ mod tests {
             let y = GREY * 2f32.powf(ev);
             let (a, b) = (camera.apply(y), default.apply(y));
             assert!((a - b).abs() <= 0.01 * b.max(0.01), "{ev} EV: {a} vs {b}");
+        }
+    }
+
+    /// sRGB-encoded output of `map` for an sRGB-encoded grey `x` under an Exposure gain of `ev`.
+    fn shown(map: &ToneMap, x: f32, ev: f32) -> f32 {
+        lcc_color::transfer::linear_to_srgb(map.apply(lcc_color::transfer::srgb_to_linear(x) * ev.exp2()))
+    }
+
+    /// V8's display tone map is the file itself at neutral settings.
+    #[test]
+    fn display_lrc_is_identity_when_neutral() {
+        let map = ToneMap::display_lrc(0.0, 0.0, 0.0, 0.0);
+        for i in 0..=50 {
+            let x = i as f32 / 50.0;
+            assert!((shown(&map, x, 0.0) - x).abs() < 0.002, "at {x}: {}", shown(&map, x, 0.0));
+        }
+    }
+
+    /// Exposure up on a JPEG rolls the highlights off as Lightroom Classic does (the wedge it was measured on),
+    /// where the V7 tone map's gain clips them; and Whites and Blacks land on Lightroom's levels.
+    #[test]
+    fn display_lrc_follows_the_wedge() {
+        for (k, &ev) in lrc_tables::EXP_EV.iter().enumerate() {
+            let map = ToneMap::display_lrc(0.0, 0.0, 0.0, ev as f64);
+            for (i, &x) in lrc_tables::EXP_X.iter().enumerate() {
+                let want = lrc_tables::EXP_Y[k][i];
+                let got = shown(&map, x, ev);
+                assert!((got - want).abs() < 0.004, "Exposure +{ev} at {x}: {got} vs Lightroom {want}");
+            }
+        }
+        // the V7 map at +2 EV: a light grey patch clips to white, Lightroom keeps it below
+        let (x, want) = (lrc_tables::EXP_X[19], lrc_tables::EXP_Y[2][19]);
+        let old = shown(&ToneMap::display(0.0, 0.0, 0.0), x, 2.0);
+        assert!((old - want).abs() > 0.05, "the old gain is off at {x}: {old} vs {want}, or this proves nothing");
+        for (s, name) in [(0, "Whites"), (1, "Blacks")] {
+            for (k, amount) in [-100.0, -50.0, 50.0, 100.0].into_iter().enumerate() {
+                let map = if s == 0 { ToneMap::display_lrc(0.0, amount, 0.0, 0.0) } else { ToneMap::display_lrc(0.0, 0.0, amount, 0.0) };
+                for (i, &x) in lrc_tables::EXP_X.iter().enumerate() {
+                    let p = (lrc_tables::WB_P[i] + lrc_tables::WB_SHIFT[s][k][i]).clamp(0.0, 1.0);
+                    let want = lcc_color::transfer::linear_to_srgb(p.powf(2.2));
+                    let got = shown(&map, x, 0.0);
+                    assert!((got - want).abs() < 0.004, "{name} {amount} at {x}: {got} vs Lightroom {want}");
+                }
+            }
+        }
+    }
+
+    /// Hostile sliders still make a finite, rising table.
+    #[test]
+    fn display_lrc_with_hostile_sliders() {
+        for (c, w, b, e) in [(f64::NAN, f64::NAN, f64::INFINITY, f64::NAN), (100.0, 1e9, -1e9, 1e9), (-100.0, -100.0, 100.0, -1e9)] {
+            let map = ToneMap::display_lrc(c, w, b, e);
+            let mut prev = 0.0;
+            for &v in map.lut() {
+                assert!(v.is_finite() && v >= prev && v <= 1.0, "{c} {w} {b} {e}: {v}");
+                prev = v;
+            }
         }
     }
 }

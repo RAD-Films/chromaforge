@@ -240,7 +240,8 @@ pub enum Process {
     /// The global Highlights and Shadows follow Lightroom Classic's: one tone curve per picture, its shape taken from
     /// the picture's own histogram (fitted to Lightroom Classic exports of our own procedural pictures; OneSlips).
     /// The parametric Tone Curve's regions bend the curve as Lightroom Classic's do (measured on a grey wedge of our
-    /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones.
+    /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones; on a display-referred
+    /// source Exposure up, Whites and Blacks follow Lightroom Classic's responses on the same wedge.
     V8,
 }
 
