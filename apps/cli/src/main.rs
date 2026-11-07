@@ -902,6 +902,16 @@ fn read_settings(p: &str) -> Result<SettingsFile, String> {
     }
 }
 
+/// Why `library.import` (report `r`) gave no photo for `input`: the reason it gives for the file, else what it did
+/// instead (a skipped file, say), so a render that fails says what to fix rather than only that it failed.
+fn not_imported(input: &str, r: &Value) -> String {
+    let reason = r["failed"].as_array().and_then(|f| f.iter().find_map(|e| e.get(1).and_then(Value::as_str)));
+    match reason {
+        Some(why) => format!("{input}: not imported: {why}"),
+        None => format!("{input}: not a readable photo (the import added nothing: {r})"),
+    }
+}
+
 fn render(args: &[String]) -> Result<(), String> {
     let mut input = None;
     let mut output = None;
@@ -954,7 +964,7 @@ fn render(args: &[String]) -> Result<(), String> {
     let mut s = Session::new().with_fs().with_default_denoise_models().with_default_genfill().with_system_clock().with_default_connections();
     let abs = expand_paths(std::slice::from_ref(&input));
     let r = s.execute("library.import", &json!({"paths": abs})).map_err(|e| e.to_string())?;
-    let id = r["imported"][0].as_u64().ok_or_else(|| format!("{input}: not a readable photo"))?;
+    let id = r["imported"][0].as_u64().ok_or_else(|| not_imported(&input, &r))?;
     let run = |s: &mut Session, cmd: &str, p: Value| s.execute(cmd, &p).map(|_| ()).map_err(|e| e.to_string());
     run(&mut s, "library.select", json!({"ids": [id], "active": id}))?;
     if let Some(p) = preset {
