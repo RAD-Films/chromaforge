@@ -339,3 +339,46 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
         max_diff(&lcc_pipeline::render(&img7, &info7, &warmer(&v7), &req).image, &lcc_pipeline::render(&img9, &info9, &warmer(&v9), &req).image);
     assert!(moved >= 3, "away from it the tables follow the chosen white: {moved} levels apart");
 }
+
+/// Process V9 on a real calibrated raw (the public Canon EOS R6 sample, skipped without the corpus). Decoded at a size
+/// the sensor bins to exactly (684 px: nothing resamples it after the colour model), the scene-linear picture after
+/// V9's white balance is V7's decode at the as-shot white, pixel for pixel; away from it the two differ. (Where a
+/// render resamples the source before the white balance, V9 applies the tables to the resampled pixels and V7 had
+/// them in the pixels before: on this calibration's look table that moves a 1600 px preview by about 1 dE on average.)
+#[test]
+fn corpus_v9_at_the_as_shot_white_develops_a_calibrated_raw_as_v7() {
+    use lcc_develop::{DevelopSettings, Process, WbMode, WbScale};
+    let path = lcc_brand::env_os("CORPUS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
+        .join("raw/cr3-canon-r6-craw.cr3");
+    let Ok(bytes) = std::fs::read(&path) else {
+        lcc_testkit::skip!(Corpus, "{} absent", path.display());
+        return;
+    };
+    crate::camera_profiles::install_dcps();
+    let decode = |defer: bool| crate::files::load_bytes_with(&bytes, 684, LoadOptions { defer_tables: defer, ..Default::default() }).unwrap();
+    let ((img7, info7), (img9, info9)) = (decode(false), decode(true));
+    assert_eq!(img7.width.max(img7.height), 684, "binned to the size asked for, not resampled");
+    assert!(info9.camera_color.as_ref().is_some_and(|c| c.deferred_tables_gain.is_some()), "the R6 calibration's tables wait");
+    let mut v7 = DevelopSettings::for_raw(info7.as_shot_temp, info7.as_shot_tint);
+    v7.process = Process::V7.version();
+    let v9 = DevelopSettings { process: Process::V9.version(), ..v7.clone() };
+    let developed = |img: &lcc_raster::Rgb32f, info: &lcc_pipeline::SourceInfo, s: &DevelopSettings| {
+        let mut img = img.clone();
+        lcc_pipeline::local::white_balance(&mut img, info, s);
+        img
+    };
+    let worst = |a: &lcc_raster::Rgb32f, b: &lcc_raster::Rgb32f| {
+        a.data.iter().zip(&b.data).map(|(p, q)| (0..3).map(|k| (p[k] - q[k]).abs() / p[k].abs().max(0.01)).fold(0f32, f32::max)).fold(0f32, f32::max)
+    };
+    let at_shot = worst(&developed(&img7, &info7, &v7), &developed(&img9, &info9, &v9));
+    assert!(at_shot < 1e-4, "at the as-shot white the pictures differ by {at_shot} (relative)");
+    let warm = |s: &DevelopSettings| {
+        let mut s = s.clone();
+        (s.wb.mode, s.wb.temp, s.wb.tint, s.wb.scale) = (WbMode::Custom, 3200.0, 0.0, WbScale::Kelvin);
+        s
+    };
+    let moved = worst(&developed(&img7, &info7, &warm(&v7)), &developed(&img9, &info9, &warm(&v9)));
+    assert!(moved > 0.02, "at 3200 K the tables follow the chosen white: {moved}");
+}
