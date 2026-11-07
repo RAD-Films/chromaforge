@@ -74,3 +74,32 @@ fn v8_with_hostile_pictures_renders() {
         assert_eq!(out.data.len(), 48 * 32);
     }
 }
+
+fn whites(p: Process, whites: f64) -> DevelopSettings {
+    DevelopSettings { process: p.version(), light: Light { whites, ..Light::default() }, ..DevelopSettings::default() }
+}
+
+/// The green value at the middle of the patch of a raw.
+fn raw_centre(src: &Rgb32f, s: &DevelopSettings) -> f64 {
+    let info = SourceInfo { raw: true, ..SourceInfo::default() };
+    let out = render(src, &info, s, &RenderRequest::fit(W, H)).image;
+    f64::from(out.data[(H / 2) * W + W / 2][1])
+}
+
+#[test]
+fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
+    // Lightroom's raw Whites +100 depends on how far the picture's brightest tones sit under white
+    let dim = picture(-3.0, -2.0);
+    let (flat, v7, v8) =
+        (raw_centre(&dim, &whites(Process::V8, 0.0)), raw_centre(&dim, &whites(Process::V7, 100.0)), raw_centre(&dim, &whites(Process::V8, 100.0)));
+    assert!(v8 - flat > (v7 - flat) + 8.0, "a dim raw: V8 lifts {flat} to {v8}, V7 to {v7}");
+    let bright = picture(-1.0, 4.0); // its field shows as white
+    let (flat, v7, v8) = (
+        raw_centre(&bright, &whites(Process::V8, 0.0)),
+        raw_centre(&bright, &whites(Process::V7, 100.0)),
+        raw_centre(&bright, &whites(Process::V8, 100.0)),
+    );
+    assert!(v8 > flat && v8 - flat < v7 - flat, "a bright raw: V8 lifts {flat} to {v8}, less than V7's {v7}");
+    // Whites down and older processes keep the tone map's response
+    assert_eq!(raw_centre(&bright, &whites(Process::V8, -100.0)), raw_centre(&bright, &whites(Process::V7, -100.0)));
+}

@@ -17,8 +17,14 @@
 //!
 //! Lightroom's curve was measured on display-referred pictures (TIFF), where a tone is what is shown. A raw's scene
 //! tones go through the camera's tone curve first, so for a raw the histogram and the curve are read in displayed
-//! tones (the default rendering of the camera's curve) and the shift is given to the scene tone, which keeps the
-//! order of tones past the camera curve's white (Highlights then brings them into view, as Lightroom's does).
+//! tones (the default rendering of the camera's curve), and a correction fitted on real raws is added to the curve:
+//! Lightroom's raw response is not its TIFF one (on our Canon EOS R5 C raws, rounds 7 and 8, the picture-fitted
+//! curve alone was 15–23 levels from Lightroom on held-out window scenes; on 7 held-out shots, rendered, the change
+//! Highlights −100 makes went from 13.3 to 8.1 levels rms from Lightroom's, Shadows +100 from 12.1 to 12.8 but with
+//! no more 3–5× over-lifts of dark frames, which reached 113 levels). In the curve's toe the scene shift is the one that moves
+//! the displayed tone by the curve's amount ([`scene_shift`]); elsewhere the shift is given to the scene tone as it
+//! is, which keeps the order of tones past the camera curve's white (Highlights then brings them into view, as
+//! Lightroom's does).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -30,7 +36,9 @@ use crate::geometry::Frame;
 use crate::local::{frame_proxy, log_lum, white_balance};
 use crate::tone::{GREY, ToneMap};
 
+mod raw;
 mod tables;
+mod whites;
 
 /// Long edge of the render the histogram is taken from.
 pub const EDGE: usize = 384;
@@ -236,21 +244,33 @@ impl Lift {
     /// scene tone to its displayed tone (EV) for a raw (the camera's default rendering; the curve is read there),
     /// `None` for a display-referred picture, whose tones are shown as they are.
     pub fn new(t: &Tones, shadows: f32, highlights: f32, display: Option<&dyn Fn(f32) -> f32>) -> Lift {
+        Lift::with_whites(t, shadows, highlights, 0.0, display)
+    }
+
+    /// [`Lift::new`] with a raw's Whites `whites` (−1 to 1): its positive side is Lightroom's picture-dependent
+    /// raw Whites ([`Whites`]); a display-referred picture and the negative side leave it to the tone map.
+    pub fn with_whites(t: &Tones, shadows: f32, highlights: f32, whites: f32, display: Option<&dyn Fn(f32) -> f32>) -> Lift {
         let (gs, gh) = (shadows_gain(finite(shadows)), highlights_gain(finite(highlights)));
+        let gw = if display.is_some() { finite(whites).max(0.0) } else { 0.0 };
         let shown = display.map(|d| t.mapped(d));
         let td = shown.as_ref().unwrap_or(t);
-        let cs = curve(&tables::SHADOWS_UP, td);
-        let ch = curve(&tables::HIGHLIGHTS_DOWN, td);
+        let mut cs = curve(&tables::SHADOWS_UP, td);
+        let mut ch = curve(&tables::HIGHLIGHTS_DOWN, td);
+        // a raw: the curve fitted on pictures plus the correction fitted on raws ([`raw`])
+        if display.is_some() {
+            cs.0.extend(curve(&raw::SHADOWS_UP_RAW, td).0);
+            ch.0.extend(curve(&raw::HIGHLIGHTS_DOWN_RAW, td).0);
+        }
         // Shadows +100 never darkens much and Highlights −100 never brightens much (a fit's tail can say otherwise)
-        let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK);
+        let cw = whites::WHITES_UP_RAW.curve(td);
+        let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d);
         let v = (0..LIFT_N)
             .map(|i| {
                 let e = LIFT_LO + LIFT_STEP * i as f32;
-                // (a raw: the curve read at the displayed tone, its shift given to the scene tone; solving for the
-                // scene tone that displays the moved one would fold every tone past the camera curve's white into one)
+                // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
                 let s = match display {
                     None => shift(e),
-                    Some(d) => shift(d(e)),
+                    Some(d) => scene_shift(d, e, shift(d(e))),
                 };
                 if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
             })
@@ -270,13 +290,99 @@ impl Lift {
     }
 }
 
+/// Knots of the Whites curve: `E − P` from `knot_lo` EV in steps of 0.5.
+const WK: usize = 23;
+
+/// Lightroom Classic's Whites +100 on a raw, measured on our Canon EOS R5 C raws (rounds 7 and 8, OneSlips, Nov
+/// 2026): it lifts the tones a few EV under the picture's bright end (`P`, the `pct` percentile of the displayed
+/// tones), and lifts them more the further that end sits under white (`gap`, EV): on a dark frame whose brightest
+/// tones are 2 EV under white the midtones rise about 4.5 EV, on a bright frame about 0.5. On held-out raws (7 shots,
+/// two scenes, rendered) the change it makes is 16.0 levels rms from Lightroom's, against 39.0 for the fixed
+/// white-point move it replaces. The curve's knot values are
+/// `c0 + per_gap × gap`, the gap held to the largest the fit saw.
+pub(crate) struct Whites {
+    pct: f32,
+    white: f32,
+    gap_max: f32,
+    knot_lo: f32,
+    c0: [f32; WK],
+    per_gap: [f32; WK],
+}
+
+/// One picture's Whites curve: its offset `P` and knot values.
+struct WhitesCurve {
+    off: f32,
+    k: [f32; WK],
+    lo: f32,
+}
+
+impl Whites {
+    fn curve(&self, t: &Tones) -> WhitesCurve {
+        let p = t.percentile(self.pct);
+        let gap = (self.white - p).clamp(0.0, self.gap_max);
+        let gap = if gap.is_finite() { gap } else { 0.0 };
+        let mut k = self.c0;
+        for (kj, g) in k.iter_mut().zip(self.per_gap) {
+            *kj += g * gap;
+        }
+        WhitesCurve { off: p, k, lo: self.knot_lo }
+    }
+}
+
+impl WhitesCurve {
+    fn at(&self, e: f32) -> f32 {
+        let f = ((e - self.off - self.lo) / 0.5).clamp(0.0, (WK - 1) as f32);
+        let f = if f.is_finite() { f } else { 0.0 };
+        let i = (f as usize).min(WK - 2);
+        let t = f - i as f32;
+        let (a, b) = (self.k.get(i).copied().unwrap_or(0.0), self.k.get(i + 1).copied().unwrap_or(0.0));
+        a + (b - a) * t
+    }
+}
+
+/// A raw's scene shift at scene tone `e` for the displayed shift `shown` of its displayed tone `d(e)`.
+///
+/// Where the camera curve is steeper than 1:1 (its toe), a scene shift shows several times larger, so the scene
+/// tone that displays the moved tone is solved for: on our R5 C raws (round 7, OneSlips, Nov 2026) giving the
+/// displayed shift straight to the scene tone lifted a dark room's shadows 3–5× more than Lightroom did, and than
+/// the curve asks for. Where the curve is 1:1 or flatter (the shoulder, and past its white, where solving would fold
+/// every tone into white) the shift goes to the scene tone as it is, so those tones keep their order and Highlights
+/// brings them into view as Lightroom's does.
+fn scene_shift(d: &dyn Fn(f32) -> f32, e: f32, shown: f32) -> f32 {
+    const H: f32 = 1.0 / 64.0;
+    let slope = (d(e + H) - d(e - H)) / (2.0 * H);
+    if slope.is_nan() || slope <= 1.0 || !shown.is_finite() {
+        return shown;
+    }
+    let want = d(e) + shown;
+    let (mut lo, mut hi) = (e - MAX_SHIFT, e + MAX_SHIFT);
+    if !(d(lo) <= want && want <= d(hi)) {
+        return shown;
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if d(mid) < want {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi) - e
+}
+
 fn finite(v: f32) -> f32 {
     if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 }
 }
 
 /// Whether `s` renders its global Highlights / Shadows with this module's curve.
 pub fn active(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V8 && (s.light.shadows != 0.0 || s.light.highlights != 0.0)
+    s.process.process() >= Process::V8 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
+}
+
+/// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V8 and above, Whites up
+/// ([`Whites`]). The tone map then leaves its white point where Whites 0 has it ([`crate::finish`]).
+pub fn whites_on_raw(s: &DevelopSettings) -> bool {
+    s.process.process() >= Process::V8 && s.light.whites > 0.0
 }
 
 type Cached = (u64, Arc<Tones>);
@@ -320,13 +426,16 @@ pub fn for_frame(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &F
     if !active(s) {
         return None;
     }
-    let t = tones(src, info, s, frame)?;
     let (sh, hl) = ((s.light.shadows / 100.0) as f32, (s.light.highlights / 100.0) as f32);
+    if raw_tone.is_none() && sh == 0.0 && hl == 0.0 {
+        return None;
+    }
+    let t = tones(src, info, s, frame)?;
     let lift = match raw_tone {
         None => Lift::new(&t, sh, hl, None),
         Some(tm) => {
             let d = |e: f32| (tm.apply(GREY * e.exp2()).max(1e-9) / GREY).log2();
-            Lift::new(&t, sh, hl, Some(&d))
+            Lift::with_whites(&t, sh, hl, (s.light.whites / 100.0) as f32, Some(&d))
         }
     };
     Some(Arc::new(lift))
@@ -436,10 +545,51 @@ mod tests {
         // a display mapping that brightens by 1 EV: the scene shift equals the shown shift of the shown tone
         let d = |e: f32| e + 1.0;
         let raw = Lift::new(&t, 1.0, 0.0, Some(&d));
-        let shown = Lift::new(&t.mapped(d), 1.0, 0.0, None);
+        let one = |e: f32| e;
+        let shown = Lift::new(&t.mapped(d), 1.0, 0.0, Some(&one));
         for e in [-6.0, -3.0, 0.0] {
             assert!((raw.at(e) - shown.at(e + 1.0)).abs() < 1e-3, "{e}: {} vs {}", raw.at(e), shown.at(e + 1.0));
         }
+    }
+
+    #[test]
+    fn a_raw_adds_the_raw_correction_to_the_curve() {
+        // the Python reference (fit/rawgold7.py, from rawres7.json) on `picture()` with a 1:1 display mapping
+        let d = |e: f32| e;
+        let s = Lift::new(&picture(), 1.0, 0.0, Some(&d));
+        let h = Lift::new(&picture(), 0.0, -1.0, Some(&d));
+        for (e, want_s, want_h) in GOLDEN_RAW {
+            assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
+            assert!((h.at(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
+        }
+        // and a display-referred picture doesn't get it
+        let tiff = Lift::new(&picture(), 1.0, 0.0, None);
+        assert!((tiff.at(-5.0) - GOLDEN[0].1).abs() < 2e-3);
+    }
+
+    const GOLDEN_RAW: [(f32, f32, f32); 4] =
+        [(-5.0, 0.98170, -0.18469), (-2.0, 1.03876, -0.49872), (0.0, 0.09104, -0.66611), (1.5, 0.01658, -1.47700)];
+
+    #[test]
+    fn a_raw_in_the_camera_curves_toe_shows_the_curves_shift_not_a_multiple() {
+        // a camera curve with a steep toe: a scene EV below grey shows 3 EV darker per EV
+        let d = |e: f32| if e < 0.0 { 3.0 * e } else { e };
+        let t = picture();
+        let raw = Lift::new(&t, 1.0, 0.0, Some(&d));
+        let one = |e: f32| e;
+        let shown = Lift::new(&t.mapped(d), 1.0, 0.0, Some(&one));
+        let mut checked = 0;
+        for i in 0..12 {
+            let e = -3.0 + 0.25 * i as f32;
+            let want = shown.at(d(e));
+            if want < 0.2 {
+                continue;
+            }
+            let got = d(e + raw.at(e)) - d(e);
+            assert!((got - want).abs() < 0.02, "{e}: shows {got}, the curve asks {want}");
+            checked += 1;
+        }
+        assert!(checked >= 4, "the curve lifts the toe's tones: {checked} checked");
     }
 
     #[test]

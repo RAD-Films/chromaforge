@@ -493,9 +493,11 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
         // V8: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
         Process::V8 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
+            // V8: a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
+            let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
             match info.camera_tone.as_ref().filter(|_| raw) {
-                Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
-                None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
+                Some(curve) => ToneMap::camera_hdr(curve, l.contrast, whites, l.blacks, peak),
+                None if raw => ToneMap::hdr(l.contrast, whites, l.blacks, peak),
                 None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
             }
         }
