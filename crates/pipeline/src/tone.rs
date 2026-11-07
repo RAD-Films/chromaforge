@@ -32,6 +32,11 @@ const NO_CHROMA: [f32; CHROMA_N] = [1.0; CHROMA_N];
 pub struct CameraTone {
     knots: [[f32; 2]; 32],
     chroma: [f32; CHROMA_N],
+    /// The curve is the camera JPEG's tone kept under a camera profile with no tone curve of its own (most
+    /// chart-made profiles): Lightroom draws such a profile with its default curve, so process 8 adds [`lrc_look`].
+    /// A calibration's or DNG's own curve, and a look fitted to the camera JPEG alone, get none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    default_curve: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for CameraTone {
@@ -42,9 +47,13 @@ impl<'de> serde::Deserialize<'de> for CameraTone {
             // absent in smart previews written before the chroma curve existed
             #[serde(default)]
             chroma: Option<[f32; CHROMA_N]>,
+            // absent before process 8's look, and for every other curve
+            #[serde(default)]
+            default_curve: bool,
         }
         let w = Wire::deserialize(d)?;
         let tone = Self::new(w.knots).ok_or_else(|| serde::de::Error::custom("invalid camera tone curve"))?;
+        let tone = if w.default_curve { tone.under_default_curve() } else { tone };
         match w.chroma {
             Some(c) => tone.with_chroma(c).ok_or_else(|| serde::de::Error::custom("invalid camera chroma curve")),
             None => Ok(tone),
@@ -61,7 +70,18 @@ impl CameraTone {
             }
             previous = p;
         }
-        Some(Self { knots, chroma: NO_CHROMA })
+        Some(Self { knots, chroma: NO_CHROMA, default_curve: false })
+    }
+
+    /// The curve marked as kept under a profile without a tone curve ([`CameraTone::has_default_curve`]).
+    pub fn under_default_curve(self) -> Self {
+        Self { default_curve: true, ..self }
+    }
+
+    /// Whether the curve is the camera JPEG's tone kept under a camera profile without a tone curve, which
+    /// Lightroom draws with its default curve.
+    pub fn has_default_curve(&self) -> bool {
+        self.default_curve
     }
 
     /// The default raw tone curve ([`ToneMap::new`] at neutral settings) as camera-curve knots, about 1/3 EV apart
@@ -110,6 +130,34 @@ impl CameraTone {
     }
 }
 
+/// Lightroom Classic's default look over a camera's own JPEG: the gain in EV it renders display luminance with, at
+/// display luminance 2^-11, 2^-10.5 … 2^0 (white stays white). Fitted by quantile matching on 50 R5 C frames at zero
+/// sliders (the photographer's matrix-only camera profile in LrC, the camera's JPEG curve here): LrC is about
+/// 0.7 EV lighter in the shadows and darker midtones, 0.25 EV at upper midtones, none at white. The frames' spread
+/// around it is a few hundredths of an EV through the midtones; on 13 held-out frames it takes LrC − JPEG from
+/// p5 +0.25 / p25 +0.32 / p50 +0.20 EV to within 0.06 EV at every percentile.
+const LRC_LOOK: [f32; 23] = [
+    0.375, 0.410, 0.460, 0.533, 0.589, 0.625, 0.663, 0.690, 0.697, 0.695, 0.686, 0.661, 0.614, 0.545, 0.468, 0.399, 0.339, 0.288, 0.237, 0.177,
+    0.098, 0.017, 0.000,
+];
+const LRC_LOOK_FROM: f32 = -11.0;
+const LRC_LOOK_STEP: f32 = 0.5;
+
+/// Display luminance `y` with [`LRC_LOOK`]: monotone, 0 stays 0 and 1 stays 1 (and above it, unchanged).
+pub fn lrc_look(y: f32) -> f32 {
+    if !(y.is_finite() && y > 0.0) {
+        return 0.0;
+    }
+    if y >= 1.0 {
+        return y;
+    }
+    let f = ((y.log2() - LRC_LOOK_FROM) / LRC_LOOK_STEP).max(0.0);
+    let i = (f as usize).min(LRC_LOOK.len() - 2);
+    let t = (f - i as f32).min(1.0);
+    let (a, b) = (LRC_LOOK.get(i).copied().unwrap_or(0.0), LRC_LOOK.get(i + 1).copied().unwrap_or(0.0));
+    (y * (a + (b - a) * t).exp2()).min(1.0)
+}
+
 /// Display luminance above which [`ToneMap::sdr_rolloff`] compresses an HDR edit's highlights.
 pub const ROLLOFF_KNEE: f32 = 0.5;
 
@@ -132,6 +180,20 @@ impl ToneMap {
     /// gain map only lifts highlights), then the highlights gain up to `peak − 1` more as in
     /// [`ToneMap::hdr`].
     pub fn camera_hdr(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        ToneMap::camera_with(curve, |y| curve.apply(y), contrast, whites, blacks, peak)
+    }
+
+    /// [`ToneMap::camera_hdr`] for process 8: a camera JPEG's tone kept under a profile without a tone curve
+    /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]); any other curve as is.
+    pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        if curve.has_default_curve() {
+            ToneMap::camera_with(curve, |y| lrc_look(curve.apply(y)), contrast, whites, blacks, peak)
+        } else {
+            ToneMap::camera_hdr(curve, contrast, whites, blacks, peak)
+        }
+    }
+
+    fn camera_with(curve: &CameraTone, base: impl Fn(f32) -> f32, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
         let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
         let adjustment = Self::display(contrast, whites, blacks);
         let neutral = contrast == 0.0 && whites == 0.0 && blacks == 0.0;
@@ -139,7 +201,7 @@ impl ToneMap {
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
-                let y = curve.apply(GREY * 2f32.powf(ev));
+                let y = base(GREY * 2f32.powf(ev));
                 let o = if neutral { y } else { adjustment.apply(y) };
                 if peak > 1.0 { (o + (peak - 1.0) * smooth(HDR_FROM_EV, top, ev)).clamp(0.0, peak) } else { o }
             })
@@ -451,6 +513,45 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lrc_look_lightens_shadows_and_midtones_and_keeps_black_and_white() {
+        assert_eq!(lrc_look(0.0), 0.0);
+        assert_eq!(lrc_look(1.0), 1.0);
+        assert_eq!(lrc_look(3.0), 3.0);
+        for y in [f32::NAN, -1.0, f32::NEG_INFINITY] {
+            assert_eq!(lrc_look(y), 0.0);
+        }
+        let gain = |y: f32| (lrc_look(y) / y).log2();
+        assert!((gain(2f32.powf(-7.0)) - 0.695).abs() < 0.01, "shadows: {}", gain(2f32.powf(-7.0)));
+        assert!((gain(0.18) - 0.30).abs() < 0.03, "grey: {}", gain(0.18));
+        assert!(gain(0.95) < 0.02 && gain(1e-6) > 0.3);
+        let mut previous = 0.0;
+        for i in 0..4000 {
+            let v = lrc_look(2f32.powf(-16.0 + 16.0 * i as f32 / 3999.0));
+            assert!(v >= previous && v <= 1.0, "{i}: {v} after {previous}");
+            previous = v;
+        }
+        // process 8's tone map has it; earlier processes don't
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let plain = CameraTone::new(knots).unwrap();
+        let curve = plain.under_default_curve();
+        let (v7, v8) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
+        assert!((v8.apply(0.1) - lrc_look(v7.apply(0.1))).abs() < 1e-4);
+        assert!(v8.apply(0.1) > v7.apply(0.1) * 1.1);
+        // any other curve (a profile's own, a look fitted to the camera JPEG alone) gets no look
+        assert!(curve.has_default_curve() && !plain.has_default_curve());
+        assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - v7.apply(0.1)).abs() < 1e-4);
+        // the mark travels through serialisation (smart previews); older files have none
+        let back: CameraTone = serde_json::from_value(serde_json::to_value(curve).unwrap()).unwrap();
+        assert_eq!(back, curve);
+        assert!(!serde_json::to_value(plain).unwrap().as_object().unwrap().contains_key("default_curve"));
+        let old: CameraTone = serde_json::from_value(serde_json::json!({"knots": knots})).unwrap();
+        assert!(!old.has_default_curve());
+    }
 
     #[test]
     fn camera_curve_preserves_black_and_extends_headroom() {

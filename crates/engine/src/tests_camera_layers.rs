@@ -221,13 +221,17 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     assert!((own.apply(0.18) - camera).abs() < 0.05, "the fit learnt the camera's curve: {} vs {camera}", own.apply(0.18));
     let default = lcc_pipeline::tone::CameraTone::default_raw().unwrap();
     assert!((own.apply(0.18) - default.apply(0.18)).abs() > 0.02, "the camera's tone is not the default one");
-    assert_eq!(camera_tone_with(&bytes, PLAIN, true), Some(own), "a matrix-only profile keeps the photo's tone");
-    assert_eq!(camera_tone_with(&bytes, TABLE, true), Some(own), "a look table is colour, not tone");
-    assert_eq!(camera_tone_with(&bytes, TABLE, false), Some(own), "under another look: the calibration and the photo's tone");
+    // (kept under a profile without a curve, the tone is marked for Lightroom's default look in process 8)
+    assert!(!own.has_default_curve(), "fitted without a profile: no Lightroom look");
+    let kept = own.under_default_curve();
+    assert_eq!(camera_tone_with(&bytes, PLAIN, true), Some(kept), "a matrix-only profile keeps the photo's tone");
+    assert_eq!(camera_tone_with(&bytes, TABLE, true), Some(kept), "a look table is colour, not tone");
+    assert_eq!(camera_tone_with(&bytes, TABLE, false), Some(kept), "under another look: the calibration and the photo's tone");
     // a profile with its own curve keeps it (As profile), and under another look its calibration only
     let curve = profile("x", true).color.profile.tone_curve.unwrap();
     let with_look = camera_tone_with(&bytes, WITH_LOOK, true).expect("the profile's own curve");
     assert_eq!(Some(with_look), crate::files::dng_tone_curve(&curve));
+    assert!(!with_look.has_default_curve(), "a profile's own curve gets no Lightroom look");
     assert_eq!(camera_tone_with(&bytes, WITH_LOOK, false), None);
     // the colour still comes from the profile
     let options = LoadOptions { camera: PLAIN.into(), ..Default::default() };
@@ -240,17 +244,22 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     // got before
     let options = LoadOptions { camera: PLAIN.into(), ..Default::default() };
     let (img, info) = crate::files::load_bytes_with(&bytes, 384, options).unwrap();
-    let spread = |info: &lcc_pipeline::SourceInfo| {
-        let s = lcc_develop::DevelopSettings::for_raw(info.as_shot_temp, info.as_shot_tint);
+    // (mean, standard deviation) of the render's luma at a process version
+    let luma = |info: &lcc_pipeline::SourceInfo, process: lcc_develop::Process| {
+        let mut s = lcc_develop::DevelopSettings::for_raw(info.as_shot_temp, info.as_shot_tint);
+        s.process = process.version();
         let out = lcc_pipeline::render(&img, info, &s, &lcc_pipeline::RenderRequest::fit(384, 256)).image;
         let luma: Vec<f64> = out.data.iter().map(|p| 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])).collect();
         let mean = luma.iter().sum::<f64>() / luma.len() as f64;
-        (luma.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / luma.len() as f64).sqrt()
+        (mean, (luma.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / luma.len() as f64).sqrt())
     };
-    let kept = spread(&info);
-    let flat = spread(&lcc_pipeline::SourceInfo { camera_tone: None, ..info.clone() });
+    let (_, kept) = luma(&info, lcc_develop::Process::V7);
+    let (_, flat) = luma(&lcc_pipeline::SourceInfo { camera_tone: None, ..info.clone() }, lcc_develop::Process::V7);
     eprintln!("luma standard deviation under the matrix-only profile: {kept:.2} (default tone before: {flat:.2})");
     assert!(kept > flat * 1.05, "the photo's tone keeps more contrast: {kept} vs {flat}");
+    // process 8 draws the kept tone in Lightroom's default look: lighter than process 7
+    let (v7, v8) = (luma(&info, lcc_develop::Process::V7).0, luma(&info, lcc_develop::Process::V8).0);
+    assert!(v8 > v7 + 2.0, "process 8 renders the kept tone lighter: {v8} vs {v7}");
 }
 
 /// An imported photo carries its camera profile in its settings (`develop.profile.camera`, from the import's
@@ -274,7 +283,7 @@ fn an_imported_photo_with_a_matrix_only_profile_renders_with_the_photos_tone() {
     for (what, job) in [("grid", s.thumb_job(id, 128)), ("loupe", s.render_job(id, 400, 300, false, true))] {
         let source = job.unwrap().source.load_source().unwrap();
         let tone = source.info.as_ref().and_then(|i| i.camera_tone).or(source.camera_tone);
-        assert_eq!(tone, Some(own), "{what}");
+        assert_eq!(tone, Some(own.under_default_curve()), "{what}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

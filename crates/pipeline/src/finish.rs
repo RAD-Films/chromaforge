@@ -496,6 +496,8 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
             // V8: a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
             let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
             match info.camera_tone.as_ref().filter(|_| raw) {
+                // V8: a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
+                Some(curve) if s.process.process() >= Process::V8 => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
                 Some(curve) => ToneMap::camera_hdr(curve, l.contrast, whites, l.blacks, peak),
                 None if raw => ToneMap::hdr(l.contrast, whites, l.blacks, peak),
                 None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),

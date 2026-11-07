@@ -880,8 +880,24 @@ fn load_bytes_now(
                 Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy })
             });
         // a fitted look's tone, else the tone a profile without a curve of its own keeps, else the file's (or profile's) curve
-        let camera_tone =
-            camera_look.as_ref().map(|p| p.tone).or(kept_tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
+        // (the tone kept under a profile without a curve is marked: process 8 draws it in Lightroom's default look)
+        let camera_tone = camera_look
+            .as_ref()
+            .map(|p| p.tone)
+            .or(kept_tone.map(lcc_pipeline::tone::CameraTone::under_default_curve))
+            .or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
+        if lcc_pipeline::profiling() {
+            let from = if camera_look.is_some() {
+                "fitted look"
+            } else if kept_tone.is_some() {
+                "kept photo tone"
+            } else if camera_tone.is_some() {
+                "profile curve"
+            } else {
+                "none"
+            };
+            eprintln!("[profile] camera tone: {from}");
+        }
         let local_tone = local_tone(&raw);
         let (temp, tint) = scale.as_shot(xy);
         return Ok((
