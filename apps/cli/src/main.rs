@@ -150,9 +150,13 @@ USAGE:
   {cli} calibrate-lightroom preset -o FILE.xmp
       Write the baseline Lightroom preset to apply (on virtual copies) before exporting for a fit.
   {cli} calibrate-lightroom fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME] [--dry-run]
+      [--base FILE [--replace-looks] [--since-process N]] [--hold-out NAME,…]
       Fit a camera's colour model and looks to Lightroom's exports of your own raws (16-bit TIFF, one export
       folder per Lightroom profile). Writes <Make>_<Model>.json (the file to send: numbers only, no images) and
       one .dcp per look for your own testing. --dry-run pairs and reports coverage without fitting.
+      --base FILE keeps that calibration's camera model and looks and fits only the other looks the exports name
+      (--replace-looks refits one it has too; --since-process N adds them as entries for process N and newer only,
+      so older edits keep the file's looks); --hold-out NAME,… holds out the raws whose file names contain a name.
   {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME]
       Developers: validate a contributed calibration, write it to crates/camdb/data/calibrations/ and add its
       assets/ATTRIBUTION.md row (DIR: the repository root, default .).
