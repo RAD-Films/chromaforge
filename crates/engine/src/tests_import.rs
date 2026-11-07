@@ -1427,6 +1427,7 @@ fn smart_previews_keep_the_decoder_facts_offline_edits_need() {
             ..Default::default()
         },
         developed_for: lcc_color::Xy { x: 0.32, y: 0.35 },
+        deferred_tables_gain: None,
     };
     let mut mattes = Mattes::default();
     mattes.push(
@@ -4154,4 +4155,26 @@ fn before_is_the_import_state_and_set_before_is_kept() {
     let missing = lcc_catalog::Op::SetBefore { id: lcc_catalog::PhotoId(u64::MAX), before: None };
     assert!(s.commit("Set Before", missing).is_err());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The public Panasonic DC-G9 (raw format 5, 12-bit) and DC-S1 (raw format 6, 14-bit) samples (skipped without the
+/// corpus) import as photos: the raw decoder reads them, so the import must not turn them away.
+#[test]
+fn corpus_panasonic_format_5_and_6_raws_import() {
+    let dir = lcc_brand::env_os("CORPUS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
+        .join("raw");
+    for name in ["rw2-panasonic-g9.rw2", "rw2-panasonic-s1.rw2"] {
+        let path = dir.join(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            lcc_testkit::skip!(Corpus, "{} absent", path.display());
+            return;
+        };
+        let probe = crate::files::probe_bytes(name, &bytes);
+        assert!(probe.is_ok(), "{name}: probe: {probe:?}");
+        let mut s = Session::new().with_fs();
+        let r = s.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+        assert_eq!(ids(&r, "imported"), 1, "{name}: {r}");
+    }
 }

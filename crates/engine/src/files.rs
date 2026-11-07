@@ -821,11 +821,21 @@ fn load_bytes_now(
         let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
         // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
         let tables = lcc_raw::profile::ProfileTables::new(&raw.color.profile, lcc_raw::color::illuminant_weight(&raw.color, xy));
+        // White balance re-evaluates the file's own colour model (when it has one and no file-local look matrix sits
+        // on top of it). A model's measured matrices never do: they only give the Kelvin scale its numbers, and the
+        // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
+        // existed render exactly as they did, `lcc_pipeline::local::legacy_white`).
+        let own_model = scale.own_matrix && !t.matrix_is_fallback && (camera_look.is_none() || raw.format == lcc_raw::RawFormat::Dng || dcp);
+        // Process V9: the tables wait for the white balance (DNG spec ch. 6 order), which the pipeline applies after
+        // re-balancing to the chosen white; only with the camera's own model (the white balance re-develops through
+        // it) and no fitted look's hue/saturation step after them
+        let defer = options.defer_tables && own_model && tables.is_some() && hue_sat.is_none();
+        let gain = 2f32.powf(t.baseline_exposure as f32);
         let colour = CameraColourModel {
             wb: t.wb,
             matrix: camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix),
-            gain: 2f32.powf(t.baseline_exposure as f32),
-            tables: tables.as_ref(),
+            gain,
+            tables: if defer { None } else { tables.as_ref() },
             hue_sat: hue_sat.as_ref(),
         };
         // camera RGB → what the pipeline takes: clipped highlights rebuilt, white balance and the colour model applied,
@@ -861,15 +871,21 @@ fn load_bytes_now(
             eprintln!("[profile] raw source {}×{} (max {max_edge}, ms after decode): {}", img.width, img.height, parts.join(", "));
         }
         let twin = twin.map(|picture| finish(picture).0);
-        // White balance re-evaluates the file's own colour model (when it has one and no file-local look matrix sits
-        // on top of it). A model's measured matrices never do: they only give the Kelvin scale its numbers, and the
-        // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
-        // existed render exactly as they did, `lcc_pipeline::local::legacy_white`).
-        let camera_color = (scale.own_matrix && !t.matrix_is_fallback && (camera_look.is_none() || raw.format == lcc_raw::RawFormat::Dng || dcp))
-            .then(|| {
-                let tags = lcc_raw::ColorData { profile: Default::default(), ..raw.color.clone() };
-                Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy })
-            });
+        let camera_color = own_model.then(|| {
+            // the tags without their profile look (applied while decoding), or with its tables when they wait for the
+            // white balance (the tone curve and gain table map have stages of their own: `camera_tone`, `local_tone`)
+            let profile = if defer {
+                lcc_raw::profile::ProfileLook {
+                    hue_sat_map: raw.color.profile.hue_sat_map.clone(),
+                    look_table: raw.color.profile.look_table.clone(),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            };
+            let tags = lcc_raw::ColorData { profile, ..raw.color.clone() };
+            Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy, deferred_tables_gain: defer.then_some(gain) })
+        });
         // a fitted look's tone, else the tone a profile without a curve of its own keeps, else the file's (or profile's) curve
         let camera_tone =
             camera_look.as_ref().map(|p| p.tone).or(kept_tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));

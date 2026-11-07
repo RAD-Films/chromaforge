@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 79;
+pub const RENDER_CACHE_VERSION: u64 = 81;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -169,6 +169,11 @@ pub struct LoadOptions {
     /// Correct the raw's hot, dead and stuck pixels (`sensor.pixelFix`): the camera body's known ones
     /// and the clear ones this photo shows (`crate::files::repair_pixels`).
     pub pixel_fix: bool,
+    /// Leave a raw's camera-profile tables (hue/saturation map, look table) out of the decoded pixels and hand them
+    /// to the pipeline, which applies them after the white balance at the chosen white (process V9,
+    /// [`lcc_pipeline::CameraColor::deferred_tables_gain`]); false: applied while decoding, at the as-shot white
+    /// (V1–V7).
+    pub defer_tables: bool,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -177,7 +182,17 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        LoadOptions { colour: Default::default(), outliers: false, camera: String::new(), camera_look: true, pixel_fix: true, path: None }
+        LoadOptions {
+            colour: Default::default(),
+            outliers: false,
+            camera: String::new(),
+            camera_look: true,
+            pixel_fix: true,
+            // (baked in: callers that use the decoded pixels directly, such as chart profiling, merges and the colour
+            // fitter, see the camera profile's colours; photo renders decode with `for_photo`, which follows the process)
+            defer_tables: false,
+            path: None,
+        }
     }
 }
 
@@ -189,6 +204,7 @@ impl LoadOptions {
             camera: s.profile.camera.clone(),
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
+            defer_tables: s.process.process() >= lcc_develop::Process::V9,
             path: None,
         }
     }
@@ -297,7 +313,8 @@ impl DecodedSource {
             || ((self.options.outliers == options.outliers || !info.is_some_and(|i| i.raw))
                 && (self.options.colour == options.colour || !info.is_some_and(|i| i.colorimetric))
                 && ((self.options.camera == options.camera && self.options.camera_look == options.camera_look) || !info.is_some_and(|i| i.raw))
-                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw)))
+                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
+                && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -3508,7 +3525,8 @@ mod tests {
             })),
             fallback: None,
             denoise: None,
-            options: Default::default(),
+            // (decoded for the settings below: a raw source serves only the options it was decoded with)
+            options: LoadOptions::of(&DevelopSettings::default()),
             reduced: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.

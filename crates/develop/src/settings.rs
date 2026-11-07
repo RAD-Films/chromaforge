@@ -243,6 +243,12 @@ pub enum Process {
     /// jointly, leaving Y alone, with edge-aware weights from a denoised guide and a brake for
     /// isolated colour specks (adapted from upstream #1348).
     V8,
+    /// A raw's camera-profile tables (a calibration's or `.dcp`'s hue/saturation map and look table, a DNG's own)
+    /// apply after the white balance, at the chosen white, in the order of the DNG specification (chapter 6): white
+    /// balance, matrix, hue/saturation map, exposure, look table. Before V9 they were applied while decoding, at the
+    /// as-shot white, and a white-balance change re-balanced colours the tables had already moved, so a grey picked
+    /// neutral stayed tinted (up to 12 b* on a Canon EOS R6 calibration from 5500 K to 3200 K). Built on V8.
+    V9,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -252,14 +258,15 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 | Process::V8 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V8 | Process::V9 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8];
-    pub const LATEST: Process = Process::V8;
+    pub const ALL: [Process; 9] =
+        [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8, Process::V9];
+    pub const LATEST: Process = Process::V9;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -271,6 +278,7 @@ impl Process {
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
             Process::V8 => ProcessVersion(8),
+            Process::V9 => ProcessVersion(9),
         }
     }
 }
