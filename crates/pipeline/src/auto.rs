@@ -170,12 +170,12 @@ pub fn auto_bw_mix(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> [f64
     use lcc_color::perceptual::{lab_to_lch, oklab_from_2020};
     let mut img = lcc_raster::resample::fit(src, 512, 512, lcc_raster::resample::Filter::Box);
     let base = DevelopSettings { wb: s.wb, light: s.light, process: s.process, ..DevelopSettings::default() };
+    // (white balance and exposure: the exposure is in the pixels once)
     crate::local::scene_linear_pre(&mut img, info, &base);
-    let gain = 2f32.powf(base.light.exposure as f32);
     let (mut mass, mut sum_l) = ([0f64; 8], [0f64; 8]);
     let (mut all_l, mut n) = (0f64, 0usize);
     for p in &img.data {
-        let lch = lab_to_lch(oklab_from_2020(p.map(|v| (v * gain).max(0.0))));
+        let lch = lab_to_lch(oklab_from_2020(p.map(|v| v.max(0.0))));
         all_l += lch[0] as f64;
         n += 1;
         let k = (lch[1] / 0.2).min(1.0) as f64; // as in the B&W conversion
@@ -246,6 +246,21 @@ pub fn current_wb(info: &SourceInfo, s: &DevelopSettings) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Auto B&W sees the photo at its exposure once: +1 EV is the same picture twice as bright (it was +2 EV: the
+    /// exposure gain was applied by the scene-linear stage and again on top).
+    #[test]
+    fn auto_bw_mix_applies_the_exposure_once() {
+        let colours = [[0.30f32, 0.05, 0.04], [0.04, 0.20, 0.05], [0.05, 0.06, 0.30], [0.25, 0.22, 0.03], [0.10, 0.10, 0.10]];
+        let src = Rgb32f::from_fn(64, 64, |x, y| colours[(x / 13 + y / 13) % colours.len()]);
+        let brighter = Rgb32f { data: src.data.iter().map(|p| p.map(|v| v * 2.0)).collect(), ..src.clone() };
+        let info = SourceInfo::default();
+        let mut pushed = DevelopSettings::default();
+        pushed.light.exposure = 1.0;
+        let (a, b) = (auto_bw_mix(&src, &info, &pushed), auto_bw_mix(&brighter, &info, &DevelopSettings::default()));
+        assert_eq!(a, b, "+1 EV vs twice as bright");
+        assert!(a.iter().any(|v| *v != 0.0), "the colours separate: {a:?}");
+    }
 
     #[test]
     fn exposure_follows_the_log_average_luminance() {
