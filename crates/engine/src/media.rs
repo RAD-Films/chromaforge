@@ -188,8 +188,9 @@ impl Default for LoadOptions {
             camera: String::new(),
             camera_look: true,
             pixel_fix: true,
-            // (what the latest process, the default settings' one, decodes with: `of(&DevelopSettings::default())`)
-            defer_tables: true,
+            // (baked in: callers that use the decoded pixels directly, such as chart profiling, merges and the colour
+            // fitter, see the camera profile's colours; photo renders decode with `for_photo`, which follows the process)
+            defer_tables: false,
             path: None,
         }
     }
@@ -3523,7 +3524,8 @@ mod tests {
             })),
             fallback: None,
             denoise: None,
-            options: Default::default(),
+            // (decoded for the settings below: a raw source serves only the options it was decoded with)
+            options: LoadOptions::of(&DevelopSettings::default()),
             reduced: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.

@@ -323,7 +323,8 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     let v9 = DevelopSettings { process: Process::V9.version(), ..v7.clone() };
     assert!(!LoadOptions::of(&v7).defer_tables && LoadOptions::of(&v9).defer_tables);
     // a decode without a photo's settings is the default settings' (the latest process): its cached source serves them
-    assert_eq!(LoadOptions::default().defer_tables, LoadOptions::of(&DevelopSettings::default()).defer_tables);
+    // (a plain decode keeps the tables in the pixels, for callers that use them without the pipeline)
+    assert!(!LoadOptions::default().defer_tables);
     let req = lcc_pipeline::RenderRequest::fit(64, 48);
     let max_diff = |a: &lcc_raster::Rgba8, b: &lcc_raster::Rgba8| {
         a.data.iter().zip(&b.data).flat_map(|(p, q)| (0..3).map(move |k| (i32::from(p[k]) - i32::from(q[k])).abs())).max().unwrap_or(0)
