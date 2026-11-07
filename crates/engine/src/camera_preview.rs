@@ -56,7 +56,9 @@ use lcc_raw::{
 /// 22: a camera profile without a tone curve of its own keeps the tone the photo has without it (its DNG tone curve,
 /// else the tone fitted to its camera JPEG) instead of the default tone (OneSlips).
 /// 23: fitted tone curves no steeper than a log-log slope of 4 between knots (upstream #1904 / #2656).
-pub const LOOK_VERSION: u32 = 23;
+/// 24: a Sony "12-bit uncompressed" ARW takes the 14-bit scale from its word layout, not its brightest sample, so a
+/// dark frame is no longer fitted on the wrong black and white levels (upstream #3429).
+pub const LOOK_VERSION: u32 = 24;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CameraLook {
