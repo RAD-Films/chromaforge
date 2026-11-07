@@ -374,7 +374,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 => true,
+            Process::V7 | Process::V10 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -450,31 +450,37 @@ impl FinishParams {
 /// lifts its highlights past white ([`ToneMap::camera_hdr`]), so it matches the SDR render below them.
 pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     // the SDR rendition of an HDR edit: the HDR curve, its highlights rolled off into SDR white
-    // (issue #69); SDR edits never get here (their rolloff peak is 1)
+    // (issue #69); SDR edits never get here (their rolloff peak is 1). It keeps the HDR curve it was
+    // tuned on under every process: V10 changes only the HDR render, and this rendition already matches
+    // Lightroom Classic's SDR version of an HDR edit on real raws within 0.16 EV rms
     let rolloff = s.hdr.rolloff_peak();
     if peak <= 1.0 && rolloff > 1.0 {
-        return base_tone_at(s, info, rolloff).sdr_rolloff(rolloff);
+        return base_tone_at(s, info, rolloff, false).sdr_rolloff(rolloff);
     }
-    base_tone_at(s, info, peak)
+    base_tone_at(s, info, peak, true)
 }
 
-fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
+/// `lrc_hdr`: an HDR render (`peak` > 1) under V10 takes Lightroom Classic's HDR tone
+/// ([`ToneMap::hdr_from_sdr`] of the SDR tone map); `false` keeps the older HDR curve of each source kind.
+fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
     let l = &s.light;
     // a Source filter that renders a finished picture (a negative conversion) is shown as it is,
     // like a JPEG, not toned again as a raw
     let raw = info.raw
         && !(crate::plugin_filters::any_active(s)
             && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone());
+    let tone = |peak: f32| match info.camera_tone.as_ref().filter(|_| raw) {
+        Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
+        None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
+        None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
+    };
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {
-            match info.camera_tone.as_ref().filter(|_| raw) {
-                Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
-                None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
-                None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
-            }
-        }
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => tone(peak),
+        // V10: SDR renders as V7; an HDR render unrolls the SDR curve's shoulder up to the headroom
+        Process::V10 if lrc_hdr && peak > 1.0 => ToneMap::hdr_from_sdr(&tone(1.0), peak),
+        Process::V10 => tone(peak),
     }
 }
 
