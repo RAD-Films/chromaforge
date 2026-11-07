@@ -633,7 +633,14 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
                 )));
             }
         }
-        look_evidence.push(LookEvidence { name: l.name.clone(), photos: count_photos(&trained), held_out: count_photos(&held), before: b, after: a });
+        look_evidence.push(LookEvidence {
+            name: l.name.clone(),
+            photos: count_photos(&trained),
+            held_out: count_photos(&held),
+            before: b,
+            after: a,
+            since_process: None,
+        });
     }
     looks.retain(|l| !dropped.contains(&l.name));
     if gated == 0 {
@@ -686,6 +693,7 @@ fn assemble(who: &Who, model: &Model, looks: &[FittedLook], prior_fm: [Mat3; 2],
                 baseline_exposure_offset: l.look.offset,
                 look_table: l.look.table.clone(),
                 tone_curve: l.tone.clone(),
+                since_process: None,
             })
             .collect(),
         evidence,

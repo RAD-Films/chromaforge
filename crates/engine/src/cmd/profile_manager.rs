@@ -718,6 +718,7 @@ mod tests {
             make: "PMHIDE".into(),
             names: vec!["PMHIDE ONE".into()],
             looks: vec![("cal:pmhide-me".into(), dcp)],
+            gated: Vec::new(),
             default: None,
         });
         lcc_raw::dcp::install_calibrated(list);

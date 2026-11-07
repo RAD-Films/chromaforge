@@ -54,6 +54,7 @@ fn add_accepts_model_with_slash() {
             baseline_exposure_offset: 0.0,
             look_table: None,
             tone_curve: vec![],
+            since_process: None,
         }],
         evidence: lcc_camdb::calibration::Evidence {
             photos: 10,
@@ -67,6 +68,7 @@ fn add_accepts_model_with_slash() {
                 held_out: 2,
                 before: Default::default(),
                 after: Default::default(),
+                since_process: None,
             }],
         },
     };
