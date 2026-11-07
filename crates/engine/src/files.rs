@@ -757,10 +757,11 @@ fn load_bytes_now(
         // (its own look, tone curve and look table, only "As profile": under one of the app's looks its calibration only).
         // A profile without a tone curve of its own (most chart-made ones) keeps the tone the photo has without it,
         // fitted below with the file's own colour (`own_colour`), whichever look sits on top.
-        let own_colour = crate::camera_profiles::profile_for(&raw.color, &raw.metadata, &options.camera)
+        let own_colour = crate::camera_profiles::profile_for_at(&raw.color, &raw.metadata, &options.camera, options.process)
             .filter(|d| crate::camera_preview::keeps_photo_tone(d))
             .map(|_| raw.color.clone());
-        let dcp = crate::camera_profiles::apply_choice_with(&mut raw.color, &raw.metadata, &options.camera, options.camera_look).is_some();
+        let dcp =
+            crate::camera_profiles::apply_choice_with(&mut raw.color, &raw.metadata, &options.camera, options.camera_look, options.process).is_some();
         // Embedded lens corrections are applied by the pipeline ("Enable Profile Corrections"), not baked in
         // (removed before the camera look's binned sensor proxy too, which needs an empty `OpcodeList3`).
         let info = raw.info();

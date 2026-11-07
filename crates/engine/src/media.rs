@@ -169,6 +169,9 @@ pub struct LoadOptions {
     /// Correct the raw's hot, dead and stuck pixels (`sensor.pixelFix`): the camera body's known ones
     /// and the clear ones this photo shows (`crate::files::repair_pixels`).
     pub pixel_fix: bool,
+    /// The photo's process number (`DevelopSettings::process`): picks a calibrated look's entry for newer processes
+    /// when the camera's calibration has one (`lcc_raw::dcp::resolve_at`); the latest process by default.
+    pub process: u32,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -177,7 +180,16 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        LoadOptions { colour: Default::default(), outliers: false, camera: String::new(), camera_look: true, pixel_fix: true, path: None }
+        LoadOptions {
+            colour: Default::default(),
+            outliers: false,
+            camera: String::new(),
+            camera_look: true,
+            pixel_fix: true,
+            // (what the default settings decode with: `of(&DevelopSettings::default())`)
+            process: lcc_develop::Process::LATEST.version().0,
+            path: None,
+        }
     }
 }
 
@@ -189,6 +201,7 @@ impl LoadOptions {
             camera: s.profile.camera.clone(),
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
+            process: s.process.process().version().0,
             path: None,
         }
     }
@@ -297,7 +310,8 @@ impl DecodedSource {
             || ((self.options.outliers == options.outliers || !info.is_some_and(|i| i.raw))
                 && (self.options.colour == options.colour || !info.is_some_and(|i| i.colorimetric))
                 && ((self.options.camera == options.camera && self.options.camera_look == options.camera_look) || !info.is_some_and(|i| i.raw))
-                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw)))
+                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
+                && (self.options.process == options.process || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -3329,6 +3343,26 @@ mod thumbnail_hash_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw decodes for the photo's process (a calibrated look can have an entry for newer processes only), so a
+    /// raw decoded for one process doesn't serve another; a rendered file has no camera profile and serves both.
+    #[test]
+    fn a_raw_decoded_for_one_process_does_not_serve_another() {
+        let latest = lcc_develop::DevelopSettings::default();
+        assert_eq!(LoadOptions::default(), LoadOptions::of(&latest));
+        assert_eq!(LoadOptions::of(&latest).process, lcc_develop::Process::LATEST.version().0);
+        let mut old = latest.clone();
+        old.process = lcc_develop::ProcessVersion(1);
+        assert_eq!(LoadOptions::of(&old).process, 1);
+        let image = Arc::new(Rgb32f::new(2, 2));
+        let mut raw = DecodedSource::new(image.clone(), Some(SourceInfo { raw: true, ..Default::default() }));
+        raw.options = LoadOptions::of(&latest);
+        assert!(raw.serves(&LoadOptions::of(&latest)));
+        assert!(!raw.serves(&LoadOptions::of(&old)));
+        let mut jpeg = DecodedSource::new(image, Some(SourceInfo::default()));
+        jpeg.options = LoadOptions::of(&latest);
+        assert!(jpeg.serves(&LoadOptions::of(&old)));
+    }
 
     /// A photo edited since its last view (an Auto Sync edit, its thumbnail built with the edit)
     /// steps in with the edit, never with the picture from before it.
