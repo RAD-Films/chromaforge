@@ -1164,7 +1164,9 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
     let s = &*plan.settings;
-    let img = if lcc_pipeline::lin_needs_cpu(s, info) {
+    // (process V9: a camera profile's tables after the white balance; `None` inside when they don't fit the kernel)
+    let tables = local::deferred_tables(info, s).map(|(t, gain)| profile_table_words(&t, gain));
+    let img = if lcc_pipeline::lin_needs_cpu(s, info) || matches!(tables, Some(None)) {
         // content-aware Fill spots / the camera's local tone map: the whole stage on the CPU
         let mut img = match host.sampled.take() {
             Some(i) => i,
@@ -1177,7 +1179,13 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
         let mut p = vec![m.is_some() as u32];
         p.extend(m.unwrap_or_default().iter().flatten().map(|v| v.to_bits()));
         let out = cx.gpu.buffer(n * 3);
-        map(cx, "wb_k", n, &p, [Some(sampled), None, None], &out);
+        if let Some(Some((words, entries))) = &tables {
+            p.extend_from_slice(words);
+            let entries = cx.gpu.upload(entries);
+            map(cx, "wb_tables_k", n, &p, [Some(sampled), Some(&entries), None], &out);
+        } else {
+            map(cx, "wb_k", n, &p, [Some(sampled), None, None], &out);
+        }
         // `lin_cpu`'s order: white balance, defringe, spots, red eye
         let out = defringe(cx, out, plan);
         let out = spots(cx, out, plan);
@@ -1212,6 +1220,33 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
     let buf = cx.gpu.upload(rgb_words(&host_img));
     host.lin = Some(Arc::new(host_img));
     buf
+}
+
+/// The parameters of `wb_tables_k` after the white-balance matrix (P[11..42]: the matrices into and out of ProPhoto,
+/// the baseline gain, both tables' headers) and the tables' entries; `None` when a table's shape doesn't match its
+/// entries (the CPU applies the tables then).
+fn profile_table_words(t: &lcc_raw::profile::ProfileTables, gain: f32) -> Option<(Vec<u32>, Vec<f32>)> {
+    let (hue_sat, look, to, from) = t.parts();
+    let mut words: Vec<u32> = to.iter().chain(from).flatten().map(|v| v.to_bits()).collect();
+    words.push(gain.to_bits());
+    let mut entries: Vec<f32> = Vec::new();
+    for table in [hue_sat, look] {
+        let Some(table) = table else {
+            words.extend([0; 6]);
+            continue;
+        };
+        let (h, s, v) = (table.hue_divisions, table.sat_divisions, table.val_divisions);
+        let count = h.checked_mul(s)?.checked_mul(v)?;
+        if h == 0 || s == 0 || v == 0 || table.data.len() != count {
+            return None;
+        }
+        let first = u32::try_from(entries.len() / 3).ok()?;
+        let dims = [h, s, v].map(u32::try_from);
+        let [Ok(h), Ok(s), Ok(v)] = dims else { return None };
+        words.extend([1, h, s, v, u32::from(table.srgb_value), first]);
+        entries.extend(table.data.iter().flatten());
+    }
+    Some((words, entries))
 }
 
 /// Smooth Skin (`lcc_pipeline::skin`) on the device, in place on `img`, from the CPU's plan

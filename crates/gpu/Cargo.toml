@@ -17,6 +17,7 @@ lcc-raster = { workspace = true }
 lcc-develop = { workspace = true }
 lcc-faces = { workspace = true }
 lcc-pipeline = { workspace = true }
+lcc-raw = { workspace = true }
 log = { workspace = true }
 
 # Native only: Metal / Vulkan / DX12 through wgpu (pure Rust; the drivers are the system's).
@@ -35,4 +36,3 @@ denoise = ["dep:lcc-denoise", "lcc-denoise/runtime"]
 # tests record why they skip (`cargo xtask ci` lists the skips)
 lcc-testkit = { workspace = true }
 lcc-scenes = { workspace = true }
-lcc-raw = { workspace = true }

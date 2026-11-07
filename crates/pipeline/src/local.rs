@@ -48,11 +48,6 @@ pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]
     Some(m.mul(&lcc_color::Mat3::diag(1.0 / y, 1.0 / y, 1.0 / y)).to_f32())
 }
 
-/// Whether the source's camera-profile tables wait for the white balance ([`crate::CameraColor::deferred_tables_gain`]).
-pub fn defers_tables(info: &SourceInfo) -> bool {
-    info.camera_color.as_deref().is_some_and(|cc| cc.deferred_tables_gain.is_some())
-}
-
 /// The camera-profile tables of a source whose tables wait for the white balance, resolved for the white the settings
 /// choose (the dual-illuminant hue/saturation maps blended for it, as for the matrices), with the baseline-exposure
 /// gain the source pixels already carry. `None` when the source has no deferred tables.

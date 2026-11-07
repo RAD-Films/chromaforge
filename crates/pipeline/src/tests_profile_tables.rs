@@ -163,8 +163,8 @@ fn renders_apply_the_deferred_tables_after_the_white_balance() {
 }
 
 #[test]
-fn deferred_tables_keep_the_scene_linear_stage_on_the_cpu() {
+fn deferred_tables_leave_the_scene_linear_stage_on_the_gpu() {
     let s = DevelopSettings::for_raw(AS_SHOT.0, AS_SHOT.1);
-    assert!(crate::lin_needs_cpu(&s, &info(true)), "no GPU kernel for the tables: the CPU stage runs");
+    assert!(!crate::lin_needs_cpu(&s, &info(true)), "the GPU has a kernel for the tables (`wb_tables_k`)");
     assert!(!crate::lin_needs_cpu(&s, &info(false)));
 }

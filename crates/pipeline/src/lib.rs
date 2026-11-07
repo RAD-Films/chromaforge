@@ -740,10 +740,7 @@ pub fn lin_needs_cpu(s: &DevelopSettings, info: &SourceInfo) -> bool {
     // defringe and Clone / Heal / sourced Remove spots have GPU kernels; spots rebuilt from their
     // surroundings (Fill, Generate, a Remove without a source), Even Out and the camera's local
     // tone map don't
-    s.spots.iter().any(|sp| spots::synthesises(sp) || sp.mode == lcc_develop::SpotMode::Flat)
-        || local_tone::enabled(info, s)
-        // (a camera profile's tables waiting for the white balance: no GPU kernel for them yet)
-        || local::defers_tables(info)
+    s.spots.iter().any(|sp| spots::synthesises(sp) || sp.mode == lcc_develop::SpotMode::Flat) || local_tone::enabled(info, s)
 }
 
 /// The white-balanced, defringed, retouched image (before noise reduction): the CPU part of the

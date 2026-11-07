@@ -58,6 +58,7 @@ const MODULES: &[Module] = &[
             "guided_ab",
             "guided_apply",
             "wb_k",
+            "wb_tables_k",
             "nr_lum",
             "chroma_k",
             "clamp0_k",

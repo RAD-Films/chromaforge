@@ -2011,3 +2011,61 @@ fn cached_mask_planes_match_uncached() {
     s.masks[1].visible = false;
     step(&s, "hidden mask");
 }
+
+/// A raw source of process V9 whose camera-profile tables wait for the white balance: a hue/saturation map that
+/// shifts and saturates by hue, and a value-indexed, sRGB-coded look table (the shapes real profiles use).
+fn deferred_tables_source(gain: f32) -> SourceInfo {
+    use lcc_raw::profile::HsvTable;
+    let (h, s) = (18usize, 5usize);
+    let mut map = Vec::new();
+    for hi in 0..h {
+        for si in 0..s {
+            let a = hi as f64 / h as f64 * std::f64::consts::TAU;
+            map.extend_from_slice(&[8.0 * a.sin(), 1.0 + 0.5 * (si as f64 / (s - 1) as f64) * (1.0 + a.cos()) / 2.0, 1.0]);
+        }
+    }
+    let (lh, ls, lv) = (12usize, 4usize, 6usize);
+    let mut look = Vec::new();
+    for vi in 0..lv {
+        for hi in 0..lh {
+            for si in 0..ls {
+                let a = hi as f64 / lh as f64 * std::f64::consts::TAU;
+                look.extend_from_slice(&[-4.0 * a.cos(), 0.9 + 0.08 * si as f64, 0.92 + 0.03 * vi as f64]);
+            }
+        }
+    }
+    let mut tags = lcc_raw::ColorData {
+        illuminant: [17, 21],
+        color_matrix: [
+            Some(lcc_color::Mat3([[0.9, 0.2, -0.15], [-0.3, 1.25, 0.08], [0.02, -0.12, 0.85]])),
+            Some(lcc_color::Mat3([[0.7, 0.3, -0.1], [-0.35, 1.3, 0.1], [0.05, -0.2, 1.0]])),
+        ],
+        ..Default::default()
+    };
+    let table = HsvTable::from_tags(&[h as u64, s as u64, 1], &map, 0).expect("valid map");
+    tags.profile.hue_sat_map = [Some(table.clone()), Some(table)];
+    tags.profile.look_table = HsvTable::from_tags(&[lh as u64, ls as u64, lv as u64], &look, 1);
+    assert!(tags.profile.look_table.is_some());
+    let (temp, tint) = (5500.0, 0.0);
+    let cc = lcc_pipeline::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint), deferred_tables_gain: Some(gain) };
+    SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, camera_color: Some(Arc::new(cc)), ..Default::default() }
+}
+
+#[test]
+fn deferred_profile_tables_render_on_the_gpu() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(0, 320, 240);
+    let req = RenderRequest::fit(320, 240);
+    for gain in [1.0f32, 1.6] {
+        let info = deferred_tables_source(gain);
+        assert!(!lcc_pipeline::lin_needs_cpu(&DevelopSettings::for_raw(5500.0, 0.0), &info), "the tables have a kernel");
+        let mut s = DevelopSettings::for_raw(5500.0, 0.0);
+        check(&format!("V9 tables as shot ×{gain}"), &src, &info, &s, &req);
+        (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 3200.0, 12.0);
+        check(&format!("V9 tables 3200 K ×{gain}"), &src, &info, &s, &req);
+        typical(&mut s);
+        check(&format!("V9 tables edited ×{gain}"), &src, &info, &s, &req);
+    }
+}
