@@ -74,10 +74,17 @@ pub use tone::ToneMap;
 /// spec ch. 6) instead of adapting the as-shot rendering ([`local::wb_matrix_for`]).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CameraColor {
-    /// The file's colour tags (its profile look left out: it is applied at load).
+    /// The file's colour tags. Their profile look is left out (applied at load), except for its hue/saturation map
+    /// and look table when [`Self::deferred_tables_gain`] says they wait for the white balance.
     pub tags: lcc_raw::ColorData,
     /// The white the source pixels were developed for.
     pub developed_for: lcc_color::Xy,
+    /// Process V9 (`LoadOptions::defer_tables`): the source pixels are white-balanced, matrixed and scaled by this
+    /// baseline-exposure gain, but the tags' hue/saturation map and look table are not in them yet; the scene-linear
+    /// stage applies them after the white balance, at the chosen white ([`local::white_balance`]). `None`: any
+    /// tables were applied while decoding, at the as-shot white.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_tables_gain: Option<f32>,
 }
 
 /// Facts about the source the settings are interpreted against.
@@ -733,7 +740,10 @@ pub fn lin_needs_cpu(s: &DevelopSettings, info: &SourceInfo) -> bool {
     // defringe and Clone / Heal / sourced Remove spots have GPU kernels; spots rebuilt from their
     // surroundings (Fill, Generate, a Remove without a source), Even Out and the camera's local
     // tone map don't
-    s.spots.iter().any(|sp| spots::synthesises(sp) || sp.mode == lcc_develop::SpotMode::Flat) || local_tone::enabled(info, s)
+    s.spots.iter().any(|sp| spots::synthesises(sp) || sp.mode == lcc_develop::SpotMode::Flat)
+        || local_tone::enabled(info, s)
+        // (a camera profile's tables waiting for the white balance: no GPU kernel for them yet)
+        || local::defers_tables(info)
 }
 
 /// The white-balanced, defringed, retouched image (before noise reduction): the CPU part of the
@@ -749,6 +759,7 @@ pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     }
     // (before the white balance: the gain's input is the as-shot development, as in the file)
     local_tone::apply(img, info, p);
+    // (process V9: the camera profile's tables with it, after the white balance, DNG spec ch. 6)
     local::white_balance(img, info, s);
     optics::defringe(img, s, p.px_per_long / optics::DEFRINGE_REF_LONG);
     // a Generative spot changes nothing until its patch is there (not generated yet, moved since,
@@ -1158,6 +1169,8 @@ mod tests_nr_scale;
 mod tests_pixel_scale;
 #[cfg(test)]
 mod tests_plugin_filters;
+#[cfg(test)]
+mod tests_profile_tables;
 #[cfg(test)]
 mod tests_retouch;
 #[cfg(test)]

@@ -678,7 +678,7 @@ fn camera_color(temp: f64, tint: f64) -> std::sync::Arc<crate::CameraColor> {
         ],
         ..Default::default()
     };
-    std::sync::Arc::new(crate::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint) })
+    std::sync::Arc::new(crate::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint), deferred_tables_gain: None })
 }
 
 /// Every stored process number renders with a process this build knows: settings saved before

@@ -1393,6 +1393,7 @@ fn smart_previews_keep_the_decoder_facts_offline_edits_need() {
             ..Default::default()
         },
         developed_for: lcc_color::Xy { x: 0.32, y: 0.35 },
+        deferred_tables_gain: None,
     };
     let mut mattes = Mattes::default();
     mattes.push(

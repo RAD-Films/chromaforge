@@ -374,7 +374,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 => true,
+            Process::V7 | Process::V9 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -468,7 +468,7 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V9 => {
             match info.camera_tone.as_ref().filter(|_| raw) {
                 Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
                 None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
