@@ -468,13 +468,25 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {
-            match info.camera_tone.as_ref().filter(|_| raw) {
-                Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
-                None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
-                None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
-            }
-        }
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => {}
+    }
+    let rolloff = rolls_off_into_white(s.process.process());
+    match info.camera_tone.as_ref().filter(|_| raw) {
+        Some(curve) if rolloff => ToneMap::camera_rolloff_hdr(curve, l.contrast, l.whites, l.blacks, peak),
+        Some(curve) => ToneMap::camera_hdr(curve, l.contrast, l.whites, l.blacks, peak),
+        None if raw && rolloff => ToneMap::rolloff_hdr(l.contrast, l.whites, l.blacks, peak),
+        None if raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
+        None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
+    }
+}
+
+/// Whether a process's raw base curve rolls off into white in stops past the sensor's white
+/// ([`ToneMap::camera_rolloff_hdr`] / [`ToneMap::rolloff_hdr`], upstream #1632 / #3783) instead of
+/// clipping about ¼ stop past it. Ported ahead of a process that adopts it: no process does yet,
+/// so every saved edit renders as before. The match is exhaustive, so a new process must decide.
+pub fn rolls_off_into_white(p: Process) -> bool {
+    match p {
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => false,
     }
 }
 
@@ -1206,6 +1218,16 @@ fn enc(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_saved_process_rolls_off_into_white_yet() {
+        // the roll-off is ported ahead of a process: every saved edit must render as it did
+        assert!(Process::ALL.iter().all(|p| !rolls_off_into_white(*p)));
+        // and it is a different curve, so turning it on for a process changes highlights only
+        let (plain, rolled) = (ToneMap::hdr(0.0, 0.0, 0.0, 1.0), ToneMap::rolloff_hdr(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(plain.apply(0.05), rolled.apply(0.05));
+        assert!(rolled.apply(4.0) < plain.apply(4.0));
+    }
 
     #[test]
     fn grain_noise_is_finite_for_degenerate_coordinates() {
