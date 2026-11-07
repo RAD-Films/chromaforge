@@ -56,7 +56,8 @@ use lcc_raw::{
 /// 22: a camera profile without a tone curve of its own keeps the tone the photo has without it (its DNG tone curve,
 /// else the tone fitted to its camera JPEG) instead of the default tone (OneSlips).
 /// 23: smoothed tone curves keep the fitted level through the midtones (`with_smooth_tone`).
-pub const LOOK_VERSION: u32 = 23;
+/// 24: ... and through the shadows: the level is held along the whole curve (`hold_level`).
+pub const LOOK_VERSION: u32 = 24;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CameraLook {
@@ -828,8 +829,8 @@ fn sony_dro_off_tone() -> Option<CameraTone> {
 /// A Gaussian moves a curved line by about σ²/2 times its curvature, and camera curves bend down in
 /// log-log all along: blurred alone, the curve came out lower through the midtones, by about 0.07 in
 /// log at grey (0.1 EV, 4–6 8-bit levels) on Canon EOS R5 C portraits, darker than the camera JPEG
-/// the curve was fitted to. So the blurred curve is moved back to the fitted curve's level at grey
-/// ([`hold_midtones`]).
+/// the curve was fitted to, and further down the shadows. So the blurred curve is moved back to the
+/// fitted curve's level along its length ([`hold_level`]).
 fn with_smooth_tone(look: CameraLook) -> CameraLook {
     let own = *look.tone.knots();
     let Some(grid) = LogGrid::over(&own) else { return look };
@@ -841,7 +842,7 @@ fn with_smooth_tone(look: CameraLook) -> CameraLook {
     }
     let sigma = TONE_SMOOTHING / grid.step;
     let blurred = blur_point_reflected(&values, sigma);
-    let curve = hold_midtones(&grid, &values, blurred);
+    let curve = hold_level(&grid, &values, blurred);
     let [.., [_, own_end]] = own;
     let mut knots = grid.knots(&curve, own_end, |_| 1.0);
     ease_shoulder(&mut knots, &own, |_| 1.0);
@@ -969,32 +970,30 @@ fn ease_shoulder(knots: &mut [[f32; 2]; 32], own: &[[f32; 2]; 32], cap: impl Fn(
     }
 }
 
-/// `values` blurred with a Gaussian of standard deviation `sigma` (in samples), mirrored at both
-/// ends so that a value running into an end stays as it is there.
-/// Stops either side of grey over which [`hold_midtones`] measures how far smoothing moved the curve.
-/// (A stop: half as wide brings back part of a kink that sits at grey; twice as wide doesn't fit in
-/// the range most fitted curves span above grey.)
-const MIDTONE_HOLD_EV: f64 = 1.0;
+/// Width in stops (standard deviation) of the Gaussian over which [`hold_level`] averages how far
+/// smoothing moved the curve: 1.04 in natural log, about twice [`TONE_SMOOTHING`], so a kink's
+/// distance is spread thinner than the kink was and the averaging bends smoothly. (A window with
+/// edges brought kinks back where it ended; a stop wide, the dent of
+/// `a_fitted_curve_is_smoothed_without_flat_segments` came back.)
+const LEVEL_HOLD_EV: f64 = 1.5;
 
-/// `smooth` (log display luminance on `grid`, smoothed from `fitted`) moved by its mean distance to
-/// `fitted` over [`MIDTONE_HOLD_EV`] around grey: all of it at grey, easing (smoothstep in log scene
-/// luminance) to none at both ends of the curve, which stay where they are; spread over the whole
-/// span on each side, so a curve whose last knot is close above grey keeps its shoulder. Unchanged
-/// when the curve doesn't reach past that range on both sides.
-fn hold_midtones(grid: &LogGrid, fitted: &[f64], smooth: Vec<f64>) -> Vec<f64> {
+/// `smooth` (log display luminance on `grid`, smoothed from `fitted`) moved back by its distance to
+/// `fitted` averaged over [`LEVEL_HOLD_EV`] around each point. The smoothing's bias follows the
+/// curve's bend, which varies slowly, so the average brings back the level while a kink, narrower
+/// than that, stays smoothed. All of it from a stop
+/// above the first knot up to grey; eased (smoothstep in log scene luminance) to none at the first
+/// knot, and above grey to none at the last, spread over the whole span there, so both ends stay
+/// where they are and a curve whose last knot is close above grey keeps its shoulder.
+fn hold_level(grid: &LogGrid, fitted: &[f64], smooth: Vec<f64>) -> Vec<f64> {
     let grey = f64::from(lcc_pipeline::tone::GREY).ln();
-    let hold = MIDTONE_HOLD_EV * std::f64::consts::LN_2;
+    let hold = LEVEL_HOLD_EV * std::f64::consts::LN_2;
     let lx: Vec<f64> = grid.xs.iter().map(|&x| f64::from(x).ln()).collect();
     let (Some(&lo), Some(&hi)) = (lx.first(), lx.last()) else { return smooth };
-    let (from, to) = (grey - hold, grey + hold);
-    if !(lo < from && to < hi) {
+    if !(lo < grey && grey < hi) || fitted.len() != smooth.len() || lx.len() != smooth.len() {
         return smooth;
     }
-    let near: Vec<f64> = lx.iter().zip(fitted.iter().zip(&smooth)).filter(|(x, _)| (from..=to).contains(*x)).map(|(_, (f, s))| f - s).collect();
-    if near.is_empty() {
-        return smooth;
-    }
-    let shift = near.iter().sum::<f64>() / near.len() as f64;
+    let distance: Vec<f64> = fitted.iter().zip(&smooth).map(|(f, s)| f - s).collect();
+    let shifts = blur_mirrored(&distance, hold / grid.step);
     let ease = |t: f64| {
         let t = t.clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
@@ -1002,8 +1001,9 @@ fn hold_midtones(grid: &LogGrid, fitted: &[f64], smooth: Vec<f64>) -> Vec<f64> {
     smooth
         .iter()
         .zip(&lx)
-        .map(|(s, &x)| {
-            let w = if x < grey { ease((x - lo) / (grey - lo)) } else { ease((hi - x) / (hi - grey)) };
+        .zip(&shifts)
+        .map(|((s, &x), shift)| {
+            let w = if x < grey { ease((x - lo) / hold.min(grey - lo)) } else { ease((hi - x) / (hi - grey)) };
             s + shift * w
         })
         .collect()
@@ -1049,6 +1049,8 @@ fn blur_point_reflected(values: &[f64], sigma: f64) -> Vec<f64> {
         .collect()
 }
 
+/// `values` blurred with a Gaussian of standard deviation `sigma` (in samples), mirrored at both
+/// ends so that a value running into an end stays as it is there.
 fn blur_mirrored(values: &[f64], sigma: f64) -> Vec<f64> {
     let n = values.len();
     if n == 0 || !(sigma.is_finite() && sigma > 0.0) {
@@ -4294,7 +4296,7 @@ mod tests {
         };
         let fitted = dro_test_look(&xs, &f);
         let smooth = with_smooth_tone(fitted.clone());
-        for ev in [-1.0f32, -0.5, 0.0, 0.5] {
+        for ev in [-4.0f32, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5] {
             let x = 0.18 * ev.exp2();
             let d = (smooth.tone.apply(x) / fitted.tone.apply(x)).ln();
             assert!(d.abs() < 0.01, "at {ev:+} EV the smoothed curve is {d:+.4} off in log");
