@@ -123,15 +123,9 @@ fn parse(json: &[u8], origin: &str) -> Result<CameraProfile, String> {
     Ok(profile)
 }
 
-/// Model spelling with case and spacing folded away, for matching EXIF variants (`Nikon  Z  8` and `NIKON Z 8`).
-fn normalized_model(model: &str) -> String {
-    model.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
-}
-
 /// The built-in profile for `model`, if any.
 fn bundled(model: &str) -> Option<CameraProfile> {
-    let needle = normalized_model(model);
-    let (_, json) = BUNDLED.iter().find(|(m, _)| normalized_model(m) == needle)?;
+    let (_, json) = BUNDLED.iter().find(|(m, _)| *m == model)?;
     parse(json.as_bytes(), &format!("built-in profile {model}")).inspect_err(|e| eprintln!("{}: ignoring camera profile {e}", lcc_brand::BINARY)).ok()
 }
 
@@ -576,23 +570,6 @@ mod tests {
         assert!(load(&dir.join("junk.json")).is_err());
         assert!(load(&dir.join("missing.json")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Upstream #3861: a NEF's model spelling (case, spacing) finds the bundled profile.
-    #[test]
-    fn bundled_profile_matches_nikon_model_spelling_variants() {
-        for (variant, canonical) in [
-            ("Nikon D5300", "NIKON D5300"),
-            ("Nikon  D5300", "NIKON D5300"),
-            (" Nikon D5300 ", "NIKON D5300"),
-            ("Nikon Z 6_2", "NIKON Z 6_2"),
-            ("Nikon  Z  6_2", "NIKON Z 6_2"),
-            ("Nikon Z 8", "NIKON Z 8"),
-            ("Nikon  Z  8", "NIKON Z 8"),
-        ] {
-            assert!(bundled(canonical).is_some(), "{canonical:?} is bundled");
-            assert_eq!(bundled(variant), bundled(canonical), "NEF spelling {variant:?} must find the bundled {canonical:?} profile");
-        }
     }
 
     #[test]
