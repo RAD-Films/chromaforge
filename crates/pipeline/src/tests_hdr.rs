@@ -177,14 +177,14 @@ fn with_process(mut s: DevelopSettings, p: lcc_develop::Process) -> DevelopSetti
 /// Canon R5 C raws (medians over 1.5 M pixels, 7 Nov 2026, `_scratch/lrc-calib-2/hdr1`, `fit/hdr_transfer.py`).
 const LRC_RAW_PAIRS: [(f32, f32); 6] = [(0.45, 0.459), (0.55, 0.575), (0.65, 0.771), (0.75, 1.024), (0.85, 1.603), (0.925, 2.976)];
 
-/// V10's HDR tone is LrC's: on every kind of source, each tone's HDR value follows LrC's measured transfer
-/// from that tone's HDR-off value within 0.1 EV, and the brightest tones reach the headroom exactly (LrC clips
-/// there; V7's shoulder only creeps toward it). Fails under V7, whose HDR highlights are up to 1 EV dimmer.
+/// V10's HDR tone of a raw is LrC's: each tone's HDR value follows LrC's measured transfer from that tone's
+/// HDR-off value within 0.1 EV, and the brightest tones reach the headroom exactly (LrC clips there; V7's
+/// shoulder only creeps toward it). Fails under V7, whose HDR highlights are up to 1 EV dimmer.
 #[test]
 fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
     use crate::finish::base_tone;
     use lcc_develop::Process;
-    for info in [camera_raw(), raw(), SourceInfo::default()] {
+    for info in [camera_raw(), raw()] {
         let hdr_s = with_process(hdr_on(2.3), Process::V10);
         let sdr_s = with_process(DevelopSettings::default(), Process::V10);
         let peak = hdr_s.hdr.peak();
@@ -193,7 +193,8 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
             // the scene value whose SDR tone is `sv` (the SDR LUT is monotone)
             let i = s.lut().iter().position(|&v| v >= sv).expect("the SDR curve reaches the value");
             let got = h.lut()[i];
-            let want = crate::tone::lrc_hdr_value(s.lut()[i], peak);
+            let m = s.lut().iter().copied().fold(0.0f32, f32::max).min(1.0);
+            let want = m * crate::tone::lrc_hdr_value(s.lut()[i] / m, peak / m);
             assert!((got / want).log2().abs() < 0.02, "{info:?}: SDR {} -> HDR {got} (model {want})", s.lut()[i]);
         }
         for &(sv, lrc) in &LRC_RAW_PAIRS {
@@ -224,6 +225,43 @@ fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
             assert_eq!(a.lut(), b.lut(), "{info:?}");
         }
     }
+}
+
+/// Under V10 a raw edited with Whites −100 still reaches the headroom in HDR, as in Lightroom Classic (4.9 of a
+/// 4.9 peak on R5 C raws), and stays brighter than its SDR curve above the mid tones. Failed before the shoulder
+/// unrolled toward the SDR curve's own top: the HDR peak stopped at 1.05.
+#[test]
+fn v10_hdr_reaches_the_headroom_with_whites_lowered() {
+    use crate::finish::base_tone;
+    use lcc_develop::Process;
+    for info in [camera_raw(), raw()] {
+        for whites in [-100.0, -50.0] {
+            let mut hdr_s = with_process(hdr_on(2.3), Process::V10);
+            hdr_s.light.whites = whites;
+            let mut sdr_s = with_process(DevelopSettings::default(), Process::V10);
+            sdr_s.light.whites = whites;
+            let peak = hdr_s.hdr.peak();
+            let (h, s) = (base_tone(&hdr_s, &info, peak), base_tone(&sdr_s, &info, 1.0));
+            let top = *h.lut().last().expect("a table");
+            assert!((top / peak - 1.0).abs() < 1e-4, "{info:?} whites {whites}: HDR top {top} of {peak}");
+            assert!(h.lut().iter().zip(s.lut()).all(|(a, b)| a >= &(b * 0.999)), "{info:?}: never darker than SDR");
+        }
+    }
+}
+
+/// V10 keeps V7's HDR curve for display-referred sources (float TIFFs, JPEGs): it matched LrC within 0.2 EV on
+/// float TIFF charts, and LrC's raw tone made them 0.4-0.7 EV too bright above white. Failed when V10 gave every
+/// source the raw tone.
+#[test]
+fn v10_keeps_the_v7_hdr_tone_of_display_referred_sources() {
+    use crate::finish::base_tone;
+    use lcc_develop::Process;
+    let info = SourceInfo::default();
+    let s = hdr_on(2.3);
+    let peak = s.hdr.peak();
+    let a = base_tone(&with_process(s.clone(), Process::V10), &info, peak);
+    let b = base_tone(&with_process(s, Process::V7), &info, peak);
+    assert_eq!(a.lut(), b.lut());
 }
 
 /// The HDR value of any SDR value is finite and between the SDR value and the peak, for hostile inputs too.

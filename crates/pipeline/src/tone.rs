@@ -111,6 +111,9 @@ pub const LRC_HDR_B: f32 = 1.0285;
 /// ... and the softness of its start.
 pub const LRC_HDR_K: f32 = 0.2491;
 
+/// Smallest SDR top [`ToneMap::hdr_from_sdr`] unrolls toward (lower tops keep SDR white as the top).
+pub const HDR_TOP_MIN: f32 = 0.25;
+
 /// The HDR value of SDR value `s` under [`ToneMap::hdr_from_sdr`]: at least `s` (never darker than the SDR
 /// render), at most `peak`; SDR white and above (an SDR curve that clipped) reach the peak.
 pub fn lrc_hdr_value(s: f32, peak: f32) -> f32 {
@@ -266,12 +269,18 @@ impl ToneMap {
     /// Fitted (0.038 stops rms below the clip) on LrC 15.5 PQ exports of our own float DNG ramp at the default
     /// and a 4-stop headroom and of four Canon R5 C raws of printed charts (pairs of LrC's HDR and HDR-off
     /// renders, 7 Nov 2026; no Adobe code or assets). Contrast, Whites and Blacks act through `sdr`; the
-    /// chroma curve is `sdr`'s. `peak ≤ 1` (or non-finite) returns `sdr` unchanged.
+    /// chroma curve is `sdr`'s. The shoulder unrolls toward the top `m` of `sdr` (its brightest value), not
+    /// toward SDR white: `H = m · lrc(s/m)` with the headroom `peak/m`, so an SDR curve that Whites −100 tops
+    /// out at 0.6 still reaches the headroom in HDR, as LrC's does (it reached 4.9 of 4.9 on the R5 C raws).
+    /// `peak ≤ 1` (or non-finite) returns `sdr` unchanged.
     pub fn hdr_from_sdr(sdr: &ToneMap, peak: f32) -> ToneMap {
         if !peak.is_finite() || peak <= 1.0 {
             return sdr.clone();
         }
-        let lut = sdr.lut.iter().map(|&s| lrc_hdr_value(s, peak)).collect();
+        let top = sdr.lut.iter().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+        // a curve crushed almost to black has no shoulder to unroll: keep white as its top
+        let m = if (HDR_TOP_MIN..1.0).contains(&top) { top } else { 1.0 };
+        let lut = sdr.lut.iter().map(|&s| m * lrc_hdr_value(s / m, peak / m)).collect();
         ToneMap { lut: monotone(lut), chroma: sdr.chroma }
     }
 

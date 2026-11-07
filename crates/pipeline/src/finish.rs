@@ -478,8 +478,10 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => tone(peak),
-        // V10: SDR renders as V7; an HDR render unrolls the SDR curve's shoulder up to the headroom
-        Process::V10 if lrc_hdr && peak > 1.0 => ToneMap::hdr_from_sdr(&tone(1.0), peak),
+        // V10: SDR renders as V7; an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom.
+        // Display-referred sources (float TIFFs, JPEGs) keep V7's HDR curve: it already matched LrC's within
+        // 0.2 EV on float TIFF charts, and the LrC raw tone put them 0.4-0.7 EV too bright
+        Process::V10 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&tone(1.0), peak),
         Process::V10 => tone(peak),
     }
 }
