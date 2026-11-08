@@ -1,4 +1,4 @@
-//! Process V8's global Highlights and Shadows follow Lightroom Classic's: one curve per picture, shaped by the
+//! Process V9's global Highlights and Shadows follow Lightroom Classic's: one curve per picture, shaped by the
 //! picture's histogram (`lcc_pipeline::tone_lift`). Older processes keep the fixed response they had.
 
 use lcc_develop::{DevelopSettings, Light, Process};
@@ -36,11 +36,11 @@ fn srgb8(lin: f64) -> f64 {
 #[test]
 fn v8_shadows_follow_the_pictures_own_curve() {
     let src = picture(-4.0, 1.0);
-    let got = centre(&src, &settings(Process::V8, 100.0, 0.0));
+    let got = centre(&src, &settings(Process::V9, 100.0, 0.0));
     // the curve for this picture's tones (a sixth at -4 EV, the rest at +1 EV), at the patch's tone
     let tones = Tones::new((0..W * H).map(|i| if (i % W) / 120 == 1 && (80..160).contains(&(i / W)) { -4.0 } else { 1.0 })).unwrap();
     let want = srgb8(0.18 * f64::from((-4.0 + Lift::new(&tones, 1.0, 0.0, None).at_both(-4.0)).exp2()));
-    assert!((got - want).abs() <= 2.0, "V8 Shadows +100 on the dark patch: {got} (the curve says {want:.1})");
+    assert!((got - want).abs() <= 2.0, "V9 Shadows +100 on the dark patch: {got} (the curve says {want:.1})");
 }
 
 #[test]
@@ -49,19 +49,19 @@ fn v8_depends_on_the_rest_of_the_picture_and_older_processes_do_not() {
     let (bright, dim) = (picture(-4.0, 1.5), picture(-4.0, -1.5));
     let v7 = settings(Process::V7, 100.0, 0.0);
     assert_eq!(centre(&bright, &v7), centre(&dim, &v7), "V7's Shadows is a fixed response of the tone");
-    let v8 = settings(Process::V8, 100.0, 0.0);
-    let (b, d) = (centre(&bright, &v8), centre(&dim, &v8));
-    assert!((b - d).abs() >= 2.0, "V8's curve is the picture's own: {b} in a bright picture, {d} in a dim one");
-    // and V7 renders as it did, not with the V8 curve
+    let v9 = settings(Process::V9, 100.0, 0.0);
+    let (b, d) = (centre(&bright, &v9), centre(&dim, &v9));
+    assert!((b - d).abs() >= 2.0, "V9's curve is the picture's own: {b} in a bright picture, {d} in a dim one");
+    // and V7 renders as it did, not with the V9 curve
     assert_ne!(centre(&bright, &v7), b);
 }
 
 #[test]
 fn v8_highlights_pull_a_bright_area_down() {
     let src = picture(1.8, -2.0);
-    let flat = centre(&src, &settings(Process::V8, 0.0, 0.0));
-    let down = centre(&src, &settings(Process::V8, 0.0, -100.0));
-    let up = centre(&src, &settings(Process::V8, 0.0, 100.0));
+    let flat = centre(&src, &settings(Process::V9, 0.0, 0.0));
+    let down = centre(&src, &settings(Process::V9, 0.0, -100.0));
+    let up = centre(&src, &settings(Process::V9, 0.0, 100.0));
     assert!(down < flat - 8.0, "Highlights -100: {down} vs {flat}");
     assert!(up >= flat, "Highlights +100: {up} vs {flat}");
 }
@@ -70,7 +70,7 @@ fn v8_highlights_pull_a_bright_area_down() {
 fn v8_with_hostile_pictures_renders() {
     for v in [0.0, f32::NAN, f32::INFINITY, 1e30] {
         let src = Rgb32f::filled(48, 32, [v; 3]);
-        let out = render(&src, &SourceInfo::default(), &settings(Process::V8, 100.0, -100.0), &RenderRequest::fit(48, 32)).image;
+        let out = render(&src, &SourceInfo::default(), &settings(Process::V9, 100.0, -100.0), &RenderRequest::fit(48, 32)).image;
         assert_eq!(out.data.len(), 48 * 32);
     }
 }
@@ -90,18 +90,18 @@ fn raw_centre(src: &Rgb32f, s: &DevelopSettings) -> f64 {
 fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
     // Lightroom's raw Whites +100 depends on how far the picture's brightest tones sit under white
     let dim = picture(-3.0, -2.0);
-    let (flat, v7, v8) =
-        (raw_centre(&dim, &whites(Process::V8, 0.0)), raw_centre(&dim, &whites(Process::V7, 100.0)), raw_centre(&dim, &whites(Process::V8, 100.0)));
-    assert!(v8 - flat > (v7 - flat) + 8.0, "a dim raw: V8 lifts {flat} to {v8}, V7 to {v7}");
+    let (flat, v7, v9) =
+        (raw_centre(&dim, &whites(Process::V9, 0.0)), raw_centre(&dim, &whites(Process::V7, 100.0)), raw_centre(&dim, &whites(Process::V9, 100.0)));
+    assert!(v9 - flat > (v7 - flat) + 8.0, "a dim raw: V9 lifts {flat} to {v9}, V7 to {v7}");
     let bright = picture(-1.0, 4.0); // its field shows as white
-    let (flat, v7, v8) = (
-        raw_centre(&bright, &whites(Process::V8, 0.0)),
+    let (flat, v7, v9) = (
+        raw_centre(&bright, &whites(Process::V9, 0.0)),
         raw_centre(&bright, &whites(Process::V7, 100.0)),
-        raw_centre(&bright, &whites(Process::V8, 100.0)),
+        raw_centre(&bright, &whites(Process::V9, 100.0)),
     );
-    assert!(v8 > flat && v8 - flat < v7 - flat, "a bright raw: V8 lifts {flat} to {v8}, less than V7's {v7}");
+    assert!(v9 > flat && v9 - flat < v7 - flat, "a bright raw: V9 lifts {flat} to {v9}, less than V7's {v7}");
     // Whites down and older processes keep the tone map's response
-    assert_eq!(raw_centre(&bright, &whites(Process::V8, -100.0)), raw_centre(&bright, &whites(Process::V7, -100.0)));
+    assert_eq!(raw_centre(&bright, &whites(Process::V9, -100.0)), raw_centre(&bright, &whites(Process::V7, -100.0)));
 }
 
 /// A wall at `dark` EV over grey on the left half, a window at `bright` EV on the right, `w` × `w / 2`.
@@ -134,15 +134,15 @@ fn v8_shadows_and_highlights_ease_off_at_an_edge_like_lightrooms() {
     let w = 2400;
     let e = w / 2;
     let src = wall_and_window(w, -4.0, 1.5);
-    let zero = settings(Process::V8, 0.0, 0.0);
+    let zero = settings(Process::V9, 0.0, 0.0);
     // Shadows +100: the wall's last pixels lift less, back to the full lift within a few px; the window gets none
-    let s = row_change(&src, &settings(Process::V8, 100.0, 0.0), &zero);
+    let s = row_change(&src, &settings(Process::V9, 100.0, 0.0), &zero);
     let (near, far) = (s[e - 1], s[e - 60]);
     assert!(far > near + 0.3, "Shadows lifts the wall's last pixel less: {near:.2} EV there, {far:.2} far away");
     assert!((s[e - 8] - far).abs() < 0.1, "and is back 8 px from the edge: {:.2} vs {far:.2}", s[e - 8]);
     assert!(s[e..].iter().all(|v| v.abs() < 0.1), "the window gets no lift: {:.2}", s[e..].iter().fold(0.0f64, |m, v| m.max(v.abs())));
     // Highlights −100: the wall keeps its change up to the edge; the window's first pixels are pulled less
-    let h = row_change(&src, &settings(Process::V8, 0.0, -100.0), &zero);
+    let h = row_change(&src, &settings(Process::V9, 0.0, -100.0), &zero);
     assert!((h[e - 1] - h[e - 60]).abs() < 0.02, "Highlights doesn't spread onto the wall: {:.2} at the edge, {:.2} far", h[e - 1], h[e - 60]);
     let (near, far) = (h[e], h[e + 60]);
     assert!(near > far + 0.5, "Highlights pulls the window's first pixel less: {near:.2} EV there, {far:.2} far away");
@@ -194,7 +194,7 @@ fn v8_a_smooth_ramp_shows_no_bands() {
     let tone = lcc_pipeline::tone::CameraTone::default_raw().map(|c| c.under_default_curve());
     let info = SourceInfo { raw: true, camera_tone: tone, ..SourceInfo::default() };
     let shoulder = {
-        let zero = settings(Process::V8, 0.0, 0.0);
+        let zero = settings(Process::V9, 0.0, 0.0);
         let req = RenderRequest { depth: lcc_pipeline::OutputDepth::F32Linear, ..RenderRequest::fit(w, h) };
         let Some(lcc_pipeline::DeepSamples::F32(px)) = render(&src, &info, &zero, &req).deep.map(|d| d.samples) else { panic!("no float render") };
         let x = w / 2 + ((ev0 - 2.5) / per_px) as usize;
@@ -204,7 +204,7 @@ fn v8_a_smooth_ramp_shows_no_bands() {
     for (sh, hl) in [(0.0, 0.0), (100.0, 0.0), (0.0, -100.0), (100.0, -100.0), (-100.0, 100.0)] {
         // (shown under where the camera curve's shoulder joins its roll-off, 2.5 EV over grey with the sliders at 0:
         // that join is the tone map's own work, not this one's)
-        let (step, at) = worst_slope_step(&src, &info, &settings(Process::V8, sh, hl), ev0, per_px, (-6.0, ev0), shoulder);
+        let (step, at) = worst_slope_step(&src, &info, &settings(Process::V9, sh, hl), ev0, per_px, (-6.0, ev0), shoulder);
         assert!(step < 0.03, "Shadows {sh}, Highlights {hl}: the tone response's slope steps by {step:.3} at {at:+.2} EV");
     }
 }

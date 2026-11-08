@@ -169,7 +169,7 @@ pub struct LoadOptions {
     /// Correct the raw's hot, dead and stuck pixels (`sensor.pixelFix`): the camera body's known ones
     /// and the clear ones this photo shows (`crate::files::repair_pixels`).
     pub pixel_fix: bool,
-    /// Rebuild a raw's fully clipped highlights brighter than the sensor's clip (process V8 and above,
+    /// Rebuild a raw's fully clipped highlights brighter than the sensor's clip (process V9 and above,
     /// [`crate::files::HIGHLIGHT_HEADROOM`] stops), as Lightroom Classic shows them when Exposure goes down.
     pub highlight_headroom: bool,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
@@ -200,7 +200,7 @@ impl LoadOptions {
             camera: s.profile.camera.clone(),
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
-            highlight_headroom: s.process.process() >= lcc_develop::Process::V8,
+            highlight_headroom: s.process.process() >= lcc_develop::Process::V9,
             path: None,
         }
     }
@@ -2972,24 +2972,24 @@ pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync
 mod thumbnail_hash_tests {
     use super::*;
 
-    /// Process V8's decode rebuilds a raw's clipped highlights with headroom, older processes' without; a decoded
+    /// Process V9's decode rebuilds a raw's clipped highlights with headroom, older processes' without; a decoded
     /// raw serves only the one it was made for, a decoded JPEG either.
     #[test]
     fn a_decoded_raw_serves_only_its_own_highlight_headroom() {
         use lcc_develop::Process;
-        let mut s = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
-        let v8 = LoadOptions::of(&s);
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let v9 = LoadOptions::of(&s);
         s.process = Process::V7.version();
         let v7 = LoadOptions::of(&s);
-        assert!(v8.highlight_headroom && !v7.highlight_headroom);
+        assert!(v9.highlight_headroom && !v7.highlight_headroom);
         assert!(!LoadOptions::default().highlight_headroom);
         let img = Arc::new(Rgb32f::filled(2, 2, [0.5; 3]));
         let raw = DecodedSource { options: v7.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
         // only a headroom that changes the pixels needs its own decode
         assert!(raw.serves(&v7));
-        assert_eq!(raw.serves(&v8), crate::files::HIGHLIGHT_HEADROOM == 0.0);
+        assert_eq!(raw.serves(&v9), crate::files::HIGHLIGHT_HEADROOM == 0.0);
         let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
-        assert!(jpeg.serves(&v7) && jpeg.serves(&v8));
+        assert!(jpeg.serves(&v7) && jpeg.serves(&v9));
     }
 
     fn session() -> crate::Session {

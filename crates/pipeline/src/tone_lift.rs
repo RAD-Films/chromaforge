@@ -1,4 +1,4 @@
-//! The global Highlights and Shadows of process V8: Lightroom Classic's response, one tone curve per picture.
+//! The global Highlights and Shadows of process V9: Lightroom Classic's response, one tone curve per picture.
 //!
 //! Measured on Lightroom Classic exports of our own procedural pictures (240 photo-like scenes with skies, shapes,
 //! textures, night, high-key, fog, back-lit and portrait-like layouts; 16-bit sRGB TIFFs, OneSlips, Nov 2026):
@@ -619,13 +619,13 @@ fn finite(v: f32) -> f32 {
 
 /// Whether `s` renders its global Highlights / Shadows with this module's curve.
 pub fn active(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V8 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
+    s.process.process() >= Process::V9 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
 }
 
-/// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V8 and above, Whites up
+/// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V9 and above, Whites up
 /// ([`Whites`]). The tone map then leaves its white point where Whites 0 has it ([`crate::finish`]).
 pub fn whites_on_raw(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V8 && s.light.whites > 0.0
+    s.process.process() >= Process::V9 && s.light.whites > 0.0
 }
 
 type Cached = (u64, Arc<Tones>);
@@ -674,7 +674,7 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
     Some(t)
 }
 
-/// The V8 Highlights / Shadows table of `s` for the whole `frame` of `src`, or `None` when `s` doesn't use it
+/// The V9 Highlights / Shadows table of `s` for the whole `frame` of `src`, or `None` when `s` doesn't use it
 /// ([`active`]) or the frame is empty. `raw_tone` is a raw's default tone map (scene → display luminance), `None`
 /// for a display-referred source.
 pub fn for_frame(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, raw_tone: Option<&ToneMap>) -> Option<Arc<Lift>> {

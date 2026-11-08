@@ -862,7 +862,7 @@ pub fn render(
         narrow: prep.narrow.as_ref().map(|_| local::NARROW_BASE.weight),
     };
     // the finish kernel's `base` binding: the small base, then the wide one (one binding for both, as `tex`)
-    // (then the narrow one, when V8's Highlights / Shadows reads it)
+    // (then the narrow one, when V9's Highlights / Shadows reads it)
     let extra: Vec<&Arc<Buf>> = prep.wide.iter().chain(prep.narrow.iter()).collect();
     let base_buf: Arc<Buf> = if extra.is_empty() {
         prep.base.clone()

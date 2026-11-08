@@ -221,7 +221,7 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     assert!((own.apply(0.18) - camera).abs() < 0.05, "the fit learnt the camera's curve: {} vs {camera}", own.apply(0.18));
     let default = lcc_pipeline::tone::CameraTone::default_raw().unwrap();
     assert!((own.apply(0.18) - default.apply(0.18)).abs() > 0.02, "the camera's tone is not the default one");
-    // (kept under a profile without a curve, the tone is marked for Lightroom's default look in process 8)
+    // (kept under a profile without a curve, the tone is marked for Lightroom's default look in process 9)
     assert!(!own.has_default_curve(), "fitted without a profile: no Lightroom look");
     let kept = own.under_default_curve();
     assert_eq!(camera_tone_with(&bytes, PLAIN, true), Some(kept), "a matrix-only profile keeps the photo's tone");
@@ -257,9 +257,9 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     let (_, flat) = luma(&lcc_pipeline::SourceInfo { camera_tone: None, ..info.clone() }, lcc_develop::Process::V7);
     eprintln!("luma standard deviation under the matrix-only profile: {kept:.2} (default tone before: {flat:.2})");
     assert!(kept > flat * 1.05, "the photo's tone keeps more contrast: {kept} vs {flat}");
-    // process 8 draws the kept tone in Lightroom's default look: lighter than process 7
-    let (v7, v8) = (luma(&info, lcc_develop::Process::V7).0, luma(&info, lcc_develop::Process::V8).0);
-    assert!(v8 > v7 + 2.0, "process 8 renders the kept tone lighter: {v8} vs {v7}");
+    // process 9 draws the kept tone in Lightroom's default look: lighter than process 7
+    let (v7, v9) = (luma(&info, lcc_develop::Process::V7).0, luma(&info, lcc_develop::Process::V9).0);
+    assert!(v9 > v7 + 2.0, "process 9 renders the kept tone lighter: {v9} vs {v7}");
 }
 
 /// An imported photo carries its camera profile in its settings (`develop.profile.camera`, from the import's

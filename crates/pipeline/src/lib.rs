@@ -332,9 +332,9 @@ pub(crate) struct Prepared {
     /// Log2 luminance relative to middle grey (before exposure: add `ev`).
     pub log_l: Arc<Plane>,
     pub base: Arc<Plane>,
-    /// Wide base of V8's Highlights past white ([`local::wide_sigma`]; log luminance before exposure).
+    /// Wide base of V9's Highlights past white ([`local::wide_sigma`]; log luminance before exposure).
     pub wide: Option<Arc<Plane>>,
-    /// Narrow base of V8's Highlights / Shadows ([`local::NarrowBase`]; log luminance before exposure).
+    /// Narrow base of V9's Highlights / Shadows ([`local::NarrowBase`]; log luminance before exposure).
     pub narrow: Option<Arc<Plane>>,
     pub clarity_blur: Option<Arc<Plane>>,
     pub texture_blur: Option<Arc<Plane>>,
@@ -348,7 +348,7 @@ pub(crate) struct Prepared {
     pub masks: Vec<masks::Evaluated>,
     /// The masks' own Whites / Blacks tone ranges ([`Plan::mask_tone`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// The global Highlights / Shadows table of process V8 ([`Plan::tone_lift`]).
+    /// The global Highlights / Shadows table of process V9 ([`Plan::tone_lift`]).
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
@@ -546,8 +546,8 @@ pub struct Plan<'a> {
     /// render of the whole frame ([`mask_tone`]), so previews, zoomed windows and exports agree; empty when no mask
     /// has Whites or Blacks (the masks then use [`finish::DEFAULT_MASK_TONE`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// Process V8's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
-    /// the whole frame so previews, zoomed windows and exports agree; `None` before V8 or with both at 0.
+    /// Process V9's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
+    /// the whole frame so previews, zoomed windows and exports agree; `None` before V9 or with both at 0.
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// A windowed render works on a larger window when spots reach into it (see
     /// [`spots::window_for_reads`]); this is the requested window inside the rendered one, which

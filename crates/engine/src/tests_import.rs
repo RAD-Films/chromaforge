@@ -2707,7 +2707,7 @@ fn smart_look_refresh_for(format: &str) {
     assert_eq!((r["refreshed"].as_u64(), calls.load(Ordering::SeqCst)), (Some(0), 1), "{r}");
     assert!(std::fs::read(&file).unwrap() == rebuilt);
 
-    // a folder checked before the highlight headroom was recorded is scanned once more: a process 8 raw's proxy
+    // a folder checked before the highlight headroom was recorded is scanned once more: a process 9 raw's proxy
     // made without headroom is rebuilt with this build's (no version changed, so only the marker can tell)
     let want = crate::files::headroom_of(&crate::media::LoadOptions::of(&s.catalog.photo(id).unwrap().develop));
     if want > 0.0 {
@@ -2906,7 +2906,7 @@ fn smart_preview_look_marker_is_read_safely() {
         (format!("{cur} {enc} {hr}\n"), true),
         (format!(" {} {} {hr}\n", cur + 1, enc + 1), true),
         // Checked at another highlight headroom (none recorded means 0), or a damaged one: the folder is
-        // scanned again, so process 8 raws' proxies get this build's headroom.
+        // scanned again, so process 9 raws' proxies get this build's headroom.
         (format!("{cur} {enc} {}\n", hr + 1.0), false),
         (format!("{cur} {enc} NaN\n"), false),
         (format!("{cur} {enc} banana\n"), false),

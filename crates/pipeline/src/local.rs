@@ -381,7 +381,7 @@ pub const DEHAZE_PATCH_MAX: usize = 64;
 pub fn dehaze_patch_radius(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 | Process::V2 => 0,
-        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
+        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V9 => {
             ((DEHAZE_PATCH * px_per_long).round().max(1.0) as usize).min(DEHAZE_PATCH_MAX)
         }
     }
@@ -440,7 +440,7 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => base_detail_radius(px_per_long),
+        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V9 => base_detail_radius(px_per_long),
     }
 }
 
@@ -721,9 +721,9 @@ pub(crate) struct Planes {
     pub log_l: Option<Arc<Plane>>,
     /// Keyed by its radius, process and median radius ([`BaseKey`]).
     pub base: Option<(BaseKey, Arc<Plane>)>,
-    /// The wide base of V8's Highlights / Shadows ([`ToneBase`]), keyed by its radius and leak.
+    /// The wide base of V9's Highlights / Shadows ([`ToneBase`]), keyed by its radius and leak.
     pub wide: Option<(u32, Arc<Plane>)>,
-    /// The narrow base of V8's Highlights / Shadows ([`NarrowBase`]), keyed by its radius.
+    /// The narrow base of V9's Highlights / Shadows ([`NarrowBase`]), keyed by its radius.
     pub narrow: Option<(u32, Arc<Plane>)>,
     pub clarity: Option<(u32, Arc<Plane>)>,
     pub texture: Option<(u32, Arc<Plane>)>,
@@ -823,13 +823,13 @@ pub struct PlaneSigmas {
     pub dark_patch: usize,
     /// Chromaticity blur for local Moiré / colour noise (Gaussian).
     pub chroma: Option<f32>,
-    /// Wide, leaky base of V8's Highlights / Shadows ([`ToneBase`]).
+    /// Wide, leaky base of V9's Highlights / Shadows ([`ToneBase`]).
     pub wide: Option<f32>,
-    /// Narrow, leaky base of V8's Highlights / Shadows ([`NarrowBase`]: Gaussian).
+    /// Narrow, leaky base of V9's Highlights / Shadows ([`NarrowBase`]: Gaussian).
     pub narrow: Option<f32>,
 }
 
-/// The wide, leaky base V8's Highlights / Shadows read their table at, blended into the small base
+/// The wide, leaky base V9's Highlights / Shadows read their table at, blended into the small base
 /// ([`tone_base`]). Lightroom's Highlights / Shadows behave as a large local mask whose pull spills across edges:
 /// on a dark wall next to a bright window Shadows lifts less within a few percent of the long edge, and Highlights
 /// pulls a sky harder next to a dark slab. The default reproduces that spill (fitted to its delta maps); the
@@ -851,7 +851,7 @@ pub const TONE_BASE: ToneBase = ToneBase { radius: 0.06, leak: 2.0, weight: 0.3 
 /// Radius of the wide base (fraction of the long edge), also the Highlights past-white term's ([`crate::tone_lift::Regional`]).
 pub const WIDE_SIGMA: f32 = TONE_BASE.radius;
 
-/// The narrow, leaky base of V8's Highlights / Shadows: a plain Gaussian of log luminance. Shadows reads its table at
+/// The narrow, leaky base of V9's Highlights / Shadows: a plain Gaussian of log luminance. Shadows reads its table at
 /// the brighter of the base and this one, Highlights at the darker, so next to a bright region Shadows lifts a dark
 /// one less, next to a dark region Highlights pulls a bright one less, and neither spreads into the other region.
 /// That is Lightroom's edge bleed measured per pixel at full resolution (8 Nov 2026): on a wall next to a bright
@@ -875,9 +875,9 @@ pub fn narrow_sigma(px_per_long: f64) -> f32 {
     (NARROW_BASE.radius * px_per_long as f32).max(0.5)
 }
 
-/// Whether V8's Highlights / Shadows read the wide and narrow bases ([`ToneBase`], [`NarrowBase`]).
+/// Whether V9's Highlights / Shadows read the wide and narrow bases ([`ToneBase`], [`NarrowBase`]).
 pub fn v8_tone(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V8 && (s.light.highlights != 0.0 || s.light.shadows != 0.0)
+    s.process.process() >= Process::V9 && (s.light.highlights != 0.0 || s.light.shadows != 0.0)
 }
 
 /// The cache key of the wide base plane with radius `sigma` px ([`Planes::wide`]).
@@ -892,7 +892,7 @@ const WIDE_PROXY_EDGE: usize = 1024;
 /// pixels are `w × h` from `origin`. A zoomed window can't hold a base 6 % of the long edge wide: read from its own
 /// pixels, a 512 px window of a 7680 px frame drew Highlights / Shadows 2.5 levels off the whole render on average.
 /// So it is worked out on a proxy of the whole frame ([`WIDE_PROXY_EDGE`], white-balanced as the image is) and
-/// sampled at the window's pixels (bilinear). `None` when V8's Highlights / Shadows are off or the frame is empty.
+/// sampled at the window's pixels (bilinear). `None` when V9's Highlights / Shadows are off or the frame is empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_wide(
     src: &Rgb32f,
@@ -1016,7 +1016,7 @@ pub fn plane_sigmas(s: &DevelopSettings, px_per_long: f64, src_long: f64, _quali
     // sharpening (Amount, or a mask's Sharpness) has its own pixel-scale band, off when it would fade away
     let sharpen_raw = sharpen_sigma_raw(s, px_per_long, src_long);
     let sharpen = (v4 && sharpening && sharpen_fade(sharpen_raw) > 0.0).then(|| sharpen_sigma(sharpen_raw));
-    // V8 Highlights / Shadows: their table is read at a blend of the small and the wide, leaky base
+    // V9 Highlights / Shadows: their table is read at a blend of the small and the wide, leaky base
     let v8_tone = v8_tone(s);
     let wide = v8_tone.then(|| wide_sigma(px_per_long));
     let narrow = v8_tone.then(|| narrow_sigma(px_per_long));

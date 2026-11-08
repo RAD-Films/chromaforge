@@ -33,7 +33,7 @@ pub struct CameraTone {
     knots: [[f32; 2]; 32],
     chroma: [f32; CHROMA_N],
     /// The curve is the camera JPEG's tone kept under a camera profile with no tone curve of its own (most
-    /// chart-made profiles): Lightroom draws such a profile with its default curve, so process 8 adds [`lrc_look`].
+    /// chart-made profiles): Lightroom draws such a profile with its default curve, so process 9 adds [`lrc_look`].
     /// A calibration's or DNG's own curve, and a look fitted to the camera JPEG alone, get none.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     default_curve: bool,
@@ -47,7 +47,7 @@ impl<'de> serde::Deserialize<'de> for CameraTone {
             // absent in smart previews written before the chroma curve existed
             #[serde(default)]
             chroma: Option<[f32; CHROMA_N]>,
-            // absent before process 8's look, and for every other curve
+            // absent before process 9's look, and for every other curve
             #[serde(default)]
             default_curve: bool,
         }
@@ -129,7 +129,7 @@ impl CameraTone {
         1.0 - (1.0 - b[1]) * (-(y - b[0]) * slope / (1.0 - b[1]).max(0.01)).exp()
     }
 
-    /// [`CameraTone::apply`] without slope steps at the knots (process V8): between knots with both values above
+    /// [`CameraTone::apply`] without slope steps at the knots (process V9): between knots with both values above
     /// zero, a monotone cubic (Fritsch–Carlson) in log scene against log display luminance, so a smooth sky shows no
     /// bands at the knots; through every knot as before. Outside them (below the first such knot, past the last) as
     /// [`CameraTone::apply`].
@@ -228,7 +228,7 @@ impl ToneMap {
         ToneMap::camera_with(curve, |y| curve.apply(y), contrast, whites, blacks, peak)
     }
 
-    /// [`ToneMap::camera_hdr`] for process 8: a camera JPEG's tone kept under a profile without a tone curve
+    /// [`ToneMap::camera_hdr`] for process 9: a camera JPEG's tone kept under a profile without a tone curve
     /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]); any other curve as is.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
         if curve.has_default_curve() {
@@ -346,7 +346,7 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
-    /// Process V8's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
+    /// Process V9's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
     /// follow Lightroom Classic's responses measured on a grey wedge of our own ([`lrc_tables`]); Contrast is
     /// [`ToneMap::display`]'s. `exposure` (EV) is the gain already in the luminance this table is read at, so a
     /// brighter Exposure rolls the highlights off as Lightroom does instead of clipping them. Exposure down stays a
@@ -577,18 +577,18 @@ mod tests {
             assert!(v >= previous && v <= 1.0, "{i}: {v} after {previous}");
             previous = v;
         }
-        // process 8's tone map has it; earlier processes don't
+        // process 9's tone map has it; earlier processes don't
         let knots = std::array::from_fn(|i| {
             let x = 0.002 * 1.25f32.powi(i as i32);
             [x, 1.0 - (-2.0 * x).exp()]
         });
         let plain = CameraTone::new(knots).unwrap();
         let curve = plain.under_default_curve();
-        let (v7, v8) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
-        // (V8 reads the camera curve smoothly between its knots: [`CameraTone::apply_smooth`])
+        let (v7, v9) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
+        // (V9 reads the camera curve smoothly between its knots: [`CameraTone::apply_smooth`])
         let smooth = |c: &CameraTone| ToneMap::camera_with(c, |y| c.apply_smooth(y), 0.0, 0.0, 0.0, 1.0);
-        assert!((v8.apply(0.1) - lrc_look(smooth(&curve).apply(0.1))).abs() < 1e-4);
-        assert!(v8.apply(0.1) > v7.apply(0.1) * 1.1);
+        assert!((v9.apply(0.1) - lrc_look(smooth(&curve).apply(0.1))).abs() < 1e-4);
+        assert!(v9.apply(0.1) > v7.apply(0.1) * 1.1);
         // any other curve (a profile's own, a look fitted to the camera JPEG alone) gets no look
         assert!(curve.has_default_curve() && !plain.has_default_curve());
         assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - smooth(&plain).apply(0.1)).abs() < 1e-4);
@@ -747,7 +747,7 @@ mod tests {
         lcc_color::transfer::linear_to_srgb(map.apply(lcc_color::transfer::srgb_to_linear(x) * ev.exp2()))
     }
 
-    /// V8's display tone map is the file itself at neutral settings.
+    /// V9's display tone map is the file itself at neutral settings.
     #[test]
     fn display_lrc_is_identity_when_neutral() {
         let map = ToneMap::display_lrc(0.0, 0.0, 0.0, 0.0);

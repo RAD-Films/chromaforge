@@ -50,7 +50,7 @@ fn lut_at(o: u32, x: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V8's Shadows (`table` 0) or Highlights (1) shift at base tone `ev` (`tone_lift::Lift::at` / `at_h`).
+// Process V9's Shadows (`table` 0) or Highlights (1) shift at base tone `ev` (`tone_lift::Lift::at` / `at_h`).
 fn lift_at(table: u32, ev: f32) -> f32 {
     let o = pu(F_LIFT_OFF) + table * pu(F_LIFT_N);
     let n = pu(F_LIFT_N);
@@ -846,7 +846,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var delta = 0.0;
     var hh = pf(F_HL) + lt[4];
     var ss = pf(F_SH) + lt[5];
-    // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
+    // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
     if (pu(F_LIFT) != 0u) {
         var lb = base;
         if (pu(F_WIDE) != 0u) {

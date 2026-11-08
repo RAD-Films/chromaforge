@@ -489,7 +489,7 @@ const LOOK_MARKER: &str = "look-version";
 /// ([`crate::files::HIGHLIGHT_HEADROOM`]; a marker without one was written at 0). A missing or unreadable marker
 /// counts as not, and so does one written before the encode version was recorded — it only says the look
 /// was checked, so this build scans the folder once more and rebuilds the proxies [`is_stale`]
-/// finds. A headroom has no older or newer: a marker at another one gets the folder scanned again, so the process 8
+/// finds. A headroom has no older or newer: a marker at another one gets the folder scanned again, so the process 9
 /// raws' proxies, whose pixels carry the headroom, are rebuilt with this build's.
 pub fn look_checked(dir: &Path) -> bool {
     use std::io::Read;
