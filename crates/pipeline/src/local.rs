@@ -24,6 +24,19 @@ pub fn white_balance(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings) {
     wb_gain(img, info, s, 1.0);
 }
 
+/// Everything [`white_balance`] reads besides the pixels, for the key of a cache of its result: the matrix it
+/// applies ([`wb_matrix_for`]: the white, the raw flag, the camera's colour model) and the camera profile's deferred
+/// tables ([`deferred_tables`]: which profile, its gain, the white it was developed for).
+pub(crate) fn white_balance_key(info: &SourceInfo, s: &DevelopSettings) -> impl std::hash::Hash {
+    let m = wb_matrix_for(info, s).map(|m| m.map(|r| r.map(f32::to_bits)));
+    let tables = info
+        .camera_color
+        .as_ref()
+        .filter(|c| c.deferred_tables_gain.is_some())
+        .map(|c| (Arc::as_ptr(c) as usize, c.deferred_tables_gain.map(f32::to_bits), [c.developed_for.x.to_bits(), c.developed_for.y.to_bits()]));
+    (m, tables)
+}
+
 /// The white-balance matrix (linear Rec.2020) for the settings, or `None` when the as-shot white
 /// is kept. A raw source with its camera colour model ([`crate::CameraColor`]) is re-developed for
 /// the new white in camera space, as Lightroom does (so a neutral under the chosen white renders

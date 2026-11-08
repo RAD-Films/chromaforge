@@ -404,6 +404,7 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
             crate::optics::fingerprint(src),
             format!("{frame:?}"),
             [t.to_bits(), tint.to_bits(), info.as_shot_temp.to_bits(), info.as_shot_tint.to_bits()],
+            crate::local::white_balance_key(info, s),
             ev.to_bits(),
         ))
     };
@@ -600,5 +601,42 @@ mod tests {
             assert!(l.0.iter().all(|v| v.is_finite() && v.abs() <= MAX_SHIFT));
             assert!(l.at(f32::NAN).is_finite() && l.at(1e30).is_finite());
         }
+    }
+
+    /// The measured tones are kept by what the white balance reads: the same pixels and white under another camera
+    /// colour model (re-developed in camera space, or adapted with Bradford) are measured again, not taken from the
+    /// last photo's.
+    #[test]
+    fn the_kept_tones_follow_the_camera_colour_model() {
+        use lcc_color::Mat3;
+        let mut src = Rgb32f::new(96, 64);
+        for (i, p) in src.data.iter_mut().enumerate() {
+            let x = (i % 96) as f32 / 95.0;
+            *p = [0.02 + 0.6 * x, 0.05 + 0.2 * (1.0 - x), 0.4 * x * x + 0.01];
+        }
+        let tags = lcc_raw::ColorData {
+            illuminant: [17, 21],
+            color_matrix: [
+                Some(Mat3([[0.9, 0.2, -0.15], [-0.3, 1.25, 0.08], [0.02, -0.12, 0.85]])),
+                Some(Mat3([[0.7, 0.3, -0.1], [-0.35, 1.3, 0.1], [0.05, -0.2, 1.0]])),
+            ],
+            ..Default::default()
+        };
+        let cc = Arc::new(crate::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(5200.0, 5.0), deferred_tables_gain: None });
+        let camera = SourceInfo { raw: true, as_shot_temp: 5200.0, as_shot_tint: 5.0, camera_color: Some(cc), ..Default::default() };
+        let bradford = SourceInfo { relative_wb: true, ..camera.clone() };
+        let mut s = DevelopSettings::default();
+        (s.wb.mode, s.wb.temp, s.wb.tint) = (lcc_develop::WbMode::Custom, 2900.0, 30.0);
+        let frame = Frame::new(src.width, src.height, &s, true);
+        let fresh = |info: &SourceInfo| {
+            let mut img = Rgb32f::clone(&frame_proxy(&src, &frame, 96, 64));
+            white_balance(&mut img, info, &s);
+            img.data.iter().map(|c| log_lum(*c)).sum::<f32>()
+        };
+        assert!((fresh(&camera) - fresh(&bradford)).abs() > 1e-3, "the two models white-balance differently");
+        let median = |info: &SourceInfo| tones(&src, info, &s, &frame).map(|t| t.percentile(50.0));
+        let (a, b) = (median(&camera), median(&bradford));
+        assert_ne!(a, b, "the second model's tones were taken from the first's");
+        assert_eq!(median(&camera), a);
     }
 }
