@@ -344,7 +344,7 @@ pub(crate) struct Prepared {
     pub masks: Vec<masks::Evaluated>,
     /// The masks' own Whites / Blacks tone ranges ([`Plan::mask_tone`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// The global Highlights / Shadows table of process V8 ([`Plan::tone_lift`]).
+    /// The global Highlights / Shadows table of process V9 ([`Plan::tone_lift`]).
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
@@ -540,8 +540,8 @@ pub struct Plan<'a> {
     /// render of the whole frame ([`mask_tone`]), so previews, zoomed windows and exports agree; empty when no mask
     /// has Whites or Blacks (the masks then use [`finish::DEFAULT_MASK_TONE`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// Process V8's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
-    /// the whole frame so previews, zoomed windows and exports agree; `None` before V8 or with both at 0.
+    /// Process V9's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
+    /// the whole frame so previews, zoomed windows and exports agree; `None` before V9 or with both at 0.
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// A windowed render works on a larger window when spots reach into it (see
     /// [`spots::window_for_reads`]); this is the requested window inside the rendered one, which

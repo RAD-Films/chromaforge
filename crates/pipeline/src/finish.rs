@@ -299,7 +299,7 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     pub hl: f32,
     pub sh: f32,
-    /// Process V8's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
+    /// Process V9's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
     /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
     /// render's plan.
     pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
@@ -378,7 +378,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 | Process::V8 => true,
+            Process::V7 | Process::V9 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -471,7 +471,7 @@ fn tones_as_raw(s: &DevelopSettings, info: &SourceInfo) -> bool {
             && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone())
 }
 
-/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V8's
+/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V9's
 /// Highlights / Shadows curve is applied in ([`crate::tone_lift`]); `None` for a display-referred source.
 pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
     if !tones_as_raw(s, info) {
@@ -490,14 +490,14 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
-        // V8: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
-        Process::V8 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
-        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
-            // V8: a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
+        // V9: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
+        Process::V9 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
+        Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V9 => {
+            // V9: a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
             let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
             match info.camera_tone.as_ref().filter(|_| raw) {
-                // V8: a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
-                Some(curve) if s.process.process() >= Process::V8 => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
+                // V9: a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
+                Some(curve) if s.process.process() >= Process::V9 => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
                 Some(curve) => ToneMap::camera_hdr(curve, l.contrast, whites, l.blacks, peak),
                 None if raw => ToneMap::hdr(l.contrast, whites, l.blacks, peak),
                 None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
@@ -786,7 +786,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let shift = l1 - l0;
             let base = p.base.data[i] + ev + shift;
             let mut delta = 0.0f32;
-            // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
+            // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
             let (hh, ss) = if let Some(lf) = lift {
                 delta += lf.at(base);
                 (l_hl, l_sh)

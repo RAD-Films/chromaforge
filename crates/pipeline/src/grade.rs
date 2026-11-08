@@ -20,10 +20,10 @@ pub const DRAFT_MAX_WIDTH: usize = 960;
 /// Section on/off toggles are kept. Dropped: effects (texture, clarity, dehaze), vignette, grain,
 /// detail (sharpening, noise reduction), optics, geometry, crop, orientation, masks, spots, red
 /// eye, lens blur, enhance, point colour, calibration and HDR.
-/// Video stays at most at process V7: V8's Highlights / Shadows curve follows each picture's own histogram, which
+/// Video stays at most at process V7: V9's Highlights / Shadows curve follows each picture's own histogram, which
 /// would flicker from frame to frame, and its measured Exposure response is not a linear gain.
 pub fn video_settings(s: &DevelopSettings) -> DevelopSettings {
-    let process = if s.process.process() >= Process::V8 { Process::V7.version() } else { s.process };
+    let process = if s.process.process() >= Process::V9 { Process::V7.version() } else { s.process };
     DevelopSettings {
         version: s.version,
         process,
@@ -356,7 +356,7 @@ mod tests {
         }
     }
 
-    /// A clip edited under V8 grades as under V7: the same frame, the same pixels.
+    /// A clip edited under V9 grades as under V7: the same frame, the same pixels.
     #[test]
     fn video_grades_with_v7s_tone() {
         let img = frame();
@@ -366,7 +366,7 @@ mod tests {
         s.light.highlights = -100.0;
         s.light.whites = 40.0;
         s.curve.darks = -100.0;
-        s.process = Process::V8.version();
+        s.process = Process::V9.version();
         let new = grade_frame(&img, &s, Quality::Draft);
         s.process = Process::V7.version();
         let old = grade_frame(&img, &s, Quality::Draft);

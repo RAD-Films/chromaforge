@@ -38,7 +38,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR_PRE", 1),
     ("HL", 1),
     ("SH", 1),
-    // process V8's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
+    // process V9's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
     ("LIFT", 1),
     ("LIFT_OFF", 1),
     ("LIFT_N", 1),
@@ -270,7 +270,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some((l, _)) = lut {
         aux.extend(l.data.iter().flatten());
     }
-    // process V8's Highlights / Shadows table
+    // process V9's Highlights / Shadows table
     let lift_off = aux.len();
     let lift = fp.lift.as_ref().filter(|l| l.0.len() == lcc_pipeline::tone_lift::LIFT_N);
     if let Some(l) = lift {

@@ -880,7 +880,7 @@ fn load_bytes_now(
                 Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy })
             });
         // a fitted look's tone, else the tone a profile without a curve of its own keeps, else the file's (or profile's) curve
-        // (the tone kept under a profile without a curve is marked: process 8 draws it in Lightroom's default look)
+        // (the tone kept under a profile without a curve is marked: process 9 draws it in Lightroom's default look)
         let camera_tone = camera_look
             .as_ref()
             .map(|p| p.tone)

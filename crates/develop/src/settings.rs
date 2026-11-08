@@ -242,7 +242,7 @@ pub enum Process {
     /// The parametric Tone Curve's regions bend the curve as Lightroom Classic's do (measured on a grey wedge of our
     /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones; on a display-referred
     /// source Exposure up, Whites and Blacks follow Lightroom Classic's responses on the same wedge.
-    V8,
+    V9,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -252,14 +252,14 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 | Process::V8 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V9 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8];
-    pub const LATEST: Process = Process::V8;
+    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V9];
+    pub const LATEST: Process = Process::V9;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -270,7 +270,7 @@ impl Process {
             Process::V5 => ProcessVersion(5),
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
-            Process::V8 => ProcessVersion(8),
+            Process::V9 => ProcessVersion(9),
         }
     }
 }
