@@ -11,7 +11,10 @@
 //! kernel built counts, so a first start that compiles every kernel slowly (an empty driver shader
 //! cache after an install or a driver update: 30 s on an RTX 4070 SUPER and an RTX 5070 under DX12)
 //! still ends on the GPU, while a driver call that never returns is given up on after the limit as
-//! before (and any creation after [`limit`] times [`PROGRESS_CAP`] in all). Past it the caller gets an
+//! before (and any creation after [`limit`] times [`PROGRESS_CAP`] in all). FXC builds no cache, so
+//! that compile is every start's, not only the first's, and one kernel (`finish.wgsl`'s `main`) can
+//! take longer than the limit by itself: once the driver has made the device and taken every module
+//! ([`Progress::compiling`]), only the cap applies. Past it the caller gets an
 //! `Err` that it caches like any other creation failure — the GPU is unavailable for the process —
 //! and the blocked thread is left behind. That thread keeps what has to last as long as the driver
 //! work does: its share of the GPU work in flight (`exit.rs`: a quit then reports the GPU busy
@@ -120,8 +123,9 @@ thread_local! {
 }
 
 /// What the device creation on the current thread reports to [`create`]'s caller as it goes: each
-/// [`Self::tick`] (a kernel built) restarts the wait. Taken on the creation thread and handed to the
-/// threads it starts; does nothing outside a creation.
+/// [`Self::tick`] (a kernel built) restarts the wait, and [`Self::compiling`] (the driver has made the
+/// device and taken every shader module) gives the rest of the creation the whole [`PROGRESS_CAP`].
+/// Taken on the creation thread and handed to the threads it starts; does nothing outside a creation.
 #[derive(Clone, Default)]
 pub(crate) struct Progress(Option<Arc<AtomicU64>>);
 
@@ -137,7 +141,22 @@ impl Progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// The driver answered: the device exists and took every shader module, and what is left is
+    /// compiling the kernels. One kernel can take longer than the limit on its own (DX12's FXC took
+    /// 36–64 s over `finish.wgsl`'s `main` at every start on an RTX 5070 with builds running, while
+    /// no other kernel took 2 s), and nothing ticks inside one compile; so from here on only
+    /// [`PROGRESS_CAP`] times the limit applies. A driver that doesn't answer at all still fails
+    /// after the limit.
+    pub(crate) fn compiling(&self) {
+        if let Some(p) = &self.0 {
+            p.fetch_or(COMPILING, Ordering::Relaxed);
+        }
+    }
 }
+
+/// The bit of a creation's progress counter that [`Progress::compiling`] sets.
+const COMPILING: u64 = 1 << 63;
 
 /// Why no device is created once the process is ending ([`crate::begin_shutdown`]).
 const CLOSING: &str = "the app is closing";
@@ -222,11 +241,14 @@ fn create_on<T: Send + 'static>(
             Ok(r) => return r,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(format!("{WHAT} panicked")),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let ticks = progress.load(Ordering::Relaxed);
+                let p = progress.load(Ordering::Relaxed);
+                let ticks = p & !COMPILING;
                 if ticks != seen {
                     (seen, last) = (ticks, Instant::now());
                 }
-                if Instant::now() < (last + limit).min(start + cap) {
+                // while kernels compile, only the cap applies (see `Progress::compiling`)
+                let deadline = if p & COMPILING != 0 { start + cap } else { (last + limit).min(start + cap) };
+                if Instant::now() < deadline {
                     continue;
                 }
                 break;
@@ -240,10 +262,11 @@ fn create_on<T: Send + 'static>(
         return rx.recv().unwrap_or_else(|_| Err(format!("{WHAT} panicked")));
     }
     phase.store(ABANDONED, Ordering::Relaxed);
-    let why = if seen == 0 {
-        format!("GPU {WHAT} did not finish in {} ({}): the graphics driver or display server is not responding", show(limit), limit_env())
-    } else if last + limit > start + cap {
+    let compiling = progress.load(Ordering::Relaxed) & COMPILING != 0;
+    let why = if compiling || last + limit > start + cap {
         format!("GPU {WHAT} did not finish in {} ({} times {}): the graphics driver is too slow", show(cap), PROGRESS_CAP, limit_env())
+    } else if seen == 0 {
+        format!("GPU {WHAT} did not finish in {} ({}): the graphics driver or display server is not responding", show(limit), limit_env())
     } else {
         format!(
             "GPU {WHAT} stopped making progress for {} ({}) after {} kernels: the graphics driver or display server is not responding",
@@ -427,11 +450,63 @@ mod tests {
         eventually("the released thread never finished", || STUCK.reason().is_none());
     }
 
+    /// One kernel that compiles for longer than the limit (FXC over `finish.wgsl`: 36–64 s against
+    /// the 30 s limit) is waited for once the driver has made the device; the cap still applies.
+    #[test]
+    fn one_kernel_compiling_longer_than_the_limit_is_waited_for() {
+        static STUCK: Stuck = Stuck::new();
+        static GATE: Gate = Gate::new();
+        static ACTIVE: Mutex<u32> = Mutex::new(0);
+        let local = Local::new("compiling", &STUCK, &GATE, &ACTIVE);
+        let t0 = Instant::now();
+        let scope = local.scope();
+        let r = within_20_s(move || {
+            create_on(scope, Duration::from_millis(200), B, move || -> Result<u32, String> {
+                let progress = Progress::current();
+                progress.tick(); // the device and its modules
+                progress.compiling();
+                std::thread::sleep(Duration::from_millis(700)); // one kernel, 3.5 limits, no tick
+                progress.tick();
+                Ok(5)
+            })
+        });
+        assert_eq!(r, Ok(5), "a kernel compiling past the limit is not a hang");
+        assert!(t0.elapsed() >= Duration::from_millis(700), "{:?}", t0.elapsed());
+        assert!(STUCK.reason().is_none());
+    }
+
+    /// Compiling is still given up on at the cap (ten limits), as too slow a driver.
+    #[test]
+    fn compiling_past_the_cap_fails_as_too_slow() {
+        static STUCK: Stuck = Stuck::new();
+        static GATE: Gate = Gate::new();
+        static ACTIVE: Mutex<u32> = Mutex::new(0);
+        let local = Local::new("compiling-cap", &STUCK, &GATE, &ACTIVE);
+        let (release, blocked) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        let scope = local.scope();
+        let r = within_20_s(move || {
+            create_on(scope, Duration::from_millis(100), B, move || -> Result<u32, String> {
+                Progress::current().compiling();
+                let _ = blocked.recv(); // a compile that never ends
+                Ok(1)
+            })
+        });
+        let took = t0.elapsed();
+        let why = r.expect_err("a compile past the cap is an error");
+        assert!(why.contains("too slow"), "{why}");
+        assert!(took >= Duration::from_millis(1000), "waited the whole cap: {took:?}");
+        drop(release);
+        eventually("the released thread never finished", || STUCK.reason().is_none());
+    }
+
     /// Progress outside a device creation goes nowhere.
     #[test]
     fn progress_outside_a_creation_does_nothing() {
         Progress::current().tick();
+        Progress::current().compiling();
         Progress::default().tick();
+        Progress::default().compiling();
     }
 
     // Given a creation left behind past its limit, the process is not idle for a quit (issue #620:
