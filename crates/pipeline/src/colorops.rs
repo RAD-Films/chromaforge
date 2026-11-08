@@ -235,6 +235,9 @@ pub struct ColorOps {
     pub bw: Option<[f32; 8]>,
     /// Wheels (shadows, midtones, highlights, global), blending, balance.
     pub grading: Option<([WheelK; 4], f32, f32)>,
+    /// Process V9: the shadows and highlights wheels' colour as Lightroom Classic applies it
+    /// ([`crate::split_v9`]); their colour terms in [`Self::grading`] are then zero.
+    pub split: Option<crate::split_v9::SplitK>,
     /// OkLCh hue of skin tones (protected by vibrance).
     pub skin: f32,
 }
@@ -249,6 +252,7 @@ impl ColorOps {
     pub fn new(s: &DevelopSettings) -> ColorOps {
         let mk = MixerK::new(&s.mixer);
         let g = &s.grading;
+        let split = if s.process.process() >= lcc_develop::Process::V9 { crate::split_v9::SplitK::new(g) } else { None };
         ColorOps {
             vibrance: (s.color.vibrance / 100.0) as f32,
             saturation: (s.color.saturation / 100.0) as f32,
@@ -259,12 +263,13 @@ impl ColorOps {
             points: if crate::is_bw(s) { Vec::new() } else { point_ks(&s.point_colors) },
             bw: crate::is_bw(s).then(|| s.bw_mix.bands().map(|v| (v / 100.0) as f32)),
             grading: (!g.is_neutral()).then(|| {
-                (
-                    [wheel(&g.shadows), wheel(&g.midtones), wheel(&g.highlights), wheel(&g.global)],
-                    (g.blending / 100.0) as f32,
-                    (g.balance / 100.0) as f32,
-                )
+                let (mut sh, mut hl) = (wheel(&g.shadows), wheel(&g.highlights));
+                if split.is_some() {
+                    (sh.a, sh.b, hl.a, hl.b) = (0.0, 0.0, 0.0, 0.0);
+                }
+                ([sh, wheel(&g.midtones), hl, wheel(&g.global)], (g.blending / 100.0) as f32, (g.balance / 100.0) as f32)
             }),
+            split,
             skin: oklch_hue_of_srgb_hue(25.0),
         }
     }
@@ -330,11 +335,16 @@ impl ColorOps {
     #[inline]
     fn grade(&self, mut lab: [f32; 3]) -> [f32; 3] {
         if let Some((wheels, blending, balance)) = &self.grading {
-            let [ws, wm, wh] = grade_zones(lab[0], *blending, *balance);
+            let l = lab[0];
+            let [ws, wm, wh] = grade_zones(l, *blending, *balance);
             for (k, wt) in wheels.iter().zip([ws, wm, wh, 1.0]) {
                 lab[1] += k.a * wt;
                 lab[2] += k.b * wt;
                 lab[0] += k.lum * wt;
+            }
+            if let Some(split) = &self.split {
+                let o = split.offset(l);
+                lab = std::array::from_fn(|i| lab[i] + o[i]);
             }
         }
         oklab_to_2020(lab)

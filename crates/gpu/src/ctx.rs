@@ -487,6 +487,17 @@ fn constants() -> String {
         AUTO_LRC_EV.0, AUTO_LRC_EV.1, AUTO_LRC_CHROMA.0, AUTO_LRC_CHROMA.1
     );
     s += &format!("const SHADOW_TINT_K: f32 = {:?};\n", lcc_pipeline::colorops::SHADOW_TINT);
+    {
+        use lcc_pipeline::split_v9::{SPLIT_CENTRE, SPLIT_ZONE_DL, SPLIT_ZONE_L0, SPLIT_ZONE_SH};
+        s += &format!(
+            "const SPLIT_L0: f32 = {SPLIT_ZONE_L0:?};
+const SPLIT_DL: f32 = {SPLIT_ZONE_DL:?};
+const SPLIT_CENTRE: f32 = {SPLIT_CENTRE:?};
+const SPLIT_N: u32 = {}u;
+",
+            SPLIT_ZONE_SH.len()
+        );
+    }
     // value noise of processes V1–V6
     for (i, h) in GRAIN_HASH.iter().enumerate() {
         s += &format!("const GRAIN_VH{i}: u32 = {h}u;\n");

@@ -266,6 +266,7 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     }
     var lab = vec3<f32>(l, c * cos(h), c * sin(h));
     if (pu(F_GRADING) != 0u) {
+        let l0 = lab.x;
         let m = 0.5 - pf(F_BALANCE) * 0.25;
         let width = 0.15 + pf(F_BLENDING) * 0.5;
         let ws = 1.0 - sstep(m - width, m + width * 0.25, lab.x);
@@ -278,8 +279,28 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
             lab.z += pf(F_WHEELS + 3u * k + 1u) * wt;
             lab.x += pf(F_WHEELS + 3u * k + 2u) * wt;
         }
+        if (pu(F_SPLIT) != 0u) {
+            lab += split_offset(l0);
+        }
     }
     return oklab_inv(lab);
+}
+
+// `split_v9::zone`: a profile (`SPLIT_N` floats from parameter `at`) read at lightness `x`.
+fn split_zone(at: u32, x: f32) -> f32 {
+    let f = clamp((x - SPLIT_L0) / SPLIT_DL, 0.0, f32(SPLIT_N - 1u));
+    let i = min(u32(f), SPLIT_N - 2u);
+    let u = f - f32(i);
+    let a = pf(at + i);
+    return a + (pf(at + i + 1u) - a) * u;
+}
+
+// `split_v9::SplitK::offset`: process V9's shadows and highlights wheels as an OkLab offset (L, a, b).
+fn split_offset(l: f32) -> vec3<f32> {
+    let k = F_SPLIT_K;
+    let ws = split_zone(F_SPLIT_ZSH, SPLIT_CENTRE + (l - pf(k + 6u) - SPLIT_CENTRE) / pf(k + 8u));
+    let wh = split_zone(F_SPLIT_ZHL, SPLIT_CENTRE + (l - pf(k + 7u) - SPLIT_CENTRE) / pf(k + 8u));
+    return ws * vec3<f32>(pf(k), pf(k + 1u), pf(k + 2u)) + wh * vec3<f32>(pf(k + 3u), pf(k + 4u), pf(k + 5u));
 }
 
 // `colorops::calibrate`: primaries matrix, then the shadows tint (luminance kept).
