@@ -133,6 +133,11 @@ const FIELDS: &[(&str, usize)] = &[
     ("REFINE_SAT", 1),
     ("CALIB", 1),
     ("CALIB_M", 9),
+    // process V9: the base tone on each linear ProPhoto channel (`FinishParams::tone_per_channel`), these matrices
+    // working space → ProPhoto and back
+    ("TONE_PC", 1),
+    ("TONE_PC_TO", 9),
+    ("TONE_PC_FROM", 9),
     ("SHADOW_TINT", 1),
     ("OUT_M", 9),
     ("OUT_Y", 3),
@@ -384,6 +389,11 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some(m) = &fp.calib {
         p.b("CALIB", true);
         p.fs("CALIB_M", m.as_flattened());
+    }
+    if let Some([to, from]) = &fp.tone_per_channel {
+        p.b("TONE_PC", true);
+        p.fs("TONE_PC_TO", to.as_flattened());
+        p.fs("TONE_PC_FROM", from.as_flattened());
     }
     p.f("SHADOW_TINT", fp.shadow_tint);
     p.fs("OUT_M", fp.to_out.as_flattened());

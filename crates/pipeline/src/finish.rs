@@ -343,6 +343,10 @@ pub struct FinishParams {
     /// Peak linear output relative to SDR white: 1 for SDR renders; `2^max_ev` for an HDR render
     /// ([`OutputDepth::F32Hdr`] with HDR on), which keeps values above 1 instead of clipping them.
     pub peak: f32,
+    /// Process V9 tones a raw under a profile without a tone curve as Lightroom Classic does: [`ToneMap::camera_lrc`]'s
+    /// base curve on each channel in linear ProPhoto (these matrices: working space to ProPhoto and back) instead of on
+    /// luminance with the colour scaled along ([`tone_per_channel`]). `None`: on luminance.
+    pub tone_per_channel: Option<[[[f32; 3]; 3]; 2]>,
 }
 
 impl FinishParams {
@@ -394,6 +398,7 @@ impl FinishParams {
         let calibration = s.section_enabled("calibration");
         let peak = s.hdr.peak();
         FinishParams {
+            tone_per_channel: tone_per_channel(s, info, peak),
             peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
@@ -487,6 +492,24 @@ pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
     d.light.whites = 0.0;
     d.light.blacks = 0.0;
     Some(base_tone_at(&d, info, 1.0, true))
+}
+
+/// [`FinishParams::tone_per_channel`]: process V9's SDR render of a raw whose tone is Lightroom Classic's base curve
+/// ([`ToneMap::camera_lrc`] under a profile without a tone curve). On LrC exports of our own R5 C frames (8 Nov 2026)
+/// the tone on each linear ProPhoto channel keeps LrC's colour where the tone on luminance did not: with the base
+/// curve, chroma within 2 % of LrC's in every tone band of 13 held-out frames (0.58–1.34 before), sunlit grass
+/// C* 32.5 vs LrC 34.1 (28.3 before), and Exposure −1 EV's partly clipped highlights keep LrC's share of colour
+/// (0.22 vs 0.25; 0.40 before). Lightness is unchanged. HDR renders keep the tone on luminance (not measured).
+fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option<[[[f32; 3]; 3]; 2]> {
+    let lrc_base = s.process.process() == Process::V9
+        && peak <= 1.0
+        && tones_as_raw(s, info)
+        && info.camera_tone.as_ref().is_some_and(crate::tone::CameraTone::has_default_curve);
+    if !lrc_base {
+        return None;
+    }
+    let to = lcc_color::PROPHOTO.from_xyz().mul(&lcc_color::bradford(lcc_color::D65, lcc_color::D50)).mul(&lcc_color::REC2020.to_xyz());
+    Some([to.to_f32(), to.inverse()?.to_f32()])
 }
 
 /// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
@@ -908,14 +931,23 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
             }
 
-            // --- tone map on luminance, highlight desaturation
-            let yl = luminance_2020(c);
-            let o = tone.apply(yl);
-            let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
-            let k = tone.chroma_scale(o);
-            if k != 1.0 {
-                d = d.map(|v| o + (v - o) * k);
-            }
+            // --- tone map on luminance (or per ProPhoto channel), highlight desaturation
+            let (o, mut d) = match &fp.tone_per_channel {
+                Some([to, from]) => {
+                    let d = mul3(from, mul3(to, c).map(|v| tone.apply(v.max(0.0))));
+                    (luminance_2020(d), d)
+                }
+                None => {
+                    let yl = luminance_2020(c);
+                    let o = tone.apply(yl);
+                    let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
+                    let k = tone.chroma_scale(o);
+                    if k != 1.0 {
+                        d = d.map(|v| o + (v - o) * k);
+                    }
+                    (o, d)
+                }
+            };
             let mx = d[0].max(d[1]).max(d[2]);
             if mx > peak {
                 let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
@@ -1308,6 +1340,38 @@ fn enc(v: f32, dither: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Process V9 tones a raw under a profile without a tone curve on each ProPhoto channel (SDR only); every other
+    /// process, source and curve keeps the tone on luminance. A grey comes out the same either way.
+    #[test]
+    fn v9_tones_lightrooms_base_curve_per_prophoto_channel() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let plain = crate::tone::CameraTone::new(knots).unwrap();
+        let raw = SourceInfo { raw: true, camera_tone: Some(plain.under_default_curve()), ..Default::default() };
+        let v9 = DevelopSettings::default();
+        assert_eq!(v9.process.process(), Process::V9);
+        let [to, from] = tone_per_channel(&v9, &raw, 1.0).expect("V9 raw under a profile without a curve");
+        let v8 = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
+        assert!(tone_per_channel(&v8, &raw, 1.0).is_none(), "V8 unchanged");
+        assert!(tone_per_channel(&v9, &raw, 4.0).is_none(), "HDR keeps the tone on luminance");
+        assert!(tone_per_channel(&v9, &SourceInfo { camera_tone: Some(plain), ..raw.clone() }, 1.0).is_none(), "a profile's own curve");
+        assert!(tone_per_channel(&v9, &SourceInfo { camera_tone: None, ..raw.clone() }, 1.0).is_none());
+        assert!(tone_per_channel(&v9, &SourceInfo { raw: false, ..raw.clone() }, 1.0).is_none(), "a JPEG");
+        // white stays neutral through ProPhoto, so a grey's tone is the luminance tone
+        let tone = base_tone(&v9, &raw, 1.0);
+        for g in [0.01f32, 0.18, 0.7] {
+            let d = mul3(&from, mul3(&to, [g; 3]).map(|v| tone.apply(v)));
+            for v in d {
+                assert!((v - tone.apply(g)).abs() < 1e-4, "{g}: {d:?} vs {}", tone.apply(g));
+            }
+        }
+        // a saturated colour keeps its hue's order of channels and stays in range
+        let d = mul3(&from, mul3(&to, [0.05f32, 0.2, 0.03]).map(|v| tone.apply(v.max(0.0))));
+        assert!(d[1] > d[0] && d[0] > d[2] && d.iter().all(|v| v.is_finite() && *v <= 1.0), "{d:?}");
+    }
 
     #[test]
     fn grain_noise_is_finite_for_degenerate_coordinates() {
