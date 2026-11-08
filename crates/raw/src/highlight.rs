@@ -352,7 +352,34 @@ pub fn reconstruct_with(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 
 /// [`MAX_HEADROOM`]; anything else counts as 0) above the sensor's clip: what the sensor couldn't record was
 /// brighter than its clip, and a picture whose Exposure goes down shows how much.
 pub fn reconstruct_brighter(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], headroom: f32) -> usize {
-    rebuild_clipped(img, wb, clip, white, headroom, &|_, p| by_value(p, clip))
+    reconstruct_how(img, wb, clip, white, Rebuild { headroom, rim_hue: false }, None)
+}
+
+/// How clipped highlights are rebuilt beyond [`reconstruct_with`]'s defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rebuild {
+    /// [`reconstruct_brighter`]'s headroom, in stops.
+    pub headroom: f32,
+    /// Partly clipped pixels take the colour of their own rim (the clipped surface's colour just below its clip,
+    /// see [`RIM_LO`]) wherever there is one, instead of reliable content nearby; [`PALE`]'s fade then carries
+    /// them to neutral as more channels clip. That is what Lightroom Classic does, measured on its exports at
+    /// Exposure −1 and −3 (85 frames, about 2,300 clipped regions): partly clipped areas keep their rim's hue
+    /// (median 2–3° off) at reduced chroma, fully clipped ones are neutral. A pale sky above bright foliage stays
+    /// the sky's blue instead of turning teal. Off: V1–V8, unchanged.
+    pub rim_hue: bool,
+}
+
+/// [`reconstruct_brighter`] / [`reconstruct_masked_brighter`] with every option: `mask` as for
+/// [`reconstruct_masked`] (`None`, or one of the wrong length: clipping told by the values alone).
+pub fn reconstruct_how(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], how: Rebuild, mask: Option<&[u8]>) -> usize {
+    match mask.filter(|m| m.len() == img.data.len()) {
+        None => rebuild_clipped(img, wb, clip, white, how, &|_, p| by_value(p, clip)),
+        Some(mask) => rebuild_clipped(img, wb, clip, white, how, &|i, p| {
+            let m = mask.get(i).copied().unwrap_or(0);
+            let v = by_value(p, clip);
+            [v[0] || m & CLIPPED_R != 0, v[1] || m & CLIPPED_G != 0, v[2] || m & CLIPPED_B != 0]
+        }),
+    }
 }
 
 /// The most stops [`reconstruct_brighter`] raises clipped highlights by.
@@ -375,14 +402,7 @@ pub fn reconstruct_masked(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32
 
 /// [`reconstruct_masked`] with [`reconstruct_brighter`]'s `headroom`.
 pub fn reconstruct_masked_brighter(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], mask: &[u8], headroom: f32) -> usize {
-    if mask.len() != img.data.len() {
-        return reconstruct_brighter(img, wb, clip, white, headroom);
-    }
-    rebuild_clipped(img, wb, clip, white, headroom, &|i, p| {
-        let m = mask.get(i).copied().unwrap_or(0);
-        let v = by_value(p, clip);
-        [v[0] || m & CLIPPED_R != 0, v[1] || m & CLIPPED_G != 0, v[2] || m & CLIPPED_B != 0]
-    })
+    reconstruct_how(img, wb, clip, white, Rebuild { headroom, rim_hue: false }, Some(mask))
 }
 
 /// Which channels of pixel `i` (values `p`) are clipped.
@@ -395,7 +415,8 @@ fn by_value(p: &[f32; 3], clip: f32) -> [bool; 3] {
 }
 
 /// [`reconstruct_with`], with `clipped` telling the clipped channels.
-fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], headroom: f32, clipped: &impl Clipped) -> usize {
+fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], how: Rebuild, clipped: &impl Clipped) -> usize {
+    let Rebuild { headroom, rim_hue } = how;
     let (w, h) = (img.width, img.height);
     let count = img.data.par_iter().enumerate().filter(|(i, p)| clipped(*i, p).iter().any(|&c| c)).count();
     if count == 0 || w == 0 || h == 0 {
@@ -469,10 +490,15 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             // there is and how well the pixel agrees with it (blending the results, not the colours, keeps the
             // estimate consistent with the pixel's own unclipped channels all the way)
             let e = sample(field, 2.0, x, y);
-            let borrowed = [e[0], 1.0 - e[0] - e[1], e[1]];
             let edge = rim_field.map(|rim| sample(rim, 4.0, x, y));
-            let mut trust = e[2].clamp(0.0, 1.0);
-            if trust > 0.0 {
+            // `Rebuild::rim_hue`: the rim's own colour, where there is a rim, and fully trusted
+            let rim_colour = edge.filter(|_| rim_hue).and_then(|edge| {
+                let s = edge[0] + edge[1] + edge[2];
+                (s > 1e-6 && s.is_finite()).then(|| [edge[0] / s, edge[1] / s, edge[2] / s])
+            });
+            let borrowed = rim_colour.unwrap_or([e[0], 1.0 - e[0] - e[1], e[1]]);
+            let mut trust = if rim_colour.is_some() { 1.0 } else { e[2].clamp(0.0, 1.0) };
+            if trust > 0.0 && rim_colour.is_none() {
                 let mut off = contradiction(p, q, cl, borrowed, clip);
                 if off > AGREE.0 {
                     off = off.min(edge.map_or(0.0, |edge| {
@@ -799,6 +825,121 @@ mod tests {
             let end = at(w - 1, y);
             assert!(end.iter().all(|v| (v - 1.0 / 3.0).abs() < 0.002), "row {y}: {end:?} at the end");
         }
+    }
+
+    /// A pale blue sky brightening into a green clip, ringed by its own unclipped sky, above a large bright teal
+    /// surface (a river's sheen, bright enough to lend its colour, not bright enough to be the clip's rim), the 6719
+    /// case. Lightroom keeps a partly clipped area in its
+    /// rim's hue; with [`Rebuild::rim_hue`] every partly clipped sky pixel lies on the sky's way to neutral, wherever
+    /// the teal is.
+    fn sky_beside_teal() -> (Rgb32f, [f32; 3], usize) {
+        let sky = [1.0, 1.1, 1.3];
+        let teal = [0.75, 1.0, 0.92];
+        let (w, h) = (256usize, 128usize);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            sensor(if y >= 80 {
+                teal.map(|v| v * 0.8)
+            } else {
+                // brightest in the middle of the sky, past green's clip there
+                let d = ((x as f32 - 128.0) / 90.0).powi(2) + ((y as f32 - 40.0) / 34.0).powi(2);
+                sky.map(|v| v * (1.25 - 0.5 * d).max(0.5))
+            })
+        });
+        (img, sky, w)
+    }
+
+    /// How far the partly clipped sky of [`sky_beside_teal`] lies off the sky's way to neutral at most.
+    fn worst_sky_off(rim_hue: bool) -> f32 {
+        let (img0, sky, w) = sky_beside_teal();
+        let mut img = img0.clone();
+        let n = reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue }, None);
+        assert!(n > 100, "the scene clips: {n}");
+        let mut worst = 0f32;
+        for y in 10..70 {
+            for x in 0..w {
+                let p = img0.get(x, y);
+                let cl = by_value(&p, 0.99);
+                if cl.iter().any(|&c| c) && !cl.iter().all(|&c| c) {
+                    worst = worst.max(off_the_way_to_neutral(chroma(balanced(img.get(x, y))), chroma(sky)));
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn with_rim_hue_a_partly_clipped_sky_keeps_its_rims_hue_above_a_bright_teal_surface() {
+        let worst = worst_sky_off(true);
+        assert!(worst < 0.001, "partly clipped sky off its own way to neutral by {worst}");
+        // the V1-V8 rebuild lets the teal in (what this changes): 0.008 off
+        let before = worst_sky_off(false);
+        assert!(before > 0.005, "V1-V8 off by {before}, rim hue {worst}");
+    }
+
+    /// Hue (degrees) and chroma of a white-balanced colour: its chromaticity's offset from neutral in an opponent
+    /// plane (red-green, yellow-blue).
+    fn hue_chroma(q: [f32; 3]) -> (f32, f32) {
+        let c = chroma(q);
+        let (a, b) = (c[0] - c[1], 0.5 * (c[0] + c[1]) - c[2]);
+        (b.atan2(a).to_degrees(), a.hypot(b))
+    }
+
+    /// Worst hue swing from the sky's own hue (degrees) and worst chroma step between neighbouring pixels, over the
+    /// partly clipped sky of [`sky_beside_teal`].
+    fn sky_swing(rim_hue: bool) -> (f32, f32) {
+        let (img0, sky, w) = sky_beside_teal();
+        let mut img = img0.clone();
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue }, None);
+        let (sky_hue, _) = hue_chroma(sky);
+        let partly = |x: usize, y: usize| {
+            let cl = by_value(&img0.get(x, y), 0.99);
+            cl.iter().any(|&c| c) && !cl.iter().all(|&c| c)
+        };
+        let (mut hue, mut step) = (0f32, 0f32);
+        for y in 10..70 {
+            for x in 0..w {
+                if !partly(x, y) {
+                    continue;
+                }
+                let (h, c) = hue_chroma(balanced(img.get(x, y)));
+                // a pixel faded nearly to neutral has no hue to keep
+                if c > 0.005 {
+                    let d = (h - sky_hue + 540.0).rem_euclid(360.0) - 180.0;
+                    hue = hue.max(d.abs());
+                }
+                if x + 1 < w && partly(x + 1, y) {
+                    step = step.max((c - hue_chroma(balanced(img.get(x + 1, y))).1).abs());
+                }
+            }
+        }
+        (hue, step)
+    }
+
+    /// The 6719 cyan blob: a green-clipped sky beside a bright teal surface turned cyan where the rebuild borrowed
+    /// the teal. With [`Rebuild::rim_hue`] the partly clipped sky keeps its own hue within 5° and its chroma has no
+    /// jumps (each pixel within 0.004 of its neighbour, a tenth of the sky's chroma, 0.05).
+    #[test]
+    fn with_rim_hue_a_green_clipped_sky_keeps_its_hue_without_chroma_jumps() {
+        let (hue, step) = sky_swing(true);
+        assert!(hue <= 5.0, "hue swings {hue}°");
+        assert!(step <= 0.004, "chroma steps by {step}");
+        let (before, _) = sky_swing(false);
+        assert!(before > 5.0, "V1-V8 swings {before}° (the cyan blob), rim hue {hue}°");
+    }
+
+    /// Without [`Rebuild::rim_hue`] (V1–V8) the rebuild is exactly [`reconstruct_brighter`]'s, masked or not.
+    #[test]
+    fn without_rim_hue_the_rebuild_is_unchanged() {
+        let (img0, _, _) = sky_beside_teal();
+        let (mut a, mut b) = (img0.clone(), img0.clone());
+        reconstruct_brighter(&mut a, WB, 0.99, [1.0; 3], 0.0);
+        reconstruct_how(&mut b, WB, 0.99, [1.0; 3], Rebuild::default(), None);
+        assert!(a.data == b.data);
+        let mask: Vec<u8> = img0.data.iter().map(|p| if p[1] >= 0.99 { CLIPPED_G } else { 0 }).collect();
+        let (mut a, mut b) = (img0.clone(), img0.clone());
+        reconstruct_masked_brighter(&mut a, WB, 0.99, [1.0; 3], &mask, 0.0);
+        reconstruct_how(&mut b, WB, 0.99, [1.0; 3], Rebuild::default(), Some(&mask));
+        assert!(a.data == b.data);
     }
 
     #[test]
