@@ -485,10 +485,12 @@ pub fn is_stale(path: &Path) -> bool {
 const LOOK_MARKER: &str = "look-version";
 
 /// Whether the smart previews folder `dir` has been checked for out-of-date proxies at this build's
-/// camera-look fit version and encode version (or newer ones). A missing or unreadable marker counts
-/// as not, and so does one written before the encode version was recorded — it only says the look
+/// camera-look fit version and encode version (or newer ones), and at this build's highlight headroom
+/// ([`crate::files::HIGHLIGHT_HEADROOM`]; a marker without one was written at 0). A missing or unreadable marker
+/// counts as not, and so does one written before the encode version was recorded — it only says the look
 /// was checked, so this build scans the folder once more and rebuilds the proxies [`is_stale`]
-/// finds.
+/// finds. A headroom has no older or newer: a marker at another one gets the folder scanned again, so the process 8
+/// raws' proxies, whose pixels carry the headroom, are rebuilt with this build's.
 pub fn look_checked(dir: &Path) -> bool {
     use std::io::Read;
     let Ok(f) = std::fs::File::open(dir.join(LOOK_MARKER)) else { return false };
@@ -498,17 +500,26 @@ pub fn look_checked(dir: &Path) -> bool {
     }
     let mut versions = text.split_whitespace();
     let (Some(look), Some(enc)) = (versions.next(), versions.next()) else { return false };
+    let headroom = match versions.next().map(str::parse::<f32>) {
+        None => 0.0,
+        Some(Ok(h)) if h.is_finite() => h,
+        Some(_) => return false,
+    };
     match (look.parse::<u64>(), enc.parse::<u64>()) {
-        (Ok(look), Ok(enc)) => look >= u64::from(crate::camera_preview::LOOK_VERSION) && enc >= ENCODE_VERSION,
+        (Ok(look), Ok(enc)) => {
+            look >= u64::from(crate::camera_preview::LOOK_VERSION)
+                && enc >= ENCODE_VERSION
+                && (headroom - crate::files::HIGHLIGHT_HEADROOM).abs() <= 1e-3
+        }
         _ => false,
     }
 }
 
-/// Record that the proxies in `dir` were checked at this build's camera-look fit version and encode
-/// version.
+/// Record that the proxies in `dir` were checked at this build's camera-look fit version, encode
+/// version and highlight headroom.
 pub fn mark_look_checked(dir: &Path) -> Result<(), String> {
     let path = dir.join(LOOK_MARKER);
-    let text = format!("{} {}\n", crate::camera_preview::LOOK_VERSION, ENCODE_VERSION);
+    let text = format!("{} {} {}\n", crate::camera_preview::LOOK_VERSION, ENCODE_VERSION, crate::files::HIGHLIGHT_HEADROOM);
     lcc_catalog::safe_file::write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 

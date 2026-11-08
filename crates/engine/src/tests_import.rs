@@ -2707,6 +2707,37 @@ fn smart_look_refresh_for(format: &str) {
     assert_eq!((r["refreshed"].as_u64(), calls.load(Ordering::SeqCst)), (Some(0), 1), "{r}");
     assert!(std::fs::read(&file).unwrap() == rebuilt);
 
+    // a folder checked before the highlight headroom was recorded is scanned once more: a process 8 raw's proxy
+    // made without headroom is rebuilt with this build's (no version changed, so only the marker can tell)
+    let want = crate::files::headroom_of(&crate::media::LoadOptions::of(&s.catalog.photo(id).unwrap().develop));
+    if want > 0.0 {
+        edit_smart_header(&file, |h| {
+            h.as_object_mut().unwrap().remove("headroom");
+        });
+        std::fs::write(dir.join("look-version"), format!("{} {}\n", crate::camera_preview::LOOK_VERSION, crate::smart::ENCODE_VERSION)).unwrap();
+        assert!(!crate::smart::look_checked(&dir), "a marker from before the headroom counts as checked at 0");
+        s.media.forget(id);
+        calls.store(0, Ordering::SeqCst);
+        crate::cmd::previews::refresh_stale_smart_previews(&mut s).unwrap().join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the raw's original is read");
+        assert_eq!(smart_header(&file)["headroom"], json!(want), "rebuilt with this build's headroom");
+        assert!(std::fs::read(&png_file).unwrap() == png_bytes);
+        assert!(crate::smart::look_checked(&dir));
+    } else {
+        // headroom parked at 0: a marker from before the headroom field already matches this build
+        std::fs::write(
+            dir.join("look-version"),
+            format!(
+                "{} {}
+",
+                crate::camera_preview::LOOK_VERSION,
+                crate::smart::ENCODE_VERSION
+            ),
+        )
+        .unwrap();
+        assert!(crate::smart::look_checked(&dir), "a marker without headroom counts as checked at 0");
+    }
+
     // Build Smart Previews refreshes a stale one the same way
     edit_smart_header(&file, |h| h["look_version"] = json!(0));
     s.media.file_loader = Some(plain);
@@ -2860,6 +2891,7 @@ fn smart_preview_look_marker_is_read_safely() {
     assert!(!crate::smart::look_checked(&dir), "no marker");
     let cur = crate::camera_preview::LOOK_VERSION;
     let enc = crate::smart::ENCODE_VERSION;
+    let hr = crate::files::HIGHLIGHT_HEADROOM;
     for (text, checked) in [
         (String::new(), false),
         ("banana".into(), false),
@@ -2871,8 +2903,14 @@ fn smart_preview_look_marker_is_read_safely() {
         (format!("{cur}\n"), false),
         (format!("{cur} {}\n", enc.saturating_sub(1)), false),
         (format!("{cur} banana\n"), false),
-        (format!("{cur} {enc}\n"), true),
-        (format!(" {} {}\n", cur + 1, enc + 1), true),
+        (format!("{cur} {enc} {hr}\n"), true),
+        (format!(" {} {} {hr}\n", cur + 1, enc + 1), true),
+        // Checked at another highlight headroom (none recorded means 0), or a damaged one: the folder is
+        // scanned again, so process 8 raws' proxies get this build's headroom.
+        (format!("{cur} {enc} {}\n", hr + 1.0), false),
+        (format!("{cur} {enc} NaN\n"), false),
+        (format!("{cur} {enc} banana\n"), false),
+        (format!("{cur} {enc}\n"), hr == 0.0),
     ] {
         std::fs::write(dir.join("look-version"), &text).unwrap();
         assert_eq!(crate::smart::look_checked(&dir), checked, "{text:?}");

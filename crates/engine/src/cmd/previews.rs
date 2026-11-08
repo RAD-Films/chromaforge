@@ -708,8 +708,10 @@ fn smart_run(
                     .and_then(|s| s.load_source())
                     .and_then(|src| {
                         let info = src.info_or(Default::default());
-                        let headroom = if info.raw { crate::files::headroom_of(&src.options) } else { 0.0 };
-                        crate::smart::encode_with(&src.image, Some(&info), headroom)
+                        // the headroom the staleness check compares against (the photo's), not one told from the
+                        // decode: where those disagree on what is a raw (a preview-only raw's embedded JPEG), the
+                        // proxy would be stale the moment it is written and rebuilt by every run
+                        crate::smart::encode_with(&src.image, Some(&info), headroom.unwrap_or(0.0))
                     })
                     .and_then(|b| {
                         let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
