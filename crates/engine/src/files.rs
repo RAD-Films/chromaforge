@@ -413,6 +413,15 @@ const HIGHLIGHT_CLIP: f32 = 0.99;
 pub(crate) const HIGHLIGHT_HEADROOM: f32 = 0.0;
 
 /// The headroom (stops) a decode with `options` rebuilds clipped highlights with.
+/// A raw file decoded as process number `process` reads it: V1 to V8 keep the levels they read a Sony 12-bit
+/// uncompressed file with ([`lcc_raw::decode_v8_levels`]), V9 takes upstream #3429's.
+pub(crate) fn decode_raw_at(bytes: &[u8], process: u32) -> lcc_raw::Result<lcc_raw::RawImage> {
+    match crate::camera_preview::FitGen::of_process(process) {
+        crate::camera_preview::FitGen::V8 => lcc_raw::decode_v8_levels(bytes),
+        crate::camera_preview::FitGen::Current => lcc_raw::decode(bytes),
+    }
+}
+
 pub(crate) fn headroom_of(options: &LoadOptions) -> f32 {
     if options.highlight_headroom { HIGHLIGHT_HEADROOM } else { 0.0 }
 }
@@ -740,7 +749,7 @@ fn load_bytes_now(
         let used_reduced = reduced.is_some();
         let decoded = match reduced {
             Some(r) => Ok(r),
-            None => lcc_raw::decode(&bytes),
+            None => decode_raw_at(&bytes, options.process),
         };
         let mut raw = match decoded.map_err(|e| preview_reason(&bytes, e)) {
             Ok(r) => r,
@@ -790,19 +799,30 @@ fn load_bytes_now(
         let colorimetric = crate::camera_preview::colorimetric_camera(&raw).is_some();
         // the source's segmentation mattes (DNG semantic masks), read while the starting colour is fitted
         let (((xy, t, camera_look), kept_tone), mattes) = rayon::join(
+            // (the fit of the photo's process: V1 to V8 keep theirs, `camera_preview::FitGen`)
             || {
-                let removed = dng_lens_ops.map(|ops| std::mem::replace(&mut raw.opcodes.list3, ops));
-                // With the opcodes restored, the proxy already includes vignetting; do not apply it twice.
-                let embedded = if removed.is_some() { None } else { lens.as_ref() };
-                let kept_tone = own_colour.and_then(|own| {
-                    let mut trace = crate::camera_preview::StartTrace::default();
-                    crate::camera_preview::tone_without_profile(&mut raw, own, &bytes, lens_geometry.as_ref(), embedded, options.colour, &mut trace)
-                });
-                let colour = crate::camera_preview::starting_colour(&mut raw, &bytes, lens_geometry.as_ref(), embedded, options.colour, dcp);
-                if let Some(ops) = removed {
-                    raw.opcodes.list3 = ops;
-                }
-                (colour, kept_tone)
+                crate::camera_preview::with_fit_gen(crate::camera_preview::FitGen::of_process(options.process), || {
+                    let removed = dng_lens_ops.map(|ops| std::mem::replace(&mut raw.opcodes.list3, ops));
+                    // With the opcodes restored, the proxy already includes vignetting; do not apply it twice.
+                    let embedded = if removed.is_some() { None } else { lens.as_ref() };
+                    let kept_tone = own_colour.and_then(|own| {
+                        let mut trace = crate::camera_preview::StartTrace::default();
+                        crate::camera_preview::tone_without_profile(
+                            &mut raw,
+                            own,
+                            &bytes,
+                            lens_geometry.as_ref(),
+                            embedded,
+                            options.colour,
+                            &mut trace,
+                        )
+                    });
+                    let colour = crate::camera_preview::starting_colour(&mut raw, &bytes, lens_geometry.as_ref(), embedded, options.colour, dcp);
+                    if let Some(ops) = removed {
+                        raw.opcodes.list3 = ops;
+                    }
+                    (colour, kept_tone)
+                })
             },
             || dng_mattes(&bytes, &info),
         );

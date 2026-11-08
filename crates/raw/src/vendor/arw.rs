@@ -727,6 +727,12 @@ fn raw_ifd(tiff: &Tiff) -> Option<&Ifd> {
 }
 
 pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
+    decode_levels(bytes, mode, false)
+}
+
+/// [`decode`]; `v8_levels`: a "12-bit uncompressed" file takes its scale from its brightest sample, as processes V1 to
+/// V8 read it (`crate::decode_v8_levels`).
+pub(crate) fn decode_levels(bytes: &[u8], mode: Mode, v8_levels: bool) -> Result<RawImage> {
     let tiff = Tiff::parse(bytes)?;
     let ifd0 = &tiff.ifds[0];
     let Some(raw) = raw_ifd(&tiff) else {
@@ -828,7 +834,16 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     // (upstream #3429: picking the scale from the brightest sample gave those black 128 / white 4095 and a purple
     // render, and made header and full decodes disagree). The layout decides; `bits` keeps the tag, and genuinely
     // packed 12-bit strips keep their 12-bit scale.
-    let scale_bits = if info.compression == 1 && out_bits < 14 && strip_len >= (w * h * 2) as u64 { 14 } else { out_bits };
+    // (processes V1 to V8 read the scale from the brightest sample, as they always did: a saved edit never changes)
+    let scale_bits = if info.compression == 1
+        && out_bits < 14
+        && strip_len >= (w * h * 2) as u64
+        && (!v8_levels || samples.iter().any(|&v| v >> (out_bits + 1) != 0))
+    {
+        14
+    } else {
+        out_bits
+    };
 
     let cfa = match (raw.u64s(t::CFA_REPEAT_PATTERN_DIM).as_deref(), raw.bytes(t::CFA_PATTERN_EP)) {
         (Some([2, 2]), Some(p)) if p.len() == 4 && p.iter().all(|&c| c <= 2) => Cfa { width: 2, height: 2, pattern: p.to_vec() },
@@ -1790,6 +1805,12 @@ mod tests {
             raw.set(t::COMPRESSION, Value::Short(vec![1]));
             raw.set_image(ImageData::Strips { rows_per_strip: 8, strips: vec![samples.iter().flat_map(|v| v.to_le_bytes()).collect()] });
             let bytes = TiffWriter::default().write(&[raw]).unwrap();
+            // processes V1 to V8 read a dark frame (no sample above the 12-bit range) on the 12-bit scale, as before
+            let v8 = decode_levels(&bytes, Mode::Full, true).unwrap();
+            let (black, white) = if peak > 4095 { (512.0, vec![16383.0]) } else { (128.0, v8.white.clone()) };
+            assert_eq!(v8.black.mean(), black, "V8 levels, peak {peak}");
+            assert_eq!(v8.white, white, "V8 levels, peak {peak}");
+            assert!(peak > 4095 || v8.white[0] <= 4095.0, "a dark frame's V8 white is on the 12-bit scale: {:?}", v8.white);
             for mode in [Mode::Header, Mode::Full] {
                 let decoded = decode(&bytes, mode).unwrap();
                 assert_eq!(decoded.bits, 12, "keep the recorded bit depth");

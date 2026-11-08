@@ -15,9 +15,16 @@ use lcc_raw::RawImage;
 /// the chosen (or the camera's default) `.dcp` or calibration look, else the file's own matrices, else the starting
 /// colour the app fits for a raw without matrices. Returns the profile's name when a `.dcp` or look was applied.
 pub(crate) fn with_photo_colour(raw: &mut RawImage, bytes: &[u8], choice: &str) -> Option<String> {
+    with_photo_colour_at(raw, bytes, choice, lcc_develop::Process::LATEST.version().0)
+}
+
+/// [`with_photo_colour`] for a photo on process number `process`: the calibration look and the fitted starting colour
+/// it renders with (processes V1 to V8 keep theirs, `camera_preview::FitGen`), so an export matches the render.
+pub(crate) fn with_photo_colour_at(raw: &mut RawImage, bytes: &[u8], choice: &str, process: u32) -> Option<String> {
     let meta = raw.metadata.clone();
-    let applied = crate::camera_profiles::apply_choice(&mut raw.color, &meta, choice);
-    crate::camera_preview::with_starting_colour(raw, bytes);
+    let applied = crate::camera_profiles::apply_choice_with(&mut raw.color, &meta, choice, true, process);
+    let fit = crate::camera_preview::FitGen::of_process(process);
+    crate::camera_preview::with_fit_gen(fit, || crate::camera_preview::with_starting_colour(raw, bytes));
     applied
 }
 
@@ -34,8 +41,13 @@ pub fn profile_model(make: Option<&str>, model: &str) -> String {
 /// A `.dcp` of the camera colour a photo of the raw in `bytes` renders with (see [`with_photo_colour`]), named
 /// `name`, for camera `unique` (`UniqueCameraModel`; default [`profile_model`]).
 pub fn photo_dcp(bytes: &[u8], choice: &str, name: &str, unique: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut raw = lcc_raw::decode(bytes).map_err(|e| format!("not a raw photo: {e}"))?;
-    with_photo_colour(&mut raw, bytes, choice);
+    photo_dcp_at(bytes, choice, name, unique, lcc_develop::Process::LATEST.version().0)
+}
+
+/// [`photo_dcp`] of a photo on process number `process` ([`with_photo_colour_at`]).
+pub fn photo_dcp_at(bytes: &[u8], choice: &str, name: &str, unique: Option<&str>, process: u32) -> Result<Vec<u8>, String> {
+    let mut raw = crate::files::decode_raw_at(bytes, process).map_err(|e| format!("not a raw photo: {e}"))?;
+    with_photo_colour_at(&mut raw, bytes, choice, process);
     if !lcc_raw::color::has_matrix(&raw.color) {
         return Err("the app has no colour model for this camera to export".into());
     }
