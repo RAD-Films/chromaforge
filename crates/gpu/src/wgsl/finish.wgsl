@@ -84,6 +84,14 @@ fn lin_to_srgb(v: f32) -> f32 {
     return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 
+fn srgb_dec_odd(v: f32) -> f32 {
+    return sign(v) * srgb_to_lin(abs(v));
+}
+
+fn srgb_enc_odd(v: f32) -> f32 {
+    return sign(v) * lin_to_srgb(abs(v));
+}
+
 fn srgb_to_lin(v: f32) -> f32 {
     if (v <= 0.04045) {
         return v / 12.92;
@@ -266,7 +274,6 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     }
     var lab = vec3<f32>(l, c * cos(h), c * sin(h));
     if (pu(F_GRADING) != 0u) {
-        let l0 = lab.x;
         let m = 0.5 - pf(F_BALANCE) * 0.25;
         let width = 0.15 + pf(F_BLENDING) * 0.5;
         let ws = 1.0 - sstep(m - width, m + width * 0.25, lab.x);
@@ -278,9 +285,6 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
             lab.y += pf(F_WHEELS + 3u * k) * wt;
             lab.z += pf(F_WHEELS + 3u * k + 1u) * wt;
             lab.x += pf(F_WHEELS + 3u * k + 2u) * wt;
-        }
-        if (pu(F_SPLIT) != 0u) {
-            lab += split_offset(l0);
         }
     }
     return oklab_inv(lab);
@@ -1089,6 +1093,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rs = pf(F_REFINE_SAT);
         if (rs < 1.0) {
             e = refine_saturation(e0, e, rs);
+        }
+    }
+    // --- process V9 Split Toning on the curved display colour (`finish::split_display`)
+    if (pu(F_SPLIT) != 0u) {
+        let lin = vec3<f32>(srgb_dec_odd(e.x), srgb_dec_odd(e.y), srgb_dec_odd(e.z));
+        let lab = oklab(mul3(mat_at(F_OUT_INV), lin));
+        let q = mul3(mat_at(F_OUT_M), oklab_inv(lab + split_offset(lab.x)));
+        let s = vec3<f32>(srgb_enc_odd(q.x), srgb_enc_odd(q.y), srgb_enc_odd(q.z));
+        if (all(s == s) && all(abs(s) < vec3<f32>(1e30))) {
+            e = s;
         }
     }
     // --- the masks' local Curves, in mask order, each weighted by its mask (`finish::local_curve_luts`)

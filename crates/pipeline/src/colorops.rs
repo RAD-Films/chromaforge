@@ -236,7 +236,8 @@ pub struct ColorOps {
     /// Wheels (shadows, midtones, highlights, global), blending, balance.
     pub grading: Option<([WheelK; 4], f32, f32)>,
     /// Process V9: the shadows and highlights wheels' colour as Lightroom Classic applies it
-    /// ([`crate::split_v9`]); their colour terms in [`Self::grading`] are then zero.
+    /// ([`crate::split_v9`]); their colour terms in [`Self::grading`] are then zero. Not applied by
+    /// [`Self::apply`]: the finish adds it to the final display colour, after the tone curves.
     pub split: Option<crate::split_v9::SplitK>,
     /// OkLCh hue of skin tones (protected by vibrance).
     pub skin: f32,
@@ -341,10 +342,6 @@ impl ColorOps {
                 lab[1] += k.a * wt;
                 lab[2] += k.b * wt;
                 lab[0] += k.lum * wt;
-            }
-            if let Some(split) = &self.split {
-                let o = split.offset(l);
-                lab = std::array::from_fn(|i| lab[i] + o[i]);
             }
         }
         oklab_to_2020(lab)
@@ -580,8 +577,17 @@ mod tests {
         let mut s = DevelopSettings::default();
         s.grading.shadows = lcc_develop::Wheel { hue: 220.0, sat: 60.0, lum: 0.0 };
         let ops = ColorOps::new(&s);
-        let dark = ops.apply([0.01, 0.01, 0.01], 0.0, 0.0);
-        let bright = ops.apply([0.8, 0.8, 0.8], 0.0, 0.0);
+        // process V9's split goes on in the finish, after the curves: add it as there (no curves here)
+        let apply = |c: [f32; 3]| {
+            let mut lab = oklab_from_2020(ops.apply(c, 0.0, 0.0));
+            if let Some(k) = &ops.split {
+                let o = k.offset(lab[0]);
+                lab = std::array::from_fn(|i| lab[i] + o[i]);
+            }
+            oklab_to_2020(lab)
+        };
+        let dark = apply([0.01, 0.01, 0.01]);
+        let bright = apply([0.8, 0.8, 0.8]);
         assert!(dark[2] > dark[0]);
         assert!((bright[2] - bright[0]).abs() < 0.02);
     }

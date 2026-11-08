@@ -140,6 +140,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("CALIB_M", 9),
     ("SHADOW_TINT", 1),
     ("OUT_M", 9),
+    ("OUT_INV", 9),
     ("OUT_Y", 3),
     ("OUT_TRC", 1),
     ("OUT_GAMMA", 1),
@@ -399,6 +400,11 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     }
     p.f("SHADOW_TINT", fp.shadow_tint);
     p.fs("OUT_M", fp.to_out.as_flattened());
+    match lcc_pipeline::finish::inv3(&fp.to_out) {
+        Some(m) => p.fs("OUT_INV", m.as_flattened()),
+        // singular output matrix (never in practice): no split, as the CPU
+        None => p.b("SPLIT", false),
+    }
     p.fs("OUT_Y", &fp.out_luma);
     let (trc, gamma) = fp.out_trc.code();
     p.u("OUT_TRC", trc);

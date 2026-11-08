@@ -280,6 +280,8 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.grading.highlights = Wheel { hue: 42.0, sat: 9.0, lum: 0.0 };
             s.grading.blending = 100.0;
             s.grading.balance = 21.0;
+            // the split goes on after the curves: a steep one must agree too
+            s.curve.master = vec![Point::new(0.0, 0.0), Point::new(0.3, 0.15), Point::new(0.6, 0.75), Point::new(1.0, 1.0)];
         }),
         ("highlights/shadows ±100 (V9 curve)", |s| {
             s.process = lcc_develop::Process::V9.version();

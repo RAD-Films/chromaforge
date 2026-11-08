@@ -694,6 +694,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         particles,
         ..
     } = fp;
+    // process V9's Split Toning works on the final display colour (after the curves), as LrC's does
+    let split_out = ops.split.zip(inv3(to_out));
     let dehaze_v3 = *dehaze_v3;
     let sharpen_v4 = *sharpen_v4;
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
@@ -1017,6 +1019,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
             }
+            if let Some((k, from_out)) = &split_out {
+                e = split_display(k, from_out, to_out, e);
+            }
             // --- the masks' local Curves, in mask order, each weighted by its mask (feather, Amount, invert and
             // combined components are all in the alpha)
             for (m, l) in &local_curves {
@@ -1126,6 +1131,48 @@ const GAMUT_WARN: f32 = 0.995;
 fn out_of_gamut(r: [f32; 3], t: f32) -> bool {
     let (lo, hi) = (r[0].min(r[1]).min(r[2]), r[0].max(r[1]).max(r[2]));
     t < GAMUT_WARN && (hi - lo) > 0.02 * hi.abs().max(1e-3) && hi - lo > 1e-3 && (lo < -1e-3 || (hi > 1.0 && lo < 1.0))
+}
+
+/// Inverse of a 3×3 matrix (`None` when it is singular or not finite).
+pub fn inv3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *m;
+    let co = [e * i - f * h, f * g - d * i, d * h - e * g];
+    let det = a * co[0] + b * co[1] + c * co[2];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    let r = [
+        [co[0] / det, (c * h - b * i) / det, (b * f - c * e) / det],
+        [co[1] / det, (a * i - c * g) / det, (c * d - a * f) / det],
+        [co[2] / det, (b * g - a * h) / det, (a * e - b * d) / det],
+    ];
+    r.as_flattened().iter().all(|v| v.is_finite()).then_some(r)
+}
+
+/// The sRGB curve, odd and unbounded (curved values may leave 0..1).
+#[inline]
+fn srgb_dec_odd(v: f32) -> f32 {
+    lcc_color::transfer::srgb_to_linear(v.abs()).copysign(v)
+}
+#[inline]
+fn srgb_enc_odd(v: f32) -> f32 {
+    linear_to_srgb(v.abs()).copysign(v)
+}
+
+/// Process V9 Split Toning on a curved, sRGB-encoded colour `e` in the output primaries: its OkLab offset at the
+/// colour's own lightness (`from_out` / `to_out`: output ↔ linear Rec.2020). The GPU mirrors it in `finish.wgsl`.
+pub fn split_display(k: &crate::split_v9::SplitK, from_out: &[[f32; 3]; 3], to_out: &[[f32; 3]; 3], e: [f32; 3]) -> [f32; 3] {
+    use lcc_color::perceptual::{oklab_from_2020, oklab_to_2020};
+    let lab = oklab_from_2020(mul3(from_out, e.map(srgb_dec_odd)));
+    let o = k.offset(lab[0]);
+    let r = mul3(to_out, oklab_to_2020([lab[0] + o[0], lab[1] + o[1], lab[2] + o[2]])).map(srgb_enc_odd);
+    if r.iter().all(|v| v.is_finite()) { r } else { e }
+}
+
+/// [`mul3`] for tests in other modules.
+#[cfg(test)]
+pub(crate) fn mul3_pub(m: &[[f32; 3]; 3], d: [f32; 3]) -> [f32; 3] {
+    mul3(m, d)
 }
 
 #[inline]

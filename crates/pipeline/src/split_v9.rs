@@ -1,6 +1,9 @@
 //! Process V9 Split Toning: the Color Grading panel's shadows and highlights wheels as Lightroom Classic applies them.
 //! Measured on its own exports of our grey-ramp and colour charts (round 17: each wheel at six hues and two
 //! saturations, three balances, two blendings), all in OkLab on display values:
+//! - LrC applies it to the final display colour, after the tone curves: in a raw's full edit (round 12's g07, steep
+//!   RGB curves) its effect matches this model read at the output lightness, not at the lightness before the
+//!   curves. So [`crate::finish`] adds it after the curves ([`crate::finish::split_display`]).
 //! - LrC adds an offset that is nearly the same for every colour at a given lightness, not a multiplicative tint.
 //! - The offset points along the OkLab direction of the slider hue's ProPhoto HSV colour, with a small per-hue
 //!   correction. Its size and its lightness change depend on the hue (two-harmonic Fourier fits over the six hues).
@@ -241,7 +244,12 @@ mod tests {
             let ops = crate::colorops::ColorOps::new(&s);
             let (mut e, mut n) = (0.0f32, 0.0f32);
             for ((b, l), f) in R17_SPLIT_BASE.iter().zip(lrc.iter()).zip(fit.iter()) {
-                let o = oklab_from_2020(ops.apply(oklab_to_2020(*b), 0.0, 0.0));
+                // the finish adds the split to the display colour after the curves (none here)
+                let mut o = oklab_from_2020(ops.apply(oklab_to_2020(*b), 0.0, 0.0));
+                if let Some(k) = &ops.split {
+                    let d = k.offset(o[0]);
+                    o = std::array::from_fn(|i| o[i] + d[i]);
+                }
                 let d = |x: &[f32; 3]| ((o[0] - x[0]).powi(2) + (o[1] - x[1]).powi(2) + (o[2] - x[2]).powi(2)).sqrt();
                 if zones {
                     model = model.max(d(f));
@@ -308,6 +316,29 @@ mod tests {
         // measured: Blending 50 0.0015 / 0.0029, 100 0.0031 / 0.0045 (the zone sum alone at 100: 0.0070 / 0.0107)
         assert!(m50 < 0.002 && w50 < 0.0035, "Blending 50 {m50} / {w50}");
         assert!(m100 < 0.0038 && w100 < 0.0055, "Blending 100 {m100} / {w100}");
+    }
+
+    #[test]
+    fn the_split_reads_the_curved_colours_own_lightness() {
+        use lcc_color::perceptual::oklab_from_2020;
+        let g = ColorGrading {
+            shadows: Wheel { hue: 18.0, sat: 12.0, lum: 0.0 },
+            highlights: Wheel { hue: 42.0, sat: 9.0, lum: 0.0 },
+            balance: 21.0,
+            blending: 100.0,
+            ..Default::default()
+        };
+        let Some(k) = SplitK::new(&g) else { panic!("no split") };
+        let to_out = crate::output::OutputSpace::Srgb.from_working();
+        let Some(from_out) = crate::finish::inv3(&to_out) else { panic!("singular sRGB matrix") };
+        let lin = |e: [f32; 3]| oklab_from_2020(crate::finish::mul3_pub(&from_out, e.map(lcc_color::transfer::srgb_to_linear)));
+        for e in [[0.2f32, 0.15, 0.1], [0.5, 0.45, 0.4], [0.85, 0.8, 0.7]] {
+            let (a, b) = (lin(e), lin(crate::finish::split_display(&k, &from_out, &to_out, e)));
+            let want = k.offset(a[0]);
+            for i in 0..3 {
+                assert!((b[i] - a[i] - want[i]).abs() < 2e-4, "{e:?}: {:?} vs {want:?}", [b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+            }
+        }
     }
 
     #[test]
