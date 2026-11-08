@@ -338,15 +338,17 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     let max_diff = |a: &lcc_raster::Rgba8, b: &lcc_raster::Rgba8| {
         a.data.iter().zip(&b.data).flat_map(|(p, q)| (0..3).map(move |k| (i32::from(p[k]) - i32::from(q[k])).abs())).max().unwrap_or(0)
     };
-    let at_shot = max_diff(&lcc_pipeline::render(&img7, &info7, &v7, &req).image, &lcc_pipeline::render(&img9, &info9, &v9, &req).image);
-    assert!(at_shot <= 2, "at the as-shot white V9 renders as V7 did: {at_shot} levels apart");
+    // the same V9 render from either decode (V9's own tone is not V7's: it is built on V8 and draws a profile
+    // without a tone curve in Lightroom's default look), so only where the tables are applied differs
+    let at_shot = max_diff(&lcc_pipeline::render(&img7, &info7, &v9, &req).image, &lcc_pipeline::render(&img9, &info9, &v9, &req).image);
+    assert!(at_shot <= 2, "at the as-shot white the deferred tables render as the decoded ones: {at_shot} levels apart");
     let warmer = |s: &DevelopSettings| {
         let mut s = s.clone();
         (s.wb.mode, s.wb.temp, s.wb.tint, s.wb.scale) = (WbMode::Custom, (info7.as_shot_temp * 0.6).max(2000.0), info7.as_shot_tint, WbScale::Kelvin);
         s
     };
     let moved =
-        max_diff(&lcc_pipeline::render(&img7, &info7, &warmer(&v7), &req).image, &lcc_pipeline::render(&img9, &info9, &warmer(&v9), &req).image);
+        max_diff(&lcc_pipeline::render(&img7, &info7, &warmer(&v9), &req).image, &lcc_pipeline::render(&img9, &info9, &warmer(&v9), &req).image);
     assert!(moved >= 3, "away from it the tables follow the chosen white: {moved} levels apart");
 }
 

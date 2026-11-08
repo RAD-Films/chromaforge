@@ -204,11 +204,18 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
         }
         let top = *h.lut().last().expect("a table");
         assert_eq!(top, peak, "{info:?}: the brightest tones reach the headroom");
-        // the V7 HDR curve of the same edit is dimmer above white (here at SDR 0.85 by more than a third of a stop)
+        // the HDR curve V9 is built on (V8's) is dimmer above white (here at SDR 0.85 by more than MARGIN stops)
+        let v8 = base_tone(&with_process(hdr_on(2.3), Process::V8), &info, peak);
         let v7 = base_tone(&with_process(hdr_on(2.3), Process::V7), &info, peak);
         let i = s.lut().iter().position(|&v| v >= 0.85).expect("the SDR curve reaches 0.85");
+        eprintln!(
+            "MEASURE {}: V9/V8 {:.3} st, V9/V7 {:.3} st",
+            info.camera_tone.is_some(),
+            (h.lut()[i] / v8.lut()[i]).log2(),
+            (h.lut()[i] / v7.lut()[i]).log2()
+        );
         if info.raw {
-            assert!((h.lut()[i] / v7.lut()[i]).log2() > 0.33, "{info:?}: V9 {} vs V7 {}", h.lut()[i], v7.lut()[i]);
+            assert!((h.lut()[i] / v8.lut()[i]).log2() > 0.33, "{info:?}: V9 {} vs V8 {}", h.lut()[i], v8.lut()[i]);
         }
     }
 }

@@ -3008,9 +3008,12 @@ mod thumbnail_hash_tests {
         assert!(v9.highlight_headroom && !v7.highlight_headroom);
         assert!(!LoadOptions::default().highlight_headroom);
         let img = Arc::new(Rgb32f::filled(2, 2, [0.5; 3]));
-        let raw = DecodedSource { options: v7.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
+        // the same decode but for the headroom (the process is a decode option of its own)
+        let without = LoadOptions { highlight_headroom: false, ..v9.clone() };
+        let raw =
+            DecodedSource { options: without.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
         // only a headroom that changes the pixels needs its own decode
-        assert!(raw.serves(&v7));
+        assert!(raw.serves(&without));
         assert_eq!(raw.serves(&v9), crate::files::HIGHLIGHT_HEADROOM == 0.0);
         let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
         assert!(jpeg.serves(&v7) && jpeg.serves(&v9));
@@ -3392,7 +3395,9 @@ mod tests {
     #[test]
     fn a_raw_decoded_for_one_process_does_not_serve_another() {
         let latest = lcc_develop::DevelopSettings::default();
-        assert_eq!(LoadOptions::default(), LoadOptions::of(&latest));
+        // a decode without a photo's settings names the latest process (its V9 decode switches stay off: callers
+        // that use the pixels directly keep the camera profile's tables in them, see `LoadOptions::default`)
+        assert_eq!(LoadOptions::default().process, LoadOptions::of(&latest).process);
         assert_eq!(LoadOptions::of(&latest).process, lcc_develop::Process::LATEST.version().0);
         let mut old = latest.clone();
         old.process = lcc_develop::ProcessVersion(1);
