@@ -241,7 +241,7 @@ pub enum Process {
     /// shoulder (`ToneMap::hdr_from_sdr`, measured on LrC 15.5 exports of our own charts and of real raws) and
     /// clips at the headroom, instead of creeping toward it. Numbered 10: 8 and 9 are taken by unmerged branches
     /// (LrC Shadows/Highlights, colour pipeline); a file saved with 8 or 9 renders as V7 here.
-    V10,
+    V9,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -251,14 +251,14 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 | Process::V10 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V9 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V10];
-    pub const LATEST: Process = Process::V10;
+    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V9];
+    pub const LATEST: Process = Process::V9;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -269,7 +269,7 @@ impl Process {
             Process::V5 => ProcessVersion(5),
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
-            Process::V10 => ProcessVersion(10),
+            Process::V9 => ProcessVersion(9),
         }
     }
 }

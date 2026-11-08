@@ -374,7 +374,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 | Process::V10 => true,
+            Process::V7 | Process::V9 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -451,7 +451,7 @@ impl FinishParams {
 pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     // the SDR rendition of an HDR edit: the HDR curve, its highlights rolled off into SDR white
     // (issue #69); SDR edits never get here (their rolloff peak is 1). It keeps the HDR curve it was
-    // tuned on under every process: V10 changes only the HDR render, and this rendition already matches
+    // tuned on under every process: V9 changes only the HDR render, and this rendition already matches
     // Lightroom Classic's SDR version of an HDR edit on real raws within 0.16 EV rms
     let rolloff = s.hdr.rolloff_peak();
     if peak <= 1.0 && rolloff > 1.0 {
@@ -460,7 +460,7 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     base_tone_at(s, info, peak, true)
 }
 
-/// `lrc_hdr`: an HDR render (`peak` > 1) under V10 takes Lightroom Classic's HDR tone
+/// `lrc_hdr`: an HDR render (`peak` > 1) under V9 takes Lightroom Classic's HDR tone
 /// ([`ToneMap::hdr_from_sdr`] of the SDR tone map); `false` keeps the older HDR curve of each source kind.
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
     let l = &s.light;
@@ -478,11 +478,11 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), not the tone map
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 => tone(peak),
-        // V10: SDR renders as V7; an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom.
+        // V9: SDR renders as V7; an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom.
         // Display-referred sources (float TIFFs, JPEGs) keep V7's HDR curve: it already matched LrC's within
         // 0.2 EV on float TIFF charts, and the LrC raw tone put them 0.4-0.7 EV too bright
-        Process::V10 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&tone(1.0), peak),
-        Process::V10 => tone(peak),
+        Process::V9 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&tone(1.0), peak),
+        Process::V9 => tone(peak),
     }
 }
 

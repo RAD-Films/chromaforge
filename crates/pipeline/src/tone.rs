@@ -260,7 +260,7 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
-    /// Lightroom Classic's HDR tone (process V10): the HDR value of each tone is a fixed function of the
+    /// Lightroom Classic's HDR tone (process V9): the HDR value of each tone is a fixed function of the
     /// SDR value `s` the same edit has with HDR off, `H = s · 2^G(s)` with
     /// `G = b·K·ln(1 + e^((−ln(1 − s) − a)/K))` stops ([`LRC_HDR_A`], [`LRC_HDR_B`], [`LRC_HDR_K`]), clipped at
     /// `peak`. `G` is about 0 up to the mid tones (the HDR render matches the SDR one there) and grows like
