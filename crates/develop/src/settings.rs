@@ -254,6 +254,10 @@ pub enum Process {
     /// The parametric Tone Curve's regions bend the curve as Lightroom Classic's do (measured on a grey wedge of our
     /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones; on a display-referred
     /// source Exposure up, Whites and Blacks follow Lightroom Classic's responses on the same wedge.
+    ///
+    /// HDR renders follow Lightroom Classic's HDR tone: above the SDR mid tones the HDR value unrolls the SDR
+    /// shoulder (`ToneMap::hdr_from_sdr`, measured on LrC 15.5 exports of our own charts and of real raws) and
+    /// clips at the headroom, instead of creeping toward it.
     V9,
 }
 
@@ -2185,8 +2189,15 @@ impl Default for Hdr {
 }
 
 impl Hdr {
-    pub const DEFAULT_MAX_EV: f64 = 3.0;
+    /// New HDR edits start at Lightroom Classic's default headroom: it writes `crs:HDRMaxValue="+2.30"` on a
+    /// photo whose HDR is switched on (read from its saved XMP, 7 Nov 2026), so an edit moved from LrC keeps its
+    /// look. More headroom is the user's choice on the Headroom slider. Edits saved with HDR on keep their own
+    /// value (an enabled `Hdr` is saved whole).
+    pub const DEFAULT_MAX_EV: f64 = 2.3;
     pub const MAX_EV_LIMIT: f64 = 5.0;
+    /// Headroom at which SDR Blend has its nominal strength (the default before 2.3; kept so the SDR rendition
+    /// of an existing edit stays as it was).
+    pub const BLEND_REF_EV: f64 = 3.0;
 
     /// Whether these are the default HDR settings (HDR off, nothing changed).
     pub fn is_default(&self) -> bool {
@@ -2241,7 +2252,7 @@ impl DevelopSettings {
         // takes a stronger compression; damaged values contribute nothing
         let blend = if h.sdr_blend.is_finite() { h.sdr_blend.clamp(-100.0, 100.0) } else { 0.0 };
         let ev = if h.max_ev.is_finite() { h.max_ev.clamp(0.0, Hdr::MAX_EV_LIMIT) } else { Hdr::DEFAULT_MAX_EV };
-        let k = blend * (ev / Hdr::DEFAULT_MAX_EV).min(1.5);
+        let k = blend * (ev / Hdr::BLEND_REF_EV).min(1.5);
         s.light.highlights = add(s.light.highlights, -0.6 * k);
         s.light.whites = add(s.light.whites, -0.3 * k);
         std::borrow::Cow::Owned(s)

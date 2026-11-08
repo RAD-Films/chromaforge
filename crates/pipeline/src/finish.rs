@@ -458,12 +458,14 @@ impl FinishParams {
 /// lifts its highlights past white ([`ToneMap::camera_hdr`]), so it matches the SDR render below them.
 pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     // the SDR rendition of an HDR edit: the HDR curve, its highlights rolled off into SDR white
-    // (issue #69); SDR edits never get here (their rolloff peak is 1)
+    // (issue #69); SDR edits never get here (their rolloff peak is 1). It keeps the HDR curve it was
+    // tuned on under every process: V9 changes only the HDR render, and this rendition already matches
+    // Lightroom Classic's SDR version of an HDR edit on real raws within 0.16 EV rms
     let rolloff = s.hdr.rolloff_peak();
     if peak <= 1.0 && rolloff > 1.0 {
-        return base_tone_at(s, info, rolloff).sdr_rolloff(rolloff);
+        return base_tone_at(s, info, rolloff, false).sdr_rolloff(rolloff);
     }
-    base_tone_at(s, info, peak)
+    base_tone_at(s, info, peak, true)
 }
 
 /// Whether `s` tones `info`'s source as a raw (scene-referred): a Source filter that renders a finished picture (a
@@ -484,12 +486,25 @@ pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
     d.light.contrast = 0.0;
     d.light.whites = 0.0;
     d.light.blacks = 0.0;
-    Some(base_tone_at(&d, info, 1.0))
+    Some(base_tone_at(&d, info, 1.0, true))
 }
 
-fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
+/// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
+/// ([`ToneMap::hdr_from_sdr`] of V9's SDR tone map); `false` keeps V9's own curves at `peak`.
+fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
     let l = &s.light;
     let raw = tones_as_raw(s, info);
+    // V9's tone at `peak`: V8's roll-off curves with Lightroom Classic's Whites on a raw and kept camera-JPEG tone
+    let v9 = |peak: f32| {
+        // a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
+        let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
+        match info.camera_tone.as_ref().filter(|_| raw) {
+            // a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
+            Some(curve) => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
+            None if raw => ToneMap::rolloff_hdr(l.contrast, whites, l.blacks, peak),
+            None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
+        }
+    };
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), V6 Denoise, V7 grain: not the tone map
@@ -507,19 +522,13 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
             None if raw => ToneMap::rolloff_hdr(l.contrast, l.whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
         },
-        // V9: V8's roll-off, and an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom
-        // Classic's
+        // V9: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
         Process::V9 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
-        Process::V9 => {
-            // a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
-            let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
-            match info.camera_tone.as_ref().filter(|_| raw) {
-                // a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
-                Some(curve) => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
-                None if raw => ToneMap::rolloff_hdr(l.contrast, whites, l.blacks, peak),
-                None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
-            }
-        }
+        // an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom. Display-referred sources
+        // (float TIFFs, JPEGs) keep the older HDR curve: it already matched LrC's within 0.2 EV on float TIFF charts,
+        // and the LrC raw tone put them 0.4-0.7 EV too bright
+        Process::V9 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&v9(1.0), peak),
+        Process::V9 => v9(peak),
     }
 }
 

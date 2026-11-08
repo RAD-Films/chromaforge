@@ -217,7 +217,7 @@ controls! {
     "light.shadows" => light.shadows, "Shadows", Light, -100, 100, 0, 1, 0, Centered => Ramp;
     "light.whites" => light.whites, "Whites", Light, -100, 100, 0, 1, 0, Centered => Ramp;
     "light.blacks" => light.blacks, "Blacks", Light, -100, 100, 0, 1, 0, Centered => Ramp;
-    "hdr.maxEv" => hdr.max_ev, "Headroom", Light, 0, 5, 3, 0.1, 1, Plain;
+    "hdr.maxEv" => hdr.max_ev, "Headroom", Light, 0, 5, 2.3, 0.1, 1, Plain;
     "hdr.sdrBrightness" => hdr.sdr_brightness, "SDR Brightness", Light, -100, 100, 0, 1, 0, Centered;
     "hdr.sdrContrast" => hdr.sdr_contrast, "SDR Contrast", Light, -100, 100, 0, 1, 0, Centered;
     "hdr.sdrHighlights" => hdr.sdr_highlights, "SDR Highlights", Light, -100, 100, 0, 1, 0, Centered;

@@ -238,6 +238,33 @@ pub fn lrc_look(y: f32) -> f32 {
     (y * (a + (b - a) * t).exp2()).min(1.0)
 }
 
+/// [`ToneMap::hdr_from_sdr`]'s constants: where the HDR gain starts, as `−ln(1 − s)` of the SDR value `s` ...
+pub const LRC_HDR_A: f32 = 1.0334;
+/// ... its growth (stops of gain per unit of `−ln(1 − s)`) ...
+pub const LRC_HDR_B: f32 = 1.0285;
+/// ... and the softness of its start.
+pub const LRC_HDR_K: f32 = 0.2491;
+
+/// Smallest SDR top [`ToneMap::hdr_from_sdr`] unrolls toward (lower tops keep SDR white as the top).
+pub const HDR_TOP_MIN: f32 = 0.25;
+
+/// The HDR value of SDR value `s` under [`ToneMap::hdr_from_sdr`]: at least `s` (never darker than the SDR
+/// render), at most `peak`; SDR white and above (an SDR curve that clipped) reach the peak.
+pub fn lrc_hdr_value(s: f32, peak: f32) -> f32 {
+    let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
+    if !s.is_finite() || s <= 0.0 {
+        return 0.0;
+    }
+    if s >= 1.0 {
+        return peak;
+    }
+    let x = (-(1.0 - s).ln() - LRC_HDR_A) / LRC_HDR_K;
+    // softplus without overflow: ln(1 + e^x) = max(x, 0) + ln(1 + e^−|x|)
+    let softplus = x.max(0.0) + (-x.abs()).exp().ln_1p();
+    let g = LRC_HDR_B * LRC_HDR_K * softplus;
+    (s * g.exp2()).clamp(s.min(peak), peak)
+}
+
 /// Display luminance above which [`ToneMap::sdr_rolloff`] compresses an HDR edit's highlights.
 pub const ROLLOFF_KNEE: f32 = 0.5;
 
@@ -434,6 +461,30 @@ impl ToneMap {
             })
             .collect();
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
+    }
+
+    /// Lightroom Classic's HDR tone (process V9): the HDR value of each tone is a fixed function of the
+    /// SDR value `s` the same edit has with HDR off, `H = s · 2^G(s)` with
+    /// `G = b·K·ln(1 + e^((−ln(1 − s) − a)/K))` stops ([`LRC_HDR_A`], [`LRC_HDR_B`], [`LRC_HDR_K`]), clipped at
+    /// `peak`. `G` is about 0 up to the mid tones (the HDR render matches the SDR one there) and grows like
+    /// `−ln(1 − s)` toward SDR white, so the HDR render unrolls the SDR curve's shoulder and reaches the headroom
+    /// within about half a stop of where the SDR curve flattens out, then clips there, as LrC does.
+    /// Fitted (0.038 stops rms below the clip) on LrC 15.5 PQ exports of our own float DNG ramp at the default
+    /// and a 4-stop headroom and of four Canon R5 C raws of printed charts (pairs of LrC's HDR and HDR-off
+    /// renders, 7 Nov 2026; no Adobe code or assets). Contrast, Whites and Blacks act through `sdr`; the
+    /// chroma curve is `sdr`'s. The shoulder unrolls toward the top `m` of `sdr` (its brightest value), not
+    /// toward SDR white: `H = m · lrc(s/m)` with the headroom `peak/m`, so an SDR curve that Whites −100 tops
+    /// out at 0.6 still reaches the headroom in HDR, as LrC's does (it reached 4.9 of 4.9 on the R5 C raws).
+    /// `peak ≤ 1` (or non-finite) returns `sdr` unchanged.
+    pub fn hdr_from_sdr(sdr: &ToneMap, peak: f32) -> ToneMap {
+        if !peak.is_finite() || peak <= 1.0 {
+            return sdr.clone();
+        }
+        let top = sdr.lut.iter().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+        // a curve crushed almost to black has no shoulder to unroll: keep white as its top
+        let m = if (HDR_TOP_MIN..1.0).contains(&top) { top } else { 1.0 };
+        let lut = sdr.lut.iter().map(|&s| m * lrc_hdr_value(s / m, peak / m)).collect();
+        ToneMap { lut: monotone(lut), chroma: sdr.chroma }
     }
 
     /// Fits an HDR tone map reaching `peak` into SDR (own design, issue #69). Display values up to
