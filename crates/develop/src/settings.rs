@@ -248,6 +248,12 @@ pub enum Process {
     /// balance, matrix, hue/saturation map, exposure, look table. Before V9 they were applied while decoding, at the
     /// as-shot white, and a white-balance change re-balanced colours the tables had already moved, so a grey picked
     /// neutral stayed tinted (up to 12 b* on a Canon EOS R6 calibration from 5500 K to 3200 K). Built on V8.
+    ///
+    /// The global Highlights and Shadows follow Lightroom Classic's: one tone curve per picture, its shape taken from
+    /// the picture's own histogram (fitted to Lightroom Classic exports of our own procedural pictures; OneSlips).
+    /// The parametric Tone Curve's regions bend the curve as Lightroom Classic's do (measured on a grey wedge of our
+    /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones; on a display-referred
+    /// source Exposure up, Whites and Blacks follow Lightroom Classic's responses on the same wedge.
     V9,
 }
 

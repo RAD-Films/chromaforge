@@ -267,6 +267,16 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.grading.blending = 70.0;
             s.grading.balance = 20.0;
         }),
+        ("highlights/shadows ±100 (V9 curve)", |s| {
+            s.process = lcc_develop::Process::V9.version();
+            s.light.shadows = 100.0;
+            s.light.highlights = -100.0;
+        }),
+        ("highlights/shadows (V7 response)", |s| {
+            s.process = lcc_develop::Process::V7.version();
+            s.light.shadows = 70.0;
+            s.light.highlights = -70.0;
+        }),
         ("tone curves", |s| {
             s.curve.highlights = -30.0;
             s.curve.shadows = 25.0;

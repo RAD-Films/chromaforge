@@ -345,8 +345,18 @@ pub fn reconstruct(img: &mut Rgb32f, wb: [f32; 3], clip: f32) -> usize {
 /// chromaticity of reliable unclipped content nearby, and that of `white` where there is none.
 /// Returns the number of pixels that had at least one clipped channel; the others are left exactly as they were.
 pub fn reconstruct_with(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3]) -> usize {
-    rebuild_clipped(img, wb, clip, white, &|_, p| by_value(p, clip))
+    reconstruct_brighter(img, wb, clip, white, 0.0)
 }
+
+/// [`reconstruct_with`], the brightest plausible level of a fully clipped pixel raised `headroom` stops (0 to
+/// [`MAX_HEADROOM`]; anything else counts as 0) above the sensor's clip: what the sensor couldn't record was
+/// brighter than its clip, and a picture whose Exposure goes down shows how much.
+pub fn reconstruct_brighter(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], headroom: f32) -> usize {
+    rebuild_clipped(img, wb, clip, white, headroom, &|_, p| by_value(p, clip))
+}
+
+/// The most stops [`reconstruct_brighter`] raises clipped highlights by.
+pub const MAX_HEADROOM: f32 = 4.0;
 
 /// Bits of a [`reconstruct_masked`] mask entry: which channels of the pixel had a clipped sample.
 pub const CLIPPED_R: u8 = 1;
@@ -360,10 +370,15 @@ pub const CLIPPED_B: u8 = 4;
 /// (as the block's maximum would) lifts the channel to the clip level, which reads as a coloured speckle (#548).
 /// A mask of the wrong length is ignored (clipping is then told by the values alone).
 pub fn reconstruct_masked(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], mask: &[u8]) -> usize {
+    reconstruct_masked_brighter(img, wb, clip, white, mask, 0.0)
+}
+
+/// [`reconstruct_masked`] with [`reconstruct_brighter`]'s `headroom`.
+pub fn reconstruct_masked_brighter(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], mask: &[u8], headroom: f32) -> usize {
     if mask.len() != img.data.len() {
-        return reconstruct_with(img, wb, clip, white);
+        return reconstruct_brighter(img, wb, clip, white, headroom);
     }
-    rebuild_clipped(img, wb, clip, white, &|i, p| {
+    rebuild_clipped(img, wb, clip, white, headroom, &|i, p| {
         let m = mask.get(i).copied().unwrap_or(0);
         let v = by_value(p, clip);
         [v[0] || m & CLIPPED_R != 0, v[1] || m & CLIPPED_G != 0, v[2] || m & CLIPPED_B != 0]
@@ -380,7 +395,7 @@ fn by_value(p: &[f32; 3], clip: f32) -> [bool; 3] {
 }
 
 /// [`reconstruct_with`], with `clipped` telling the clipped channels.
-fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], clipped: &impl Clipped) -> usize {
+fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], headroom: f32, clipped: &impl Clipped) -> usize {
     let (w, h) = (img.width, img.height);
     let count = img.data.par_iter().enumerate().filter(|(i, p)| clipped(*i, p).iter().any(|&c| c)).count();
     if count == 0 || w == 0 || h == 0 {
@@ -440,7 +455,8 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], c
         Some(levels).filter(|levels| levels.last().is_some_and(|top| top.cells.iter().any(|c| c[3] > 0.0)))
     };
     let rim_field = rims.as_ref().and_then(|l| l.first());
-    let max_level = wb.iter().cloned().fold(0.0f32, f32::max) * clip;
+    let headroom = if headroom.is_finite() { headroom.clamp(0.0, MAX_HEADROOM) } else { 0.0 };
+    let max_level = wb.iter().cloned().fold(0.0f32, f32::max) * clip * headroom.exp2();
     img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let p = *px;
@@ -634,6 +650,37 @@ mod tests {
             assert!((q[0] - q[1]).abs() < 1e-4 && (q[2] - q[1]).abs() < 1e-4, "{bad:?}: {q:?}");
             assert!(img.data.iter().flatten().all(|v| v.is_finite()), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn headroom_rebuilds_fully_clipped_pixels_that_many_stops_brighter() {
+        let white = [1.03, 0.98, 1.06];
+        let clipped = || {
+            let mut img = Rgb32f::filled(8, 8, [1.0; 3]);
+            img.data[0] = [0.3, 0.6, 0.4];
+            img
+        };
+        let (mut plain, mut none, mut one) = (clipped(), clipped(), clipped());
+        reconstruct_with(&mut plain, WB, 0.99, white);
+        reconstruct_brighter(&mut none, WB, 0.99, white, 0.0);
+        reconstruct_brighter(&mut one, WB, 0.99, white, 1.0);
+        assert_eq!(plain.data, none.data, "no headroom is the plain rebuild");
+        let k = |img: &Rgb32f| balanced(img.get(4, 4))[1];
+        // twice as bright, give or take the blend towards the unclipped rim's level near it
+        assert!((k(&one) / k(&plain) / 2.0 - 1.0).abs() < 0.03, "1 stop: twice as bright ({} vs {})", k(&one), k(&plain));
+        assert_eq!(one.data[0], [0.3, 0.6, 0.4], "unclipped pixels are left alone");
+        // hostile amounts: none for NaN or negative, at most MAX_HEADROOM, nothing overflows
+        for (h, want) in [(f32::NAN, 1.0), (-3.0, 1.0), (f32::INFINITY, 1.0), (1e9, MAX_HEADROOM.exp2())] {
+            let mut img = clipped();
+            reconstruct_brighter(&mut img, WB, 0.99, white, h);
+            assert!((k(&img) / k(&plain) / want - 1.0).abs() < 0.03, "{h}: {} vs {}", k(&img), k(&plain));
+            assert!(img.data.iter().flatten().all(|v| v.is_finite()), "{h}");
+        }
+        // the masked (binned) rebuild takes it too
+        let mut masked = clipped();
+        let mask = vec![0u8; masked.data.len()];
+        reconstruct_masked_brighter(&mut masked, WB, 0.99, white, &mask, 1.0);
+        assert_eq!(masked.data, one.data);
     }
 
     /// Red rises through its clip level across a sky whose green and blue clipped: the rebuilt colour changes

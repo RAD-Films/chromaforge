@@ -82,7 +82,7 @@ fn eval_curves(l: &[Lut1; 3], e: [f32; 3], hdr: bool) -> [f32; 3] {
 }
 
 /// Parametric region curve (encoded domain) composed with the master point curve.
-fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
+fn curve_luts(c: &ToneCurve, process: Process) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
     let master = !ToneCurve::point_curve_is_identity(&c.master);
     let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
@@ -90,7 +90,7 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         return None;
     }
     const N: usize = CURVE_LUT_N;
-    let mut base = crate::curve::ParametricCurve::new(c).to_lut();
+    let mut base = crate::curve::ParametricCurve::for_process(c, process).to_lut();
     let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
     if master {
         base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);
@@ -299,6 +299,10 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     pub hl: f32,
     pub sh: f32,
+    /// Process V9's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
+    /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
+    /// render's plan.
+    pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -398,7 +402,7 @@ impl FinishParams {
             ops: ColorOps::new(s),
             local_points: crate::colorops::mask_point_ks(s),
             local_mixers: crate::colorops::mask_mixer_ks(s),
-            curves: curve_luts(&s.curve),
+            curves: curve_luts(&s.curve, s.process.process()),
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),
@@ -407,6 +411,7 @@ impl FinishParams {
             proof: None,
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
+            lift: None,
             clar,
             tex,
             dehaze,
@@ -461,13 +466,30 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     base_tone_at(s, info, peak)
 }
 
+/// Whether `s` tones `info`'s source as a raw (scene-referred): a Source filter that renders a finished picture (a
+/// negative conversion) is shown as it is, like a JPEG, not toned again as a raw.
+fn tones_as_raw(s: &DevelopSettings, info: &SourceInfo) -> bool {
+    info.raw
+        && !(crate::plugin_filters::any_active(s)
+            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone())
+}
+
+/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V9's
+/// Highlights / Shadows curve is applied in ([`crate::tone_lift`]); `None` for a display-referred source.
+pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
+    if !tones_as_raw(s, info) {
+        return None;
+    }
+    let mut d = s.clone();
+    d.light.contrast = 0.0;
+    d.light.whites = 0.0;
+    d.light.blacks = 0.0;
+    Some(base_tone_at(&d, info, 1.0))
+}
+
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     let l = &s.light;
-    // a Source filter that renders a finished picture (a negative conversion) is shown as it is,
-    // like a JPEG, not toned again as a raw
-    let raw = info.raw
-        && !(crate::plugin_filters::any_active(s)
-            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone());
+    let raw = tones_as_raw(s, info);
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), V6 Denoise, V7 grain: not the tone map
@@ -480,11 +502,24 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
         }
         // a raw's tone curve rolls off into white in stops: a camera curve past its last knot, the
         // generic curve from half a stop below its white point instead of clipping (upstream #3783)
-        Process::V8 | Process::V9 => match info.camera_tone.as_ref().filter(|_| raw) {
+        Process::V8 => match info.camera_tone.as_ref().filter(|_| raw) {
             Some(curve) => ToneMap::camera_rolloff_hdr(curve, l.contrast, l.whites, l.blacks, peak),
             None if raw => ToneMap::rolloff_hdr(l.contrast, l.whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
         },
+        // V9: V8's roll-off, and an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom
+        // Classic's
+        Process::V9 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
+        Process::V9 => {
+            // a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
+            let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
+            match info.camera_tone.as_ref().filter(|_| raw) {
+                // a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
+                Some(curve) => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
+                None if raw => ToneMap::rolloff_hdr(l.contrast, whites, l.blacks, peak),
+                None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
+            }
+        }
     }
 }
 
@@ -551,6 +586,7 @@ pub(crate) fn finish(
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -585,6 +621,7 @@ pub(crate) fn finish_deep(
     use lcc_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -652,6 +689,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let sharpen_v4 = *sharpen_v4;
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
+    let lift = fp.lift.as_deref();
     let (sharpen_limit, sharpen_fade) = (*sharpen_limit, *sharpen_fade);
     let mut terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     with_tone(&mut terms, &p.mask_tone);
@@ -779,7 +817,13 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let shift = l1 - l0;
             let base = p.base.data[i] + ev + shift;
             let mut delta = 0.0f32;
-            let (hh, ss) = (hl + l_hl, sh + l_sh);
+            // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
+            let (hh, ss) = if let Some(lf) = lift {
+                delta += lf.at(base);
+                (l_hl, l_sh)
+            } else {
+                (hl + l_hl, sh + l_sh)
+            };
             if hh != 0.0 || ss != 0.0 {
                 let ws = 1.0 - smooth(-4.8, 0.3, base);
                 // Highlights reach down into the upper midtones and ease off towards white (fitted to

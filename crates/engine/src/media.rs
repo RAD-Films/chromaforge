@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 82;
+pub const RENDER_CACHE_VERSION: u64 = 83;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -177,6 +177,9 @@ pub struct LoadOptions {
     /// Demosaic a raw with the AHD that blends its candidates where noise alone would pick one
     /// ([`lcc_raw::Method::AhdBlend`], process V9); false: the outright pick of V1-V8 ([`lcc_raw::Method::Ahd`]).
     pub ahd_blend: bool,
+    /// Rebuild a raw's fully clipped highlights brighter than the sensor's clip (process V9 and above,
+    /// [`crate::files::HIGHLIGHT_HEADROOM`] stops), as Lightroom Classic shows them when Exposure goes down.
+    pub highlight_headroom: bool,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -195,6 +198,7 @@ impl Default for LoadOptions {
             // fitter, see the camera profile's colours; photo renders decode with `for_photo`, which follows the process)
             defer_tables: false,
             ahd_blend: false,
+            highlight_headroom: false,
             path: None,
         }
     }
@@ -210,6 +214,7 @@ impl LoadOptions {
             pixel_fix: s.sensor.fixes_pixels(),
             defer_tables: s.process.process() >= lcc_develop::Process::V9,
             ahd_blend: s.process.process() >= lcc_develop::Process::V9,
+            highlight_headroom: s.process.process() >= lcc_develop::Process::V9,
             path: None,
         }
     }
@@ -320,7 +325,8 @@ impl DecodedSource {
                 && ((self.options.camera == options.camera && self.options.camera_look == options.camera_look) || !info.is_some_and(|i| i.raw))
                 && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
                 && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw))
-                && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw)))
+                && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw))
+                && (crate::files::headroom_of(&self.options) == crate::files::headroom_of(options) || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -2983,6 +2989,26 @@ pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync
 mod thumbnail_hash_tests {
     use super::*;
 
+    /// Process V9's decode rebuilds a raw's clipped highlights with headroom, older processes' without; a decoded
+    /// raw serves only the one it was made for, a decoded JPEG either.
+    #[test]
+    fn a_decoded_raw_serves_only_its_own_highlight_headroom() {
+        use lcc_develop::Process;
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let v9 = LoadOptions::of(&s);
+        s.process = Process::V7.version();
+        let v7 = LoadOptions::of(&s);
+        assert!(v9.highlight_headroom && !v7.highlight_headroom);
+        assert!(!LoadOptions::default().highlight_headroom);
+        let img = Arc::new(Rgb32f::filled(2, 2, [0.5; 3]));
+        let raw = DecodedSource { options: v7.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
+        // only a headroom that changes the pixels needs its own decode
+        assert!(raw.serves(&v7));
+        assert_eq!(raw.serves(&v9), crate::files::HIGHLIGHT_HEADROOM == 0.0);
+        let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
+        assert!(jpeg.serves(&v7) && jpeg.serves(&v9));
+    }
+
     fn session() -> crate::Session {
         let mut s = crate::Session::new();
         let p = Photo::new(PhotoId(1), Source::File { path: "hash-fixture.jpg".into() }, "fixture.jpg", "JPEG", 6000, 4000, "2026-01-01");
@@ -3521,6 +3547,7 @@ mod tests {
         let id = s.active().unwrap();
         let mut job = s.render_job(id, 64, 64, false, true).unwrap();
         let loaded_info = info.clone();
+        let options = LoadOptions::of(&s.catalog.photo(id).unwrap().develop);
         job.source = SourceRef::File {
             path: "synthetic.arw".into(),
             max_edge: 64,
@@ -3531,8 +3558,7 @@ mod tests {
             })),
             fallback: None,
             denoise: None,
-            // (decoded for the settings below: a raw source serves only the options it was decoded with)
-            options: LoadOptions::of(&DevelopSettings::default()),
+            options,
             reduced: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.

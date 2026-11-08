@@ -8,6 +8,12 @@
 //! neutral settings (an unedited JPEG renders exactly as the file), with contrast/whites/blacks as
 //! S-curve adjustments in a gamma-2.2 perceptual domain and a short shoulder above 0.95.
 
+mod lrc_tables;
+
+use std::sync::OnceLock;
+
+use lcc_color::spline::MonotoneCurve;
+
 pub const GREY: f32 = 0.18;
 /// The tone LUT spans `LUT_MIN_EV..LUT_MAX_EV` around grey in `LUT_N` steps.
 pub const LUT_MIN_EV: f32 = -14.0;
@@ -26,6 +32,11 @@ const NO_CHROMA: [f32; CHROMA_N] = [1.0; CHROMA_N];
 pub struct CameraTone {
     knots: [[f32; 2]; 32],
     chroma: [f32; CHROMA_N],
+    /// The curve is the camera JPEG's tone kept under a camera profile with no tone curve of its own (most
+    /// chart-made profiles): Lightroom draws such a profile with its default curve, so process 9 adds [`lrc_look`].
+    /// A calibration's or DNG's own curve, and a look fitted to the camera JPEG alone, get none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    default_curve: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for CameraTone {
@@ -36,9 +47,13 @@ impl<'de> serde::Deserialize<'de> for CameraTone {
             // absent in smart previews written before the chroma curve existed
             #[serde(default)]
             chroma: Option<[f32; CHROMA_N]>,
+            // absent before process 9's look, and for every other curve
+            #[serde(default)]
+            default_curve: bool,
         }
         let w = Wire::deserialize(d)?;
         let tone = Self::new(w.knots).ok_or_else(|| serde::de::Error::custom("invalid camera tone curve"))?;
+        let tone = if w.default_curve { tone.under_default_curve() } else { tone };
         match w.chroma {
             Some(c) => tone.with_chroma(c).ok_or_else(|| serde::de::Error::custom("invalid camera chroma curve")),
             None => Ok(tone),
@@ -55,7 +70,18 @@ impl CameraTone {
             }
             previous = p;
         }
-        Some(Self { knots, chroma: NO_CHROMA })
+        Some(Self { knots, chroma: NO_CHROMA, default_curve: false })
+    }
+
+    /// The curve marked as kept under a profile without a tone curve ([`CameraTone::has_default_curve`]).
+    pub fn under_default_curve(self) -> Self {
+        Self { default_curve: true, ..self }
+    }
+
+    /// Whether the curve is the camera JPEG's tone kept under a camera profile without a tone curve, which
+    /// Lightroom draws with its default curve.
+    pub fn has_default_curve(&self) -> bool {
+        self.default_curve
     }
 
     /// The default raw tone curve ([`ToneMap::new`] at neutral settings) as camera-curve knots, about 1/3 EV apart
@@ -184,6 +210,34 @@ fn past_join(u: f32) -> f32 {
 /// Exposure 0, +1 and +2 where V1 to V7 render 239, 255 and 255 (upstream issue #1632).
 pub const GENERIC_KNEE_STOPS: f32 = 0.5;
 
+/// Lightroom Classic's default look over a camera's own JPEG: the gain in EV it renders display luminance with, at
+/// display luminance 2^-11, 2^-10.5 … 2^0 (white stays white). Fitted by quantile matching on 50 R5 C frames at zero
+/// sliders (the photographer's matrix-only camera profile in LrC, the camera's JPEG curve here): LrC is about
+/// 0.7 EV lighter in the shadows and darker midtones, 0.25 EV at upper midtones, none at white. The frames' spread
+/// around it is a few hundredths of an EV through the midtones; on 13 held-out frames it takes LrC − JPEG from
+/// p5 +0.25 / p25 +0.32 / p50 +0.20 EV to within 0.06 EV at every percentile.
+const LRC_LOOK: [f32; 23] = [
+    0.375, 0.410, 0.460, 0.533, 0.589, 0.625, 0.663, 0.690, 0.697, 0.695, 0.686, 0.661, 0.614, 0.545, 0.468, 0.399, 0.339, 0.288, 0.237, 0.177,
+    0.098, 0.017, 0.000,
+];
+const LRC_LOOK_FROM: f32 = -11.0;
+const LRC_LOOK_STEP: f32 = 0.5;
+
+/// Display luminance `y` with [`LRC_LOOK`]: monotone, 0 stays 0 and 1 stays 1 (and above it, unchanged).
+pub fn lrc_look(y: f32) -> f32 {
+    if !(y.is_finite() && y > 0.0) {
+        return 0.0;
+    }
+    if y >= 1.0 {
+        return y;
+    }
+    let f = ((y.log2() - LRC_LOOK_FROM) / LRC_LOOK_STEP).max(0.0);
+    let i = (f as usize).min(LRC_LOOK.len() - 2);
+    let t = (f - i as f32).min(1.0);
+    let (a, b) = (LRC_LOOK.get(i).copied().unwrap_or(0.0), LRC_LOOK.get(i + 1).copied().unwrap_or(0.0));
+    (y * (a + (b - a) * t).exp2()).min(1.0)
+}
+
 /// Display luminance above which [`ToneMap::sdr_rolloff`] compresses an HDR edit's highlights.
 pub const ROLLOFF_KNEE: f32 = 0.5;
 
@@ -213,6 +267,17 @@ impl ToneMap {
     /// ([`CameraTone::apply_rolloff`]) instead of closing on white within a stop of the sensor's.
     pub fn camera_rolloff_hdr(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
         ToneMap::camera_with(|y| curve.apply_rolloff(y), curve.chroma, contrast, whites, blacks, peak)
+    }
+
+    /// [`ToneMap::camera_rolloff_hdr`] for process V9: a camera JPEG's tone kept under a profile without a tone curve
+    /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]), over V8's roll-off; any
+    /// other curve as V8 draws it.
+    pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        if curve.has_default_curve() {
+            ToneMap::camera_with(|y| lrc_look(curve.apply_rolloff(y)), curve.chroma, contrast, whites, blacks, peak)
+        } else {
+            ToneMap::camera_rolloff_hdr(curve, contrast, whites, blacks, peak)
+        }
     }
 
     fn camera_with(curve: impl Fn(f32) -> f32, chroma: [f32; CHROMA_N], contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
@@ -341,6 +406,36 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
+    /// Process V9's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
+    /// follow Lightroom Classic's responses measured on a grey wedge of our own ([`lrc_tables`]); Contrast is
+    /// [`ToneMap::display`]'s. `exposure` (EV) is the gain already in the luminance this table is read at, so a
+    /// brighter Exposure rolls the highlights off as Lightroom does instead of clipping them. Exposure down stays a
+    /// plain gain (not measured). Identity at neutral settings.
+    pub fn display_lrc(contrast: f64, whites: f64, blacks: f64, exposure: f64) -> ToneMap {
+        let c = if contrast.is_finite() { (contrast.clamp(-100.0, 100.0) / 100.0) as f32 } else { 0.0 };
+        let (w, b) = (whites.clamp(-100.0, 100.0), blacks.clamp(-100.0, 100.0));
+        let (w, b) = (if w.is_nan() { 0.0 } else { w }, if b.is_nan() { 0.0 } else { b });
+        let e = if exposure.is_finite() { exposure.clamp(-10.0, 10.0) as f32 } else { 0.0 };
+        let gain = e.exp2();
+        let m = GREY.powf(1.0 / 2.2);
+        let lut = (0..LUT_N)
+            .map(|i| {
+                let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
+                let y = GREY * 2f32.powf(ev);
+                // the source's own value, before the Exposure gain
+                let x = y / gain;
+                let shown = if e > 0.0 && x <= 1.0 { lrc_exposure(e, x) } else { y };
+                let mut p = shown.max(0.0).powf(1.0 / 2.2);
+                if p <= 1.0 {
+                    p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
+                }
+                p = lrc_w_b(p.clamp(0.0, 1.0), w, b);
+                p.clamp(0.0, 1.0).powf(2.2)
+            })
+            .collect();
+        ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
+    }
+
     /// Fits an HDR tone map reaching `peak` into SDR (own design, issue #69). Display values up to
     /// the knee `k` ([`ROLLOFF_KNEE`]) stay as they are; above it the shoulder works in stops over
     /// the knee, `v = log2(o/k)`, which run from 0 to `V = log2(peak/k)` and are fitted into
@@ -434,6 +529,77 @@ fn w_b_shift(p: f32, w: f32, b: f32) -> f32 {
     d
 }
 
+/// The measured responses as monotone splines: Exposure (sRGB in → sRGB out) at [`lrc_tables::EXP_EV`], then
+/// Whites and Blacks (display value in → out) at −100, −50, +50, +100.
+struct Lrc {
+    exposure: Vec<MonotoneCurve>,
+    w_b: [[MonotoneCurve; 4]; 2],
+}
+
+fn lrc() -> &'static Lrc {
+    static CURVES: OnceLock<Lrc> = OnceLock::new();
+    CURVES.get_or_init(|| {
+        let pts = |xs: &[f32], ys: &[f32], shift: bool| -> MonotoneCurve {
+            let p: Vec<(f64, f64)> = xs.iter().zip(ys).map(|(&x, &y)| (x as f64, if shift { x + y } else { y } as f64)).collect();
+            MonotoneCurve::new(&p)
+        };
+        Lrc {
+            exposure: lrc_tables::EXP_Y.iter().map(|ys| pts(&lrc_tables::EXP_X, ys, false)).collect(),
+            w_b: std::array::from_fn(|s| {
+                std::array::from_fn(|a| {
+                    lrc_tables::WB_SHIFT.get(s).and_then(|t| t.get(a)).map_or_else(MonotoneCurve::identity, |ys| pts(&lrc_tables::WB_P, ys, true))
+                })
+            }),
+        }
+    })
+}
+
+/// Linear value `x` (0..1) of a display-referred source after Lightroom's Exposure `e` (> 0 EV): read off the
+/// curves measured at 0.5, 1 and 2 EV, straight between them (from the unchanged picture at 0); above 2 EV the
+/// 2 EV curve is read at the value the remaining gain gives.
+fn lrc_exposure(e: f32, x: f32) -> f32 {
+    let srgb = |v: f32| lcc_color::transfer::linear_to_srgb(v.clamp(0.0, 1.0));
+    let curves = &lrc().exposure;
+    let at = |k: usize, v: f32| curves.get(k).map_or(srgb(v), |c| c.eval(srgb(v) as f64) as f32);
+    let evs = lrc_tables::EXP_EV;
+    let out = if e >= evs[2] {
+        at(2, x * (e - evs[2]).exp2())
+    } else {
+        let (mut lo_e, mut lo) = (0.0, srgb(x));
+        let mut res = lo;
+        for (k, &ek) in evs.iter().enumerate() {
+            let hi = at(k, x);
+            if e <= ek {
+                res = lo + (hi - lo) * (e - lo_e) / (ek - lo_e);
+                break;
+            }
+            (lo_e, lo) = (ek, hi);
+            res = hi;
+        }
+        res
+    };
+    lcc_color::transfer::srgb_to_linear(out.clamp(0.0, 1.0))
+}
+
+/// Display value `p` (gamma 2.2, 0..1) after Lightroom's Whites `w` and Blacks `b` (−100..100): each slider's
+/// measured shift, straight between 0, ±50 and ±100, summed.
+fn lrc_w_b(p: f32, w: f64, b: f64) -> f32 {
+    let curves = &lrc().w_b;
+    let shift = |s: usize, a: f64| -> f64 {
+        if a == 0.0 {
+            return 0.0;
+        }
+        let d = |k: usize| curves.get(s).and_then(|c| c.get(k)).map_or(0.0, |c| c.eval(p as f64) - p as f64);
+        match a {
+            a if a >= 50.0 => d(2) + (a - 50.0) / 50.0 * (d(3) - d(2)),
+            a if a >= 0.0 => a / 50.0 * d(2),
+            a if a >= -50.0 => -a / 50.0 * d(1),
+            a => d(1) + (-a - 50.0) / 50.0 * (d(0) - d(1)),
+        }
+    };
+    (p as f64 + shift(0, w) + shift(1, b)) as f32
+}
+
 /// Running maximum: strong Whites lift the upper tones past white, which must not fold back.
 fn monotone(mut lut: Vec<f32>) -> Vec<f32> {
     let mut top = f32::MIN;
@@ -459,6 +625,45 @@ mod tests {
             let x = 0.004 * 1.18f32.powi(i as i32);
             [x, 1.0 - (-2.0 * x).exp()]
         })
+    }
+
+    #[test]
+    fn lrc_look_lightens_shadows_and_midtones_and_keeps_black_and_white() {
+        assert_eq!(lrc_look(0.0), 0.0);
+        assert_eq!(lrc_look(1.0), 1.0);
+        assert_eq!(lrc_look(3.0), 3.0);
+        for y in [f32::NAN, -1.0, f32::NEG_INFINITY] {
+            assert_eq!(lrc_look(y), 0.0);
+        }
+        let gain = |y: f32| (lrc_look(y) / y).log2();
+        assert!((gain(2f32.powf(-7.0)) - 0.695).abs() < 0.01, "shadows: {}", gain(2f32.powf(-7.0)));
+        assert!((gain(0.18) - 0.30).abs() < 0.03, "grey: {}", gain(0.18));
+        assert!(gain(0.95) < 0.02 && gain(1e-6) > 0.3);
+        let mut previous = 0.0;
+        for i in 0..4000 {
+            let v = lrc_look(2f32.powf(-16.0 + 16.0 * i as f32 / 3999.0));
+            assert!(v >= previous && v <= 1.0, "{i}: {v} after {previous}");
+            previous = v;
+        }
+        // process 9's tone map has it; earlier processes don't
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let plain = CameraTone::new(knots).unwrap();
+        let curve = plain.under_default_curve();
+        let (v7, v9) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
+        assert!((v9.apply(0.1) - lrc_look(v7.apply(0.1))).abs() < 1e-4);
+        assert!(v9.apply(0.1) > v7.apply(0.1) * 1.1);
+        // any other curve (a profile's own, a look fitted to the camera JPEG alone) gets no look
+        assert!(curve.has_default_curve() && !plain.has_default_curve());
+        assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - v7.apply(0.1)).abs() < 1e-4);
+        // the mark travels through serialisation (smart previews); older files have none
+        let back: CameraTone = serde_json::from_value(serde_json::to_value(curve).unwrap()).unwrap();
+        assert_eq!(back, curve);
+        assert!(!serde_json::to_value(plain).unwrap().as_object().unwrap().contains_key("default_curve"));
+        let old: CameraTone = serde_json::from_value(serde_json::json!({"knots": knots})).unwrap();
+        assert!(!old.has_default_curve());
     }
 
     #[test]
@@ -720,6 +925,63 @@ mod tests {
             let y = GREY * 2f32.powf(ev);
             let (a, b) = (camera.apply(y), default.apply(y));
             assert!((a - b).abs() <= 0.01 * b.max(0.01), "{ev} EV: {a} vs {b}");
+        }
+    }
+
+    /// sRGB-encoded output of `map` for an sRGB-encoded grey `x` under an Exposure gain of `ev`.
+    fn shown(map: &ToneMap, x: f32, ev: f32) -> f32 {
+        lcc_color::transfer::linear_to_srgb(map.apply(lcc_color::transfer::srgb_to_linear(x) * ev.exp2()))
+    }
+
+    /// V9's display tone map is the file itself at neutral settings.
+    #[test]
+    fn display_lrc_is_identity_when_neutral() {
+        let map = ToneMap::display_lrc(0.0, 0.0, 0.0, 0.0);
+        for i in 0..=50 {
+            let x = i as f32 / 50.0;
+            assert!((shown(&map, x, 0.0) - x).abs() < 0.002, "at {x}: {}", shown(&map, x, 0.0));
+        }
+    }
+
+    /// Exposure up on a JPEG rolls the highlights off as Lightroom Classic does (the wedge it was measured on),
+    /// where the V7 tone map's gain clips them; and Whites and Blacks land on Lightroom's levels.
+    #[test]
+    fn display_lrc_follows_the_wedge() {
+        for (k, &ev) in lrc_tables::EXP_EV.iter().enumerate() {
+            let map = ToneMap::display_lrc(0.0, 0.0, 0.0, ev as f64);
+            for (i, &x) in lrc_tables::EXP_X.iter().enumerate() {
+                let want = lrc_tables::EXP_Y[k][i];
+                let got = shown(&map, x, ev);
+                assert!((got - want).abs() < 0.004, "Exposure +{ev} at {x}: {got} vs Lightroom {want}");
+            }
+        }
+        // the V7 map at +2 EV: a light grey patch clips to white, Lightroom keeps it below
+        let (x, want) = (lrc_tables::EXP_X[19], lrc_tables::EXP_Y[2][19]);
+        let old = shown(&ToneMap::display(0.0, 0.0, 0.0), x, 2.0);
+        assert!((old - want).abs() > 0.05, "the old gain is off at {x}: {old} vs {want}, or this proves nothing");
+        for (s, name) in [(0, "Whites"), (1, "Blacks")] {
+            for (k, amount) in [-100.0, -50.0, 50.0, 100.0].into_iter().enumerate() {
+                let map = if s == 0 { ToneMap::display_lrc(0.0, amount, 0.0, 0.0) } else { ToneMap::display_lrc(0.0, 0.0, amount, 0.0) };
+                for (i, &x) in lrc_tables::EXP_X.iter().enumerate() {
+                    let p = (lrc_tables::WB_P[i] + lrc_tables::WB_SHIFT[s][k][i]).clamp(0.0, 1.0);
+                    let want = lcc_color::transfer::linear_to_srgb(p.powf(2.2));
+                    let got = shown(&map, x, 0.0);
+                    assert!((got - want).abs() < 0.004, "{name} {amount} at {x}: {got} vs Lightroom {want}");
+                }
+            }
+        }
+    }
+
+    /// Hostile sliders still make a finite, rising table.
+    #[test]
+    fn display_lrc_with_hostile_sliders() {
+        for (c, w, b, e) in [(f64::NAN, f64::NAN, f64::INFINITY, f64::NAN), (100.0, 1e9, -1e9, 1e9), (-100.0, -100.0, 100.0, -1e9)] {
+            let map = ToneMap::display_lrc(c, w, b, e);
+            let mut prev = 0.0;
+            for &v in map.lut() {
+                assert!(v.is_finite() && v >= prev && v <= 1.0, "{c} {w} {b} {e}: {v}");
+                prev = v;
+            }
         }
     }
 }
