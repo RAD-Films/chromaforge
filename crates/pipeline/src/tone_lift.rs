@@ -18,13 +18,15 @@
 //! Lightroom's curve was measured on display-referred pictures (TIFF), where a tone is what is shown. A raw's scene
 //! tones go through the camera's tone curve first, so for a raw the histogram and the curve are read in displayed
 //! tones (the default rendering of the camera's curve), and a correction fitted on real raws is added to the curve:
-//! Lightroom's raw response is not its TIFF one (on our Canon EOS R5 C raws, rounds 7 and 8, the picture-fitted
-//! curve alone was 15–23 levels from Lightroom on held-out window scenes; on 7 held-out shots, rendered, the change
-//! Highlights −100 makes went from 13.3 to 8.1 levels rms from Lightroom's, Shadows +100 from 12.1 to 12.8 but with
-//! no more 3–5× over-lifts of dark frames, which reached 113 levels). In the curve's toe the scene shift is the one that moves
-//! the displayed tone by the curve's amount ([`scene_shift`]); elsewhere the shift is given to the scene tone as it
-//! is, which keeps the order of tones past the camera curve's white (Highlights then brings them into view, as
-//! Lightroom's does).
+//! Lightroom's raw response is not its TIFF one. Fitted on our Canon EOS R5 C raws (rounds 7–10, 34 scenes, Nov 2026)
+//! and scored on flat areas of held-out shots, the change each slider makes is, in 8-bit levels rms from Lightroom's
+//! (before this fit → now, and the best one curve per picture can do): Shadows +100 20.7 → 16.1 (3.7), Highlights
+//! −100 12.2 → 6.6 (4.2), both together 26.2 → 11.0 (6.5). The Shadows correction also reads how much of the frame
+//! is shown white (Lightroom lifts a frame's shadows less the more of it is white), and the pair has its own
+//! correction, as Lightroom's pair isn't the sum of its two sliders. In the curve's toe the scene shift is the one
+//! that moves the displayed tone by the curve's amount ([`scene_shift`]); elsewhere the shift is given to the scene
+//! tone as it is, which keeps the order of tones past the camera curve's white (Highlights then brings them into
+//! view, as Lightroom's does).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -51,6 +53,14 @@ const KN: usize = 57;
 /// Tones darker than this (EV over grey) count as this, as in the fit.
 const EV_FLOOR: f32 = -16.0;
 
+/// The darkest shown tone (EV) the raw fit saw: 8-bit level 1 of an sRGB export. The raw curves were fitted on
+/// 8-bit exports, so a raw's curve is read no lower than this, and its histogram counts the tones an export shows
+/// as level 0 (under [`RAW_BLACK`]) at [`EV_FLOOR`], as the fit's did. Without both, a dark frame's deep shadows,
+/// which a float render keeps, met the curve's unfitted tail: Shadows +100 lifted them 3–4 EV past Lightroom.
+const RAW_FIT_LOW: f32 = -9.21;
+/// The shown tone (EV) under which an 8-bit sRGB export shows level 0 (level ½).
+const RAW_BLACK: f32 = -10.21;
+
 /// The per-picture table: EV from [`LIFT_LO`] in steps of [`LIFT_STEP`], [`LIFT_N`] entries.
 pub const LIFT_LO: f32 = -20.0;
 pub const LIFT_STEP: f32 = 1.0 / 32.0;
@@ -62,12 +72,14 @@ const MAX_SHIFT: f32 = 8.0;
 /// How far (EV) the +100 Shadows curve may darken a tone, and the −100 Highlights curve brighten one.
 const SIGN_SLACK: f32 = 0.5;
 
-/// A histogram feature: a percentile relative to the 99th, the 99th itself, or the share of tones under `−k` EV.
+/// A histogram feature: a percentile relative to the 99th, the 99th itself, the share of tones under `−k` EV, or the
+/// share of tones over `k` EV (how much of a raw shows white, which its percentiles, all at white, can't tell).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Feat {
     P99,
     Pct(f32),
     Dark(f32),
+    Bright(f32),
 }
 
 /// What a block's curve is a function of: the tone less a percentile of the picture, or the tone itself.
@@ -171,6 +183,7 @@ fn curve(model: &Model, t: &Tones) -> Curve {
                 Feat::P99 => p99,
                 Feat::Pct(q) => t.percentile(q) - p99,
                 Feat::Dark(k) => t.below(-k),
+                Feat::Bright(k) => 1.0 - t.below(k),
             };
             v.clamp(*lo, hi.max(*lo)) - m
         })
@@ -252,25 +265,41 @@ impl Lift {
     pub fn with_whites(t: &Tones, shadows: f32, highlights: f32, whites: f32, display: Option<&dyn Fn(f32) -> f32>) -> Lift {
         let (gs, gh) = (shadows_gain(finite(shadows)), highlights_gain(finite(highlights)));
         let gw = if display.is_some() { finite(whites).max(0.0) } else { 0.0 };
-        let shown = display.map(|d| t.mapped(d));
+        let shown = display.map(|d| t.mapped(|e| if d(e) < RAW_BLACK { EV_FLOOR } else { d(e) }));
         let td = shown.as_ref().unwrap_or(t);
         let mut cs = curve(&tables::SHADOWS_UP, td);
         let mut ch = curve(&tables::HIGHLIGHTS_DOWN, td);
-        // a raw: the curve fitted on pictures plus the correction fitted on raws ([`raw`])
+        // a raw: the curve fitted on pictures plus the correction fitted on raws ([`raw`]); with Shadows up and
+        // Highlights down together, the correction fitted on that pair takes over from the two by the product of
+        // their amounts (Lightroom's pair isn't the sum of its two sliders: fitted on its own, the pair's held-out
+        // shots went from 26.2 to 11.0 levels rms from Lightroom)
+        let mut both: Option<Curve> = None;
         if display.is_some() {
-            cs.0.extend(curve(&raw::SHADOWS_UP_RAW, td).0);
-            ch.0.extend(curve(&raw::HIGHLIGHTS_DOWN_RAW, td).0);
+            let (rs, rh) = (curve(&raw::SHADOWS_UP_RAW, td), curve(&raw::HIGHLIGHTS_DOWN_RAW, td));
+            let mut b = curve(&raw::BOTH_RAW, td);
+            b.0.extend(rs.0.iter().map(|(off, k)| (*off, k.map(|v| -v))));
+            b.0.extend(rh.0.iter().map(|(off, k)| (*off, k.map(|v| -v))));
+            both = Some(b);
+            cs.0.extend(rs.0);
+            ch.0.extend(rh.0);
         }
+        let gb = gs.max(0.0) * gh.max(0.0);
         // Shadows +100 never darkens much and Highlights −100 never brightens much (a fit's tail can say otherwise)
         let cw = whites::WHITES_UP_RAW.curve(td);
-        let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d);
+        let shift = |d: f32| {
+            let pair = match &both {
+                Some(b) if gb > 0.0 => gb * b.at(d),
+                _ => 0.0,
+            };
+            gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d) + pair
+        };
         let v = (0..LIFT_N)
             .map(|i| {
                 let e = LIFT_LO + LIFT_STEP * i as f32;
                 // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
                 let s = match display {
                     None => shift(e),
-                    Some(d) => scene_shift(d, e, shift(d(e))),
+                    Some(d) => scene_shift(d, e, shift(d(e).max(RAW_FIT_LOW))),
                 };
                 if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
             })
@@ -342,16 +371,16 @@ impl WhitesCurve {
 
 /// A raw's scene shift at scene tone `e` for the displayed shift `shown` of its displayed tone `d(e)`.
 ///
-/// Where the camera curve is steeper than 1:1 (its toe), a scene shift shows several times larger, so the scene
-/// tone that displays the moved tone is solved for: on our R5 C raws (round 7, OneSlips, Nov 2026) giving the
-/// displayed shift straight to the scene tone lifted a dark room's shadows 3–5× more than Lightroom did, and than
-/// the curve asks for. Where the curve is 1:1 or flatter (the shoulder, and past its white, where solving would fold
-/// every tone into white) the shift goes to the scene tone as it is, so those tones keep their order and Highlights
-/// brings them into view as Lightroom's does.
+/// Where the camera curve is steeper than 1:1 over the move (its toe), a scene shift shows several times larger, so
+/// the scene tone that displays the moved tone is solved for: on our R5 C raws (round 7, OneSlips, Nov 2026) giving
+/// the displayed shift straight to the scene tone lifted a dark room's shadows 3–5× more than Lightroom did, and than
+/// the curve asks for. The slope that counts is the curve's over the whole move, not at its start: a deep tone on
+/// the 1:1 part under the toe, lifted up into it, showed twice the curve's lift (round 10, Nov 2026). Where the curve
+/// is 1:1 or flatter over the move (the shoulder, and past its white, where solving would fold every tone into
+/// white) the shift goes to the scene tone as it is, so those tones keep their order and Highlights brings them into
+/// view as Lightroom's does.
 fn scene_shift(d: &dyn Fn(f32) -> f32, e: f32, shown: f32) -> f32 {
-    const H: f32 = 1.0 / 64.0;
-    let slope = (d(e + H) - d(e - H)) / (2.0 * H);
-    if slope.is_nan() || slope <= 1.0 || !shown.is_finite() {
+    if !shown.is_finite() || shown == 0.0 {
         return shown;
     }
     let want = d(e) + shown;
@@ -367,7 +396,9 @@ fn scene_shift(d: &dyn Fn(f32) -> f32, e: f32, shown: f32) -> f32 {
             hi = mid;
         }
     }
-    0.5 * (lo + hi) - e
+    let solved = 0.5 * (lo + hi) - e;
+    // steeper than 1:1 over the move: the solved shift is the smaller one
+    if solved.is_finite() && solved.abs() < shown.abs() { solved } else { shown }
 }
 
 fn finite(v: f32) -> f32 {
@@ -554,26 +585,33 @@ mod tests {
 
     #[test]
     fn a_raw_adds_the_raw_correction_to_the_curve() {
-        // the Python reference (fit/rawgold7.py, from rawres7.json) on `picture()` with a 1:1 display mapping
+        // the Python reference (fit/rawgold10.py, from the r10-final tables) on `picture()` with a 1:1 display mapping
         let d = |e: f32| e;
         let s = Lift::new(&picture(), 1.0, 0.0, Some(&d));
         let h = Lift::new(&picture(), 0.0, -1.0, Some(&d));
-        for (e, want_s, want_h) in GOLDEN_RAW {
+        let b = Lift::new(&picture(), 1.0, -1.0, Some(&d));
+        for (e, want_s, want_h, want_b) in GOLDEN_RAW {
             assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
             assert!((h.at(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
+            assert!((b.at(e) - want_b).abs() < 3e-3, "both at {e}: {} vs {want_b}", b.at(e));
         }
         // and a display-referred picture doesn't get it
         let tiff = Lift::new(&picture(), 1.0, 0.0, None);
         assert!((tiff.at(-5.0) - GOLDEN[0].1).abs() < 2e-3);
     }
 
-    const GOLDEN_RAW: [(f32, f32, f32); 4] =
-        [(-5.0, 0.98170, -0.18469), (-2.0, 1.03876, -0.49872), (0.0, 0.09104, -0.66611), (1.5, 0.01658, -1.47700)];
+    const GOLDEN_RAW: [(f32, f32, f32, f32); 4] = [
+        (-5.0, 1.32151, -0.33337, 0.16727),
+        (-2.0, 1.16265, -0.85710, -0.07288),
+        (0.0, 0.22921, -1.13222, -0.41995),
+        (1.5, -0.03449, -1.74150, -1.25166),
+    ];
 
     #[test]
     fn a_raw_in_the_camera_curves_toe_shows_the_curves_shift_not_a_multiple() {
-        // a camera curve with a steep toe: a scene EV below grey shows 3 EV darker per EV
-        let d = |e: f32| if e < 0.0 { 3.0 * e } else { e };
+        // a camera curve with a steep toe: a scene EV below grey shows 2 EV darker per EV (kept above the darkest
+        // shown tone the raw fit saw, where the curve is read)
+        let d = |e: f32| if e < 0.0 { 2.0 * e } else { e };
         let t = picture();
         let raw = Lift::new(&t, 1.0, 0.0, Some(&d));
         let one = |e: f32| e;
@@ -586,10 +624,53 @@ mod tests {
                 continue;
             }
             let got = d(e + raw.at(e)) - d(e);
-            assert!((got - want).abs() < 0.02, "{e}: shows {got}, the curve asks {want}");
+            // (0.03: where the curve falls faster than 1 EV per EV, tones keep their order by the peak of a darker
+            // tone, which the raw's table, 2× coarser here in shown EV, catches a little lower)
+            assert!((got - want).abs() < 0.03, "{e}: shows {got}, the curve asks {want}");
             checked += 1;
         }
         assert!(checked >= 4, "the curve lifts the toe's tones: {checked} checked");
+    }
+
+    #[test]
+    fn a_deep_tone_lifted_into_the_toe_shows_the_curves_lift() {
+        // 1:1 under scene -6 EV, then a toe 2.5 EV per EV up to grey: a tone at -7 lifted into the toe used to get the
+        // displayed lift as its scene shift (the slope where it starts is 1) and showed about twice the curve's lift
+        let d = |e: f32| {
+            if e < -6.0 {
+                e - 9.0
+            } else if e < 0.0 {
+                2.5 * e
+            } else {
+                e
+            }
+        };
+        for (e, shown) in [(-7.0f32, 3.5f32), (-6.5, 4.0), (-6.0, 3.0)] {
+            let s = scene_shift(&d, e, shown);
+            let moved = d(e + s) - d(e);
+            assert!((moved - shown).abs() < 1e-3, "{e}: shows {moved}, the curve asks {shown}");
+        }
+        // past white the curve is flat: the shift goes to the scene tone as it is
+        let flat = |e: f32| e.min(2.0);
+        assert_eq!(scene_shift(&flat, 3.0, -1.0), -1.0);
+    }
+
+    #[test]
+    fn a_dark_raws_deep_shadows_meet_the_curve_where_it_was_fitted() {
+        // a dark raw (half its tones 11-15 EV under grey, darker than an 8-bit export shows): how deep those tones
+        // sit doesn't change the curve, and a tone under the fit's darkest gets that tone's shift (before, the
+        // curve's unfitted tail lifted such a frame's shadows 3-4 EV past Lightroom)
+        let one = |e: f32| e;
+        let pic = |deep: f32| {
+            Tones::new((0..2000).map(|i| if i < 1000 { deep - 4.0 * (i as f32 / 1000.0) } else { -6.0 + 7.0 * ((i - 1000) as f32 / 1000.0) }))
+                .unwrap()
+        };
+        let (a, b) = (Lift::new(&pic(-11.0), 1.0, 0.0, Some(&one)), Lift::new(&pic(-12.0), 1.0, 0.0, Some(&one)));
+        for e in [-14.0, -11.0, -9.21, -6.0, -2.0, 0.0] {
+            assert!((a.at(e) - b.at(e)).abs() < 1e-3, "{e}: {} vs {}", a.at(e), b.at(e));
+        }
+        assert!((a.at(-14.0) - a.at(-9.21)).abs() < 0.05, "{} vs {}", a.at(-14.0), a.at(-9.21));
+        assert!(a.at(-12.0) < 3.0, "the deep shadows lift {} EV", a.at(-12.0));
     }
 
     #[test]
