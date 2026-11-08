@@ -363,13 +363,13 @@ fn merge_calibrations(
 /// (the app's own colour). Returns the profile's name when one was applied. A DNG of rendered RGB keeps its colour
 /// ([`lcc_raw::color::is_rendered_rgb`]).
 pub fn apply_choice(color: &mut lcc_raw::ColorData, meta: &lcc_meta::Metadata, choice: &str) -> Option<String> {
-    apply_choice_with(color, meta, choice, true)
+    apply_choice_with(color, meta, choice, true, lcc_develop::Process::LATEST.version().0)
 }
 
 /// [`apply_choice`]; `look` false applies the profile's calibration only, without its own look (tone curve, look
 /// table): the photo has one of the app's looks on top ([`lcc_develop::DevelopSettings::keeps_camera_look`]).
-pub fn apply_choice_with(color: &mut lcc_raw::ColorData, meta: &lcc_meta::Metadata, choice: &str, look: bool) -> Option<String> {
-    let dcp = profile_for(color, meta, choice)?;
+pub fn apply_choice_with(color: &mut lcc_raw::ColorData, meta: &lcc_meta::Metadata, choice: &str, look: bool, process: u32) -> Option<String> {
+    let dcp = profile_for_at(color, meta, choice, process)?;
     dcp.apply_with(color, look);
     if lcc_pipeline::profiling() {
         eprintln!("[profile] camera colour from {:?} ({})", dcp.name, dcp.model);
@@ -379,10 +379,21 @@ pub fn apply_choice_with(color: &mut lcc_raw::ColorData, meta: &lcc_meta::Metada
 
 /// The profile [`apply_choice`] applies to a file with these colour tags and this metadata.
 pub(crate) fn profile_for(color: &lcc_raw::ColorData, meta: &lcc_meta::Metadata, choice: &str) -> Option<std::sync::Arc<lcc_raw::dcp::Dcp>> {
+    profile_for_at(color, meta, choice, lcc_develop::Process::LATEST.version().0)
+}
+
+/// [`profile_for`] for a photo on process `process` (its number): a calibrated look's entry for newer processes
+/// when it has one that the process allows (`lcc_raw::dcp::resolve_at`).
+pub(crate) fn profile_for_at(
+    color: &lcc_raw::ColorData,
+    meta: &lcc_meta::Metadata,
+    choice: &str,
+    process: u32,
+) -> Option<std::sync::Arc<lcc_raw::dcp::Dcp>> {
     if lcc_raw::color::is_rendered_rgb(color) {
         return None;
     }
-    lcc_raw::dcp::resolve(choice, meta.make.as_deref(), meta.model.as_deref()?)
+    lcc_raw::dcp::resolve_at(choice, meta.make.as_deref(), meta.model.as_deref()?, process)
 }
 
 /// Whether `id` names a camera-profile choice (`profile.camera`) rather than a look: `lc` (the app's own colour),
@@ -515,7 +526,7 @@ mod tests {
             contributor: None,
             licence: c::LICENCE.into(),
             camera: c::CameraModel { illuminants: [17, 21], color_matrix: [cm, cm], forward_matrix: [fm, fm], hue_sat_map: None },
-            looks: vec![c::Look { name: look.into(), baseline_exposure_offset: 0.0, look_table: None, tone_curve: vec![] }],
+            looks: vec![c::Look { name: look.into(), baseline_exposure_offset: 0.0, look_table: None, tone_curve: vec![], since_process: None }],
             evidence: c::Evidence { photos: 10, samples: 100, hue_coverage: 0.5, ..Default::default() },
         }
     }

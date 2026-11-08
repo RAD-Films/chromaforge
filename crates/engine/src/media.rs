@@ -180,6 +180,9 @@ pub struct LoadOptions {
     /// Rebuild a raw's fully clipped highlights brighter than the sensor's clip (process V9 and above,
     /// [`crate::files::HIGHLIGHT_HEADROOM`] stops), as Lightroom Classic shows them when Exposure goes down.
     pub highlight_headroom: bool,
+    /// The photo's process number (`DevelopSettings::process`): picks a calibrated look's entry for newer processes
+    /// when the camera's calibration has one (`lcc_raw::dcp::resolve_at`); the latest process by default.
+    pub process: u32,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -199,6 +202,8 @@ impl Default for LoadOptions {
             defer_tables: false,
             ahd_blend: false,
             highlight_headroom: false,
+            // (what the default settings decode with: `of(&DevelopSettings::default())`)
+            process: lcc_develop::Process::LATEST.version().0,
             path: None,
         }
     }
@@ -215,6 +220,7 @@ impl LoadOptions {
             defer_tables: s.process.process() >= lcc_develop::Process::V9,
             ahd_blend: s.process.process() >= lcc_develop::Process::V9,
             highlight_headroom: s.process.process() >= lcc_develop::Process::V9,
+            process: s.process.process().version().0,
             path: None,
         }
     }
@@ -326,7 +332,8 @@ impl DecodedSource {
                 && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
                 && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw))
                 && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw))
-                && (crate::files::headroom_of(&self.options) == crate::files::headroom_of(options) || !info.is_some_and(|i| i.raw)))
+                && (crate::files::headroom_of(&self.options) == crate::files::headroom_of(options) || !info.is_some_and(|i| i.raw))
+                && (self.options.process == options.process || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -3379,6 +3386,26 @@ mod thumbnail_hash_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw decodes for the photo's process (a calibrated look can have an entry for newer processes only), so a
+    /// raw decoded for one process doesn't serve another; a rendered file has no camera profile and serves both.
+    #[test]
+    fn a_raw_decoded_for_one_process_does_not_serve_another() {
+        let latest = lcc_develop::DevelopSettings::default();
+        assert_eq!(LoadOptions::default(), LoadOptions::of(&latest));
+        assert_eq!(LoadOptions::of(&latest).process, lcc_develop::Process::LATEST.version().0);
+        let mut old = latest.clone();
+        old.process = lcc_develop::ProcessVersion(1);
+        assert_eq!(LoadOptions::of(&old).process, 1);
+        let image = Arc::new(Rgb32f::new(2, 2));
+        let mut raw = DecodedSource::new(image.clone(), Some(SourceInfo { raw: true, ..Default::default() }));
+        raw.options = LoadOptions::of(&latest);
+        assert!(raw.serves(&LoadOptions::of(&latest)));
+        assert!(!raw.serves(&LoadOptions::of(&old)));
+        let mut jpeg = DecodedSource::new(image, Some(SourceInfo::default()));
+        jpeg.options = LoadOptions::of(&latest);
+        assert!(jpeg.serves(&LoadOptions::of(&old)));
+    }
 
     /// A photo edited since its last view (an Auto Sync edit, its thumbnail built with the edit)
     /// steps in with the edit, never with the picture from before it.
