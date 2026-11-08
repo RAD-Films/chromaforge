@@ -1528,14 +1528,15 @@ pub(crate) const CURVE_SAMPLES: i32 = 96;
 /// Medium Contrast shows in the line, as in Lightroom; a drag still moves only the region sliders.
 pub(crate) struct StackedCurve {
     pub(crate) param: ParametricCurve,
-    /// The master point curve, `None` while it is the identity.
-    master: Option<lcc_color::spline::MonotoneCurve>,
+    /// The master point curve, `None` while it is the identity (the spline the render uses for `process`).
+    master: Option<lcc_color::spline::PointSpline>,
 }
 
 impl StackedCurve {
     pub(crate) fn new(c: &ToneCurve, process: lcc_develop::Process) -> StackedCurve {
+        let natural = lcc_pipeline::finish::curves_before_output(process);
         let master = (!ToneCurve::point_curve_is_identity(&c.master))
-            .then(|| lcc_color::spline::MonotoneCurve::new(&c.master.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()));
+            .then(|| lcc_color::spline::PointSpline::new(&c.master.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>(), natural));
         StackedCurve { param: ParametricCurve::for_process(c, process), master }
     }
 
@@ -1863,7 +1864,9 @@ pub(crate) fn curve_editor(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, d: 
         if v.len() < 2 { vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)] } else { v }
     };
     let pts = pts_of(&curves);
-    let curve = lcc_color::spline::MonotoneCurve::new(&pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>());
+    // the spline the render applies: V9's Tone Curve is a natural spline, masks' Curves stay monotone
+    let natural = matches!(target, CurveTarget::Photo) && lcc_pipeline::finish::curves_before_output(d.process.process());
+    let curve = lcc_color::spline::PointSpline::new(&pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>(), natural);
     let color = match ch.as_str() {
         "red" => hex("#dd3333"),
         "green" => hex("#33bb55"),

@@ -26,6 +26,12 @@ const FIELDS: &[(&str, usize)] = &[
     ("SRGB_OFF", 1),
     ("CURVE_OFF", 1),
     ("CURVES", 1),
+    // process V9's Tone Curve before the output transform (`FinishParams::curves_pp`): four tables at PPCURVE_OFF
+    // (parametric ∘ master, red, green, blue) and the working ↔ ProPhoto matrices
+    ("PPCURVES", 1),
+    ("PPCURVE_OFF", 1),
+    ("PP_M", 9),
+    ("PP_INV", 9),
     // the masks' local Curves: a slot per mask (its table set, or −1), then the table sets
     ("LCURVE_OFF", 1),
     // the masks' local Point Color: one record of `LOCAL_POINT_WORDS` per mask in `aux`
@@ -247,6 +253,17 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
             aux.extend_from_slice(&l.v);
         }
     }
+    let ppcurve_off = aux.len();
+    if let Some(c) = &fp.curves_pp {
+        for l in c {
+            if l.v.len() != CURVE_N as usize {
+                // as for `curves` above: a wrong length would shift every later offset
+                fail(FailKind::Fatal, format!("curve table has {} entries, expected {}", l.v.len(), CURVE_N));
+                return (Vec::new(), aux);
+            }
+            aux.extend_from_slice(&l.v);
+        }
+    }
     let mask_off = aux.len();
     for m in masks {
         aux.extend_from_slice(m);
@@ -310,6 +327,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.u("SRGB_OFF", srgb_off as u32);
     p.u("CURVE_OFF", curve_off as u32);
     p.b("CURVES", fp.curves.is_some());
+    if fp.curves_pp.is_some() {
+        let (to_pp, from_pp) = lcc_pipeline::finish::prophoto_matrices();
+        p.b("PPCURVES", true);
+        p.u("PPCURVE_OFF", ppcurve_off as u32);
+        p.fs("PP_M", to_pp.as_flattened());
+        p.fs("PP_INV", from_pp.as_flattened());
+    }
     p.u("LCURVE_OFF", lcurve_off as u32);
     p.b("LCURVES", next > 0.0);
     p.b("LPOINTS", lpoints);
