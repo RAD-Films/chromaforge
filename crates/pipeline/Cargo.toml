@@ -29,3 +29,4 @@ lcc-scenes = { workspace = true }
 proptest = { workspace = true }
 image = { workspace = true }
 serde_json = { workspace = true }
+lcc-testkit = { workspace = true }
