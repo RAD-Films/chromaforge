@@ -58,7 +58,7 @@ fn edits() -> Vec<(&'static str, DevelopSettings)> {
         (
             "busy",
             at(
-                Light { exposure: -0.7, contrast: -20.0, highlights: -70.0, shadows: 55.0, whites: -30.0, blacks: 25.0, ..l() },
+                Light { exposure: -0.7, contrast: -20.0, highlights: -70.0, shadows: 55.0, whites: -30.0, blacks: 25.0 },
                 ToneCurve { darks: 30.0, lights: -40.0, ..c() },
             ),
         ),
