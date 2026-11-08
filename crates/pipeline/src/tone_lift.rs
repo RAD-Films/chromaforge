@@ -408,7 +408,9 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
             ev.to_bits(),
         ))
     };
-    if let Some((k, t)) = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
+    // PROBE (integrate/v9-probe only): CF_PROBE_NO_LAST=1 never reuses the kept tones
+    if std::env::var_os("CF_PROBE_NO_LAST").is_none()
+        && let Some((k, t)) = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
         && *k == key
     {
         return Some(t.clone());
@@ -424,7 +426,7 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
 /// ([`active`]) or the frame is empty. `raw_tone` is a raw's default tone map (scene → display luminance), `None`
 /// for a display-referred source.
 pub fn for_frame(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, raw_tone: Option<&ToneMap>) -> Option<Arc<Lift>> {
-    if !active(s) {
+    if !active(s) || std::env::var_os("CF_PROBE_NO_LIFT").is_some() {
         return None;
     }
     let (sh, hl) = ((s.light.shadows / 100.0) as f32, (s.light.highlights / 100.0) as f32);
