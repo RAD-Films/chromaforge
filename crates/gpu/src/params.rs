@@ -3,7 +3,7 @@
 
 use lcc_color::spline::Lut1;
 use lcc_develop::VignetteStyle;
-use lcc_pipeline::colorops::{MIXER_WORDS, POINT_WORDS};
+use lcc_pipeline::colorops::{MIXER_WORDS, Mixer, POINT_WORDS};
 use lcc_pipeline::finish::{CURVE_LUT_N, FinishParams, MASK_TERMS, srgb_lut};
 
 use crate::ctx::{FailKind, fail};
@@ -70,6 +70,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("MIX_HUE", 8),
     ("MIX_SAT", 8),
     ("MIX_LUM", 8),
+    // process V9's measured Color Mixer (`ColorOps::measured`): its block in `aux` at MIXT_OFF
+    ("MIXT", 1),
+    ("MIXT_OFF", 1),
     ("NPC", 1),
     ("PC", 8 * POINT_WORDS),
     ("BW", 1),
@@ -282,6 +285,21 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
     let mixers_ok = fp.local_mixers.len() == masks.len();
+    // process V9's measured Color Mixers: the colour-space matrices, then the tables; the global one,
+    // then each mask's (its record holds the offset)
+    let measured_block = |m: &lcc_pipeline::mixer_measured::Measured, aux: &mut Vec<f32>| {
+        let o = aux.len();
+        aux.extend_from_slice(&m.matrices());
+        aux.extend(m.words());
+        o
+    };
+    let mixt_off = fp.ops.measured.as_deref().map(|m| measured_block(m, &mut aux));
+    let local_mixt: Vec<Option<usize>> = (0..masks.len())
+        .map(|m| match fp.local_mixers.get(m).and_then(Option::as_ref).filter(|_| mixers_ok) {
+            Some(Mixer::Measured(t)) => Some(measured_block(t, &mut aux)),
+            _ => None,
+        })
+        .collect();
     let lpoints = !masks.is_empty() && ((points_ok && !fp.local_points.is_empty()) || (mixers_ok && !fp.local_mixers.is_empty()));
     let lpoint_off = aux.len();
     if lpoints {
@@ -289,11 +307,21 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
             let mut rec = [0.0f32; LOCAL_POINT_WORDS];
             let points: &[lcc_pipeline::colorops::PointK] = if points_ok { fp.local_points.get(m).map_or(&[], Vec::as_slice) } else { &[] };
             rec[0] = points.len().min(8) as f32;
-            if let Some(mk) = fp.local_mixers.get(m).copied().flatten().filter(|_| mixers_ok) {
-                rec[1] = 1.0;
-                for (slot, v) in rec.iter_mut().skip(2).zip(mk.words()) {
-                    *slot = v;
+            match fp.local_mixers.get(m).and_then(Option::as_ref).filter(|_| mixers_ok) {
+                Some(Mixer::Bands(mk)) => {
+                    rec[1] = 1.0;
+                    for (slot, v) in rec.iter_mut().skip(2).zip(mk.words()) {
+                        *slot = v;
+                    }
                 }
+                // the block's offset, bit for bit (an f32 holds integers exactly only up to 2^24)
+                Some(Mixer::Measured(_)) => {
+                    if let Some(o) = local_mixt.get(m).copied().flatten().and_then(|o| u32::try_from(o).ok()) {
+                        rec[1] = 2.0;
+                        rec[2] = f32::from_bits(o);
+                    }
+                }
+                None => {}
             }
             for (slot, v) in rec.iter_mut().skip(LOCAL_POINT_SAMPLES).zip(points.iter().take(8).flat_map(|k| k.words())) {
                 *slot = v;
@@ -347,6 +375,8 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.fs("MIX_HUE", &ops.hue);
     p.fs("MIX_SAT", &ops.sat);
     p.fs("MIX_LUM", &ops.lum);
+    p.b("MIXT", mixt_off.is_some());
+    p.u("MIXT_OFF", mixt_off.and_then(|o| u32::try_from(o).ok()).unwrap_or(0));
     p.u("NPC", ops.points.len().min(8) as u32);
     let pc: Vec<f32> = ops.points.iter().take(8).flat_map(|k| k.words()).collect();
     p.fs("PC", &pc);

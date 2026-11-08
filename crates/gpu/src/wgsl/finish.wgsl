@@ -169,20 +169,128 @@ fn local_mixer(o: u32, lch: vec3<f32>, strength: f32) -> vec3<f32> {
     return vec3<f32>(l, c, h);
 }
 
+// `mixer_measured::Measured::lookup`: the step whose nodes start at `aux[t]`, at hue `h`, saturation `s`, value `v`.
+fn mt_lookup(t: u32, h: f32, s: f32, v: f32) -> vec3<f32> {
+    let hw = h - 360.0 * floor(h / 360.0);
+    let fh = clamp(hw / 360.0 * f32(MT_HUES), 0.0, f32(MT_HUES));
+    let fs = clamp(s, 0.0, 1.0) * f32(MT_SATS - 1u);
+    let fv = clamp(v, 0.0, 1.0) * f32(MT_VALS - 1u);
+    let ih = min(u32(fh), MT_HUES - 1u);
+    let is_ = min(u32(fs), MT_SATS - 2u);
+    let iv = min(u32(fv), MT_VALS - 2u);
+    let th = fh - f32(ih);
+    let ts = fs - f32(is_);
+    let tv = fv - f32(iv);
+    var d = vec3<f32>(0.0);
+    for (var a = 0u; a < 2u; a++) {
+        let wh = select(1.0 - th, th, a == 1u);
+        for (var b = 0u; b < 2u; b++) {
+            let ws = select(1.0 - ts, ts, b == 1u);
+            for (var c = 0u; c < 2u; c++) {
+                let wv = select(1.0 - tv, tv, c == 1u);
+                let k = t + ((((ih + a) % MT_HUES) * MT_SATS + is_ + b) * MT_VALS + iv + c) * 3u;
+                d += (wh * ws * wv) * vec3<f32>(aux[k], aux[k + 1u], aux[k + 2u]);
+            }
+        }
+    }
+    return d;
+}
+
+// `mixer_measured::Measured::apply`: process V9's Color Mixer whose block (`Measured::matrices`, then
+// `Measured::words`) starts at `aux[o]`, on display-linear Rec.2020 `rgb` at `strength`.
+fn measured_mixer(o: u32, rgb: vec3<f32>, strength: f32) -> vec3<f32> {
+    if (strength <= 0.0) {
+        return rgb;
+    }
+    let pp = vec3<f32>(
+        aux[o] * rgb.x + aux[o + 1u] * rgb.y + aux[o + 2u] * rgb.z,
+        aux[o + 3u] * rgb.x + aux[o + 4u] * rgb.y + aux[o + 5u] * rgb.z,
+        aux[o + 6u] * rgb.x + aux[o + 7u] * rgb.y + aux[o + 8u] * rgb.z,
+    );
+    let c = max(pp, vec3<f32>(0.0));
+    let mx = max(c.x, max(c.y, c.z));
+    let dd = mx - min(c.x, min(c.y, c.z));
+    var h0 = 0.0;
+    if (dd > 0.0) {
+        if (mx == c.x) {
+            h0 = (c.y - c.z) / dd;
+            if (h0 < 0.0) {
+                h0 += 6.0;
+            }
+        } else if (mx == c.y) {
+            h0 = (c.z - c.x) / dd + 2.0;
+        } else {
+            h0 = (c.x - c.y) / dd + 4.0;
+        }
+    }
+    h0 *= 60.0;
+    var s = select(0.0, dd / mx, mx > 0.0);
+    var v = mx;
+    if (v <= 1e-6 || s <= 1e-4) {
+        return rgb;
+    }
+    var h = h0;
+    var changed = false;
+    for (var k = 0u; k < 3u; k++) {
+        let t = o + 18u + k * MT_STEP;
+        if (aux[t] == 0.0) {
+            continue;
+        }
+        let d = mt_lookup(t + 1u, h0, s, v);
+        if (all(d == vec3<f32>(0.0))) {
+            continue;
+        }
+        changed = true;
+        h += d.x;
+        s = clamp(s + d.y, 0.0, 1.0);
+        v *= exp(clamp(d.z, -20.0, 20.0));
+    }
+    if (!changed) {
+        return rgb;
+    }
+    let kk = vec3<f32>(5.0, 3.0, 1.0) + h / 60.0;
+    let km = kk - 6.0 * floor(kk / 6.0);
+    let out = v - v * s * clamp(min(km, 4.0 - km), vec3<f32>(0.0), vec3<f32>(1.0));
+    if (!all(abs(out) < vec3<f32>(1e30))) {
+        return rgb;
+    }
+    let back = vec3<f32>(
+        aux[o + 9u] * out.x + aux[o + 10u] * out.y + aux[o + 11u] * out.z,
+        aux[o + 12u] * out.x + aux[o + 13u] * out.y + aux[o + 14u] * out.z,
+        aux[o + 15u] * out.x + aux[o + 16u] * out.y + aux[o + 17u] * out.z,
+    );
+    if (strength >= 1.0) {
+        return back;
+    }
+    return rgb + (back - rgb) * strength;
+}
+
 // `finish::local_point_colors`: each mask's Color Mixer, then its Point Color samples at the mask's opacity (at most 1).
-fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
+// A V9 mixer (record word 1 = 2, its block's offset in word 2) acts on the linear colour, a V1–V8 one (word 1 = 1) in OkLCh.
+fn local_point_colors(d0: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
+    var d = d0;
     var lch = vec3<f32>(0.0);
     var any = false;
     for (var m = 0u; m < pu(F_NMASK); m++) {
         let rec = pu(F_LPOINT_OFF) + m * LOCAL_POINT_WORDS;
         let np = min(u32(aux[rec]), 8u);
-        let has_mixer = aux[rec + 1u] != 0.0;
-        if (np == 0u && !has_mixer) {
+        let kind = aux[rec + 1u];
+        if (np == 0u && kind == 0.0) {
             continue;
         }
         let a = min(masks[m * n + i], 1.0);
         if (a <= 0.0) {
             continue;
+        }
+        if (kind == 2.0) {
+            if (any) {
+                d = oklab_inv(vec3<f32>(lch.x, lch.y * cos(lch.z), lch.y * sin(lch.z)));
+                any = false;
+            }
+            d = measured_mixer(bitcast<u32>(aux[rec + 2u]), d, a);
+            if (np == 0u) {
+                continue;
+            }
         }
         if (!any) {
             let lab = oklab(d);
@@ -191,7 +299,7 @@ fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
             lch = vec3<f32>(lab.x, c0, select(atan2(lab.z, lab.y), 0.0, c0 == 0.0));
             any = true;
         }
-        if (has_mixer) {
+        if (kind == 1.0) {
             lch = local_mixer(rec + 2u, lch, a);
         }
         for (var k = 0u; k < np; k++) {
@@ -209,9 +317,13 @@ fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
 }
 
 // `ColorOps::apply`.
-fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
+fn color_ops(rgb0: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     if (pu(F_OPS_IDENTITY) != 0u && local_sat == 0.0 && local_hue == 0.0) {
-        return rgb;
+        return rgb0;
+    }
+    var rgb = rgb0;
+    if (pu(F_MIXT) != 0u) {
+        rgb = measured_mixer(pu(F_MIXT_OFF), rgb0, 1.0);
     }
     let lab0 = oklab(rgb);
     var l = lab0.x;

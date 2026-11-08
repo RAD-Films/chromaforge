@@ -478,6 +478,13 @@ fn constants() -> String {
     s += &format!("const POINT_WORDS: u32 = {}u;\n", lcc_pipeline::colorops::POINT_WORDS);
     s += &format!("const LOCAL_POINT_WORDS: u32 = {}u;\n", crate::params::LOCAL_POINT_WORDS);
     s += &format!("const LOCAL_POINT_SAMPLES: u32 = {}u;\n", crate::params::LOCAL_POINT_SAMPLES);
+    {
+        use lcc_pipeline::mixer_measured::{HUES, NODES, SATS, VALS};
+        s += &format!(
+            "const MT_HUES: u32 = {HUES}u;\nconst MT_SATS: u32 = {SATS}u;\nconst MT_VALS: u32 = {VALS}u;\nconst MT_STEP: u32 = {}u;\n",
+            1 + NODES * 3
+        );
+    }
     s += &format!("const EYE_WORDS: u32 = {}u;\n", lcc_pipeline::redeye::EYE_WORDS);
     use lcc_pipeline::masks::{AUTO_LRC_CHROMA, AUTO_LRC_EV, AUTO_TOL_CHROMA, AUTO_TOL_EV};
     s += &format!("const AUTO_TOL_EV: f32 = {AUTO_TOL_EV:?};\nconst AUTO_TOL_CHROMA: f32 = {AUTO_TOL_CHROMA:?};\n");
