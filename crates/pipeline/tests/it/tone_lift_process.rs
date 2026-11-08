@@ -204,7 +204,50 @@ fn v8_a_smooth_ramp_shows_no_bands() {
     for (sh, hl) in [(0.0, 0.0), (100.0, 0.0), (0.0, -100.0), (100.0, -100.0), (-100.0, 100.0)] {
         // (shown under where the camera curve's shoulder joins its roll-off, 2.5 EV over grey with the sliders at 0:
         // that join is the tone map's own work, not this one's)
-        let (step, at) = worst_slope_step(&src, &info, &settings(Process::V8, sh, hl), ev0, per_px, (-6.0, ev0), shoulder);
+        // (and from 0.1 EV, 4 px, under the cone's tip: the narrow base Highlights' past-white pull is read at rounds
+        // a point off over about its radius, so the tip itself takes a little less pull, which is no band)
+        let (step, at) = worst_slope_step(&src, &info, &settings(Process::V8, sh, hl), ev0, per_px, (-6.0, ev0 - 0.1), shoulder);
         assert!(step < 0.03, "Shadows {sh}, Highlights {hl}: the tone response's slope steps by {step:.3} at {at:+.2} EV");
+    }
+}
+
+/// A raw's dark room (`dark` EV over grey) with a window (`side` px square) in the middle: a view of `bright` EV
+/// patches (up to half an EV dimmer, varying from pixel to pixel as a sky does, so no sensor clip piles up) among mid-grey
+/// ones, 4 px each (sky between leaves).
+fn room_and_window(side: usize, dark: f32, bright: f32) -> Rgb32f {
+    let lin = |ev: f32| 0.18 * ev.exp2();
+    let (x0, y0) = ((W - side) / 2, (H - side) / 2);
+    Rgb32f::from_fn(W, H, |x, y| {
+        let inside = (x0..x0 + side).contains(&x) && (y0..y0 + side).contains(&y);
+        let sky = inside && ((x - x0) / 4 + (y - y0) / 4) % 2 == 0;
+        let vary = 0.5 * ((x * 7 + y * 13) % 23) as f32 / 23.0;
+        [lin(if sky {
+            bright - vary
+        } else if inside {
+            0.0
+        } else {
+            dark
+        }); 3]
+    })
+}
+
+/// Highlights −100 brings a window in a dim room down from white, as Lightroom does: read at the narrow base, the
+/// pull past white follows the window's outline (read at the wide base, a window among dark bars sat under white there
+/// and kept its whites, as on our rounds 9b and 10).
+#[test]
+fn v8_highlights_bring_a_window_in_a_dim_room_down_from_white() {
+    let tone = lcc_pipeline::tone::CameraTone::default_raw().map(|c| c.under_default_curve());
+    let info = SourceInfo { raw: true, camera_tone: tone, ..SourceInfo::default() };
+    let pane = |side: usize, hl: f64| {
+        let src = room_and_window(side, -2.0, 3.5);
+        let out = render(&src, &info, &settings(Process::V8, 0.0, hl), &RenderRequest::fit(W, H)).image;
+        let (x0, y0) = ((W - side) / 2, (H - side) / 2);
+        f64::from(out.data[(y0 + 9) * W + x0 + 9][1])
+    };
+    for side in [26, 50, 98] {
+        let (zero, pulled) = (pane(side, 0.0), pane(side, -100.0));
+        assert!(zero > 250.0, "a {side} px window is white at zero sliders: {zero}");
+        // (read at the wide base: 157, 218 and 239; at the narrow base 132, 193 and 211)
+        assert!(pulled < 225.0, "Highlights -100 brings a {side} px window down: {pulled}");
     }
 }

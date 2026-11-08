@@ -63,7 +63,7 @@ fn lift_at(table: u32, ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Highlights' past-white gain at wide-base tone `wb` (`tone_lift::Regional::at`), its record after the table.
+// Highlights' past-white gain at narrow-base tone `wb` (`tone_lift::Regional::at`), its record after the table.
 fn region_at(wb: f32) -> f32 {
     if (!(wb == wb) || abs(wb) > 1e30) {
         return 0.0;
@@ -853,17 +853,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let wv = base_p[pu(F_WIDE_OFF) + i] + ev + shift;
             if (wv == wv && abs(wv) < 1e30) {
                 lb = base + pf(F_WIDE_W) * (wv - base);
-                if (pu(F_REGION) != 0u) {
-                    delta += region_at(wv);
-                }
             }
         }
         var nb = lb;
+        // a raw's pull past white is read at the narrow base itself (`finish.rs`), or the base without one
+        var rb = base;
         if (pu(F_NARROW) != 0u) {
             let nv = base_p[pu(F_NARROW_OFF) + i] + ev + shift;
             if (nv == nv && abs(nv) < 1e30) {
                 nb = lb + pf(F_NARROW_W) * (nv - lb);
+                rb = nv;
             }
+        }
+        if (pu(F_REGION) != 0u) {
+            delta += region_at(rb);
         }
         delta += lift_at(0u, max(lb, nb)) + lift_at(1u, min(lb, nb));
         hh = lt[4];

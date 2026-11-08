@@ -794,11 +794,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let b0 = wide.map_or(base, |wv| base + wt * (wv - base));
                 // Shadows read at the brighter, Highlights at the darker of that and the narrow, leaky base
                 // (`local::NarrowBase`): each eases off next to the other's region and never spreads into it
-                let nb = p.narrow.as_deref().and_then(|np| np.data.get(i)).map(|v| v + ev + shift).filter(|v| v.is_finite());
-                let nb = nb.map_or(b0, |n| b0 + crate::local::NARROW_BASE.weight * (n - b0));
+                let narrow = p.narrow.as_deref().and_then(|np| np.data.get(i)).map(|v| v + ev + shift).filter(|v| v.is_finite());
+                let nb = narrow.map_or(b0, |n| b0 + crate::local::NARROW_BASE.weight * (n - b0));
                 delta += lf.at(b0.max(nb)) + lf.at_h(b0.min(nb));
-                if let (Some(r), Some(wv)) = (lf.1.as_ref(), wide) {
-                    delta += r.at(wv);
+                // a raw's pull past white, read at the narrow base itself: it follows a bright region's outline
+                if let Some(r) = lf.1.as_ref() {
+                    delta += r.at(narrow.unwrap_or(base));
                 }
                 (l_hl, l_sh)
             } else {

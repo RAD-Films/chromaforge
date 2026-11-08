@@ -848,7 +848,7 @@ pub struct ToneBase {
 /// The default wide base ([`ToneBase`]), fitted to Lightroom's change maps at Shadows +100 and Highlights -100.
 pub const TONE_BASE: ToneBase = ToneBase { radius: 0.06, leak: 2.0, weight: 0.3 };
 
-/// Radius of the wide base (fraction of the long edge), also the Highlights past-white term's ([`crate::tone_lift::Regional`]).
+/// Radius of the wide base (fraction of the long edge).
 pub const WIDE_SIGMA: f32 = TONE_BASE.radius;
 
 /// The narrow, leaky base of V8's Highlights / Shadows: a plain Gaussian of log luminance. Shadows reads its table at

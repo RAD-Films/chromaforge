@@ -295,7 +295,8 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         aux.extend_from_slice(&l.0);
         aux.extend_from_slice(&l.2);
     }
-    let region = lift.and_then(|l| l.1.as_ref()).filter(|_| present.wide.is_some());
+    // (read at the narrow base, or the base without one, as on the CPU)
+    let region = lift.and_then(|l| l.1.as_ref());
     if let Some(r) = region {
         let (f0, f1, has) = r.fall.map_or((0.0, 0.0, 0.0), |(a, b)| (a, b, 1.0));
         aux.extend_from_slice(&[r.amp, r.rise.0, r.rise.1, f0, f1, has]);

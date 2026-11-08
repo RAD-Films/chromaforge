@@ -270,11 +270,16 @@ fn highlights_gain(h: f32) -> f32 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lift(pub Vec<f32>, pub Option<Regional>, pub Vec<f32>);
 
-/// Highlights down on a raw's tones past its display white, read at the picture's wide base
-/// ([`crate::local::wide_sigma`]) rather than the tone table: a gain of `amp` EV weighted by how far the wide base
+/// Highlights down on a raw's tones past its display white, read at the narrow base ([`crate::local::NarrowBase`]: a
+/// Gaussian of 0.12 % of the long edge) rather than the tone table: a gain of `amp` EV weighted by how far that base
 /// sits past white, from none [`REGION_BELOW`] EV under white to all of it [`REGION_ABOVE`] EV over, and back to none
-/// at the raw's clip tone (a clipped sun stays white, as Lightroom keeps it). Read at the wide base, the gain is nearly
-/// constant inside a bright region, so a sky's gradient keeps its slope instead of folding where its tones cross white.
+/// at the raw's clip tone (a clipped sun stays white, as Lightroom keeps it). The narrow base follows a bright region's
+/// outline as Lightroom's pull does: read at the wide base (6 %), a window in a dark room sat far under white there and
+/// kept its whites (rounds 9b and 10, Nov 2026: at Highlights −100 the white-at-zero pixels went from 28.1 to 25.5
+/// levels rms from Lightroom, held-out 17.6 to 15.5; at −50 9.4 to 8.1, held-out 6.4 to 4.9; with
+/// [`REGION_MIN_SLOPE`] 0, −100: 23.6, held-out 13.2; −50: 7.8, held-out 5.9). The rise is spread
+/// over enough tones that a ramp keeps [`REGION_MIN_SLOPE`] of its slope, so a sky's gradient doesn't fold where its
+/// tones cross white.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Regional {
     pub amp: f32,
@@ -283,7 +288,7 @@ pub struct Regional {
 }
 
 impl Regional {
-    /// The gain (EV, ≤ 0) at wide-base tone `wb`.
+    /// The gain (EV, ≤ 0) at narrow-base tone `wb`.
     #[inline]
     pub fn at(&self, wb: f32) -> f32 {
         if !wb.is_finite() {
@@ -307,13 +312,16 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// [`Regional`]: the wide base's tones under white (EV) where the pull starts, and over white where it is complete.
+/// [`Regional`]: the narrow base's tones under white (EV) where the pull starts, and over white where it is complete.
 const REGION_BELOW: f32 = 1.0;
 const REGION_ABOVE: f32 = 1.0;
-/// [`Regional`]: the least slope of a tone's output against its own tone where the wide base follows it (a sky ramp
-/// filling the frame): the pull's rise is spread over enough tones that the ramp keeps this much of its slope, so it
-/// never folds into a contour.
-const REGION_MIN_SLOPE: f32 = 0.3;
+/// [`Regional`]: the least slope of a tone's output against its own tone where the base follows it (a smooth sky
+/// ramp): the pull's rise is spread over enough tones that the ramp keeps this much of its slope, so it never folds
+/// into a contour. Lightroom flattens such a region about this far (its own slope within a pulled white region,
+/// rounds 9b / 10: 0.16 to 0.7, one −0.06); at 0.3 a strong pull spread so wide that a window just past white kept
+/// little of it (Highlights −100: 25.5 → 23.6 levels rms on the white-at-zero pixels, held-out 15.5 → 13.2; −50:
+/// 8.1 → 7.8, held-out 4.9 → 5.9).
+const REGION_MIN_SLOPE: f32 = 0.0;
 /// [`Regional`]: the tones under the raw's clip tone (EV) over which the pull eases back to none.
 const REGION_FALL: f32 = 1.5;
 /// A raw counts as clipped when at least this share of its pixels hold its brightest channel value (within
@@ -390,7 +398,7 @@ impl Lift {
         };
         let s_part = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + pair(d);
         let h_part = |d: f32| gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d);
-        // a raw's tones past its display white: Lightroom's pull for them ([`ABOVE_WHITE_BASE`]), read at the wide base
+        // a raw's tones past its display white: Lightroom's pull for them ([`ABOVE_WHITE_BASE`]), read at the narrow base
         let region = display.and_then(|d| regional(t, d, gh));
         // each part on its own: smoothed to a curvature cap, then with tones kept in order
         let table = |shift: &dyn Fn(f32) -> f32| -> Vec<f32> {
@@ -842,7 +850,7 @@ mod tests {
         let window = SHOWN_WHITE + 1.5;
         let (bright, dark) = (Lift::new(&room(0), 0.0, -1.0, Some(&d)), Lift::new(&room(80), 0.0, -1.0, Some(&d)));
         let (rb, rd) = (bright.1.clone().unwrap(), dark.1.clone().unwrap());
-        // the fitted pull: more in a dark room, read at a window's wide base
+        // the fitted pull: more in a dark room, read at a window's narrow base
         let wanted = |dark_share: f32| ABOVE_WHITE_BASE[2] + ABOVE_WHITE_DARK[2] * dark_share;
         assert!((rb.amp - wanted(0.0)).abs() < 1e-4 && (rd.amp - wanted(0.8)).abs() < 1e-4, "{} {}", rb.amp, rd.amp);
         // (it eases in over a span wide enough to keep a sky's slope, so a window just past white gets part of it)
@@ -939,7 +947,7 @@ mod tests {
         let b = Lift::new(&picture(), 1.0, -1.0, Some(&d));
         for (e, want_s, want_h, want_b) in GOLDEN_RAW {
             assert!((s.at_both(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at_both(e));
-            // (the pull past white is read at the wide base, not in this table: [`Regional`])
+            // (the pull past white is read at the narrow base, not in this table: [`Regional`])
             assert!((h.at_both(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at_both(e));
             assert!((b.at_both(e) - want_b).abs() < 3e-3, "both at {e}: {} vs {want_b}", b.at_both(e));
         }
