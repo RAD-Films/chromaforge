@@ -82,6 +82,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("SPLIT_K", lcc_pipeline::split_v9::SPLIT_WORDS),
     ("SPLIT_ZSH", 61),
     ("SPLIT_ZHL", 61),
+    ("SPLIT_ZMIX", 61),
     ("SKIN", 1),
     ("BANDH", 8),
     ("VIG", 1),
@@ -368,6 +369,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.fs("SPLIT_K", &k.words());
         p.fs("SPLIT_ZSH", &lcc_pipeline::split_v9::SPLIT_ZONE_SH);
         p.fs("SPLIT_ZHL", &lcc_pipeline::split_v9::SPLIT_ZONE_HL);
+        p.fs("SPLIT_ZMIX", &lcc_pipeline::split_v9::SPLIT_MIX);
     }
     p.f("SKIN", ops.skin);
     p.fs("BANDH", lcc_pipeline::colorops::band_hues());

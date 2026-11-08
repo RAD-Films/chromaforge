@@ -9,7 +9,12 @@
 //!   strength near black; the highlights wheel peaks near L 0.85 and falls off towards white.
 //! - Strength grows as (saturation / 50)^1.24.
 //! - Balance shifts both profiles (0.21 and 0.14 L per 100) and moves strength between them (∓0.89 per 100);
-//!   Blending above 50 narrows them a little (−0.077 per 50) and strengthens them (+0.22 per 50).
+//!   Blending below 50 widens them a little (0.077 per 50) and weakens them (0.22 per 50).
+//! - Blending above 50 mixes the two tints instead of adding two zones: at Blending 100 every lightness gets one
+//!   tint, the shadows one turning into the highlights one around L 0.59 (moved 0.57 L per 100 of balance), with a
+//!   strength profile of its own ([`SPLIT_MIX`]). So opposite hues cross through grey between the zones (round 17's
+//!   chart), and similar hues tint all tones nearly evenly (round 19: g07's raw, shadows 18 / 12, highlights 42 / 9,
+//!   balance +21, about three times the zone sum in the midtones). Between 50 and 100 the two are mixed linearly.
 //!
 //! On the round-17 exports (mean OkLab ΔE×100 on the patches LrC moves) this scores 0.68, V8's wheels 1.75.
 //! Midtones, global and the wheels' Luminance sliders were not measured and keep V8's behaviour.
@@ -44,6 +49,15 @@ const BALANCE_AMP: f32 = 0.89245;
 const BLEND_AMP: f32 = 0.22226;
 /// The lightness the profiles stretch around under Blending.
 pub const SPLIT_CENTRE: f32 = 0.61;
+/// Blending 100: the mixed tint's strength by OkLab lightness (same knots as the zones).
+#[rustfmt::skip]
+pub const SPLIT_MIX: [f32; 61] = [0.46639, 0.46639, 0.51382, 0.58497, 0.65612, 0.72727, 0.79841, 0.86956, 0.94071, 1.00222, 1.06374, 1.12525, 1.18677, 1.24828, 1.30979, 1.36467, 1.40627, 1.44788, 1.48948, 1.53109, 1.57269, 1.61429, 1.64011, 1.65804, 1.67597, 1.69389, 1.71182, 1.72975, 1.74767, 1.75829, 1.76891, 1.77953, 1.79015, 1.80077, 1.81139, 1.82649, 1.85055, 1.87461, 1.89867, 1.92273, 1.94679, 1.97085, 1.95548, 1.92040, 1.88531, 1.85023, 1.81514, 1.78006, 1.74497, 1.66831, 1.59165, 1.51499, 1.43833, 1.36166, 1.28500, 1.17775, 1.00933, 0.84091, 0.67248, 0.50406, 0.33564];
+/// Blending 100: where the tint turns from the shadows one to the highlights one, and over how wide (a logistic).
+const MIX_CROSS: f32 = 0.58776;
+const MIX_WIDTH: f32 = 0.13732;
+/// Blending 100: the crossover's shift per 100 of balance, and the strength moved per 100.
+const MIX_SHIFT: f32 = -0.57132;
+const MIX_BALANCE_AMP: f32 = 0.25946;
 
 /// Both wheels, ready to apply: each one's OkLab offset (L, a, b) at full strength, where its profile is read
 /// (shift), and the profiles' common stretch. Words for the GPU in [`SplitK::words`].
@@ -53,10 +67,17 @@ pub struct SplitK {
     pub highlights: [f32; 3],
     pub shift: [f32; 2],
     pub scale: f32,
+    /// Blending above 50: the share of the mixed tint (0 at 50 and below, 1 at 100), its shadows and highlights
+    /// tints at full strength, its crossover lightness and width.
+    pub mix: f32,
+    pub mix_shadows: [f32; 3],
+    pub mix_highlights: [f32; 3],
+    pub mix_cross: f32,
+    pub mix_width: f32,
 }
 
 /// Number of [`SplitK::words`].
-pub const SPLIT_WORDS: usize = 9;
+pub const SPLIT_WORDS: usize = 18;
 
 fn fourier(c: &[f32; 5], hue_deg: f32) -> f32 {
     let r = hue_deg.to_radians();
@@ -101,15 +122,27 @@ impl SplitK {
         }
         let bal = (g.balance.clamp(-100.0, 100.0) / 100.0) as f32;
         let blend = ((g.blending.clamp(0.0, 100.0) - 50.0) / 50.0) as f32;
-        let amp = (1.0 + BLEND_AMP * blend).max(0.0);
+        // above 50 the zones keep their Blending-50 form and give way to the mixed tint
+        let (zb, mix) = if blend > 0.0 { (0.0, blend.min(1.0)) } else { (blend, 0.0) };
+        let amp = (1.0 + BLEND_AMP * zb).max(0.0);
         let hue = |h: f64| (h.rem_euclid(360.0)) as f32;
-        let mut shadows = if ss > 0.0 { offset(hue(g.shadows.hue), &SH_MAG, &SH_DL, &SH_OFF) } else { [0.0; 3] };
-        let mut highlights = if sh > 0.0 { offset(hue(g.highlights.hue), &HL_MAG, &HL_DL, &HL_OFF) } else { [0.0; 3] };
-        let ks = ss * (1.0 - BALANCE_AMP * bal).max(0.0) * amp;
-        let kh = sh * (1.0 + BALANCE_AMP * bal).max(0.0) * amp;
-        shadows = shadows.map(|v| v * ks);
-        highlights = highlights.map(|v| v * kh);
-        let k = SplitK { shadows, highlights, shift: [-SHIFT[0] * bal, -SHIFT[1] * bal], scale: (1.0 + BLEND_WIDTH * blend).max(0.2) };
+        let sh0 = if ss > 0.0 { offset(hue(g.shadows.hue), &SH_MAG, &SH_DL, &SH_OFF) } else { [0.0; 3] };
+        let hl0 = if sh > 0.0 { offset(hue(g.highlights.hue), &HL_MAG, &HL_DL, &HL_OFF) } else { [0.0; 3] };
+        let ks = ss * (1.0 - BALANCE_AMP * bal).max(0.0) * amp * (1.0 - mix);
+        let kh = sh * (1.0 + BALANCE_AMP * bal).max(0.0) * amp * (1.0 - mix);
+        let ms = ss * (1.0 - MIX_BALANCE_AMP * bal).max(0.0) * mix;
+        let mh = sh * (1.0 + MIX_BALANCE_AMP * bal).max(0.0) * mix;
+        let k = SplitK {
+            shadows: sh0.map(|v| v * ks),
+            highlights: hl0.map(|v| v * kh),
+            shift: [-SHIFT[0] * bal, -SHIFT[1] * bal],
+            scale: (1.0 + BLEND_WIDTH * zb).max(0.2),
+            mix,
+            mix_shadows: sh0.map(|v| v * ms),
+            mix_highlights: hl0.map(|v| v * mh),
+            mix_cross: MIX_CROSS - MIX_SHIFT * bal,
+            mix_width: MIX_WIDTH,
+        };
         k.words().iter().all(|v| v.is_finite()).then_some(k)
     }
 
@@ -118,14 +151,52 @@ impl SplitK {
     pub fn offset(&self, l: f32) -> [f32; 3] {
         let ws = zone(&SPLIT_ZONE_SH, SPLIT_CENTRE + (l - self.shift[0] - SPLIT_CENTRE) / self.scale);
         let wh = zone(&SPLIT_ZONE_HL, SPLIT_CENTRE + (l - self.shift[1] - SPLIT_CENTRE) / self.scale);
-        std::array::from_fn(|i| ws * self.shadows[i] + wh * self.highlights[i])
+        let mut o: [f32; 3] = std::array::from_fn(|i| ws * self.shadows[i] + wh * self.highlights[i]);
+        if self.mix > 0.0 {
+            let a = zone(&SPLIT_MIX, l);
+            let s = mix_step(l, self.mix_cross, self.mix_width);
+            for (i, v) in o.iter_mut().enumerate() {
+                *v += a * ((1.0 - s) * self.mix_shadows[i] + s * self.mix_highlights[i]);
+            }
+        }
+        o
     }
 
-    /// For the GPU (`finish.wgsl`, `split_offset`): shadows (L, a, b), highlights (L, a, b), the two shifts, the scale.
+    /// For the GPU (`finish.wgsl`, `split_offset`): shadows (L, a, b), highlights (L, a, b), the two shifts, the
+    /// scale; then the mix share, its shadows and highlights tints, crossover and width.
     pub fn words(&self) -> [f32; SPLIT_WORDS] {
-        let [s, h] = [self.shadows, self.highlights];
-        [s[0], s[1], s[2], h[0], h[1], h[2], self.shift[0], self.shift[1], self.scale]
+        let [s, h, ms, mh] = [self.shadows, self.highlights, self.mix_shadows, self.mix_highlights];
+        [
+            s[0],
+            s[1],
+            s[2],
+            h[0],
+            h[1],
+            h[2],
+            self.shift[0],
+            self.shift[1],
+            self.scale,
+            self.mix,
+            ms[0],
+            ms[1],
+            ms[2],
+            mh[0],
+            mh[1],
+            mh[2],
+            self.mix_cross,
+            self.mix_width,
+        ]
     }
+}
+
+/// Blending 100's turn from the shadows tint (0) to the highlights tint (1) at lightness `l`.
+#[inline]
+pub fn mix_step(l: f32, cross: f32, width: f32) -> f32 {
+    let t = (l - cross) / width.max(1e-3);
+    if !t.is_finite() {
+        return 0.5;
+    }
+    1.0 / (1.0 + (-t.clamp(-60.0, 60.0)).exp())
 }
 
 /// A profile read at lightness `x` (linear between knots, its ends held outside).
@@ -160,6 +231,8 @@ mod tests {
     fn r17_error(process: lcc_develop::Process) -> (f32, f32, f32) {
         let (mut sum, mut worst, mut model) = (0.0f32, 0.0f32, 0.0f32);
         for (shh, shs, hlh, hls, bal, blend, lrc, fit) in R17_SPLIT.iter() {
+            // the fitted zone model's saved values hold up to Blending 50; above it the mixed tint takes over
+            let zones = *blend <= 50.0;
             let mut s = lcc_develop::DevelopSettings { process: process.version(), ..Default::default() };
             s.grading.shadows = Wheel { hue: *shh, sat: *shs, lum: 0.0 };
             s.grading.highlights = Wheel { hue: *hlh, sat: *hls, lum: 0.0 };
@@ -170,7 +243,9 @@ mod tests {
             for ((b, l), f) in R17_SPLIT_BASE.iter().zip(lrc.iter()).zip(fit.iter()) {
                 let o = oklab_from_2020(ops.apply(oklab_to_2020(*b), 0.0, 0.0));
                 let d = |x: &[f32; 3]| ((o[0] - x[0]).powi(2) + (o[1] - x[1]).powi(2) + (o[2] - x[2]).powi(2)).sqrt();
-                model = model.max(d(f));
+                if zones {
+                    model = model.max(d(f));
+                }
                 let moved = ((l[0] - b[0]).powi(2) + (l[1] - b[1]).powi(2) + (l[2] - b[2]).powi(2)).sqrt();
                 if moved > 0.005 {
                     e += d(l);
@@ -191,10 +266,64 @@ mod tests {
         eprintln!(
             "round 17 split toning, mean / worst OkLab error: V8 {v8:.4} / {v8_worst:.4}, V9 {v9:.4} / {v9_worst:.4}; V9 vs the fitted model {model:.4}"
         );
-        // measured: V8 0.0169 / 0.0349, V9 0.0041 / 0.0053, V9 within 0.0024 of the model (its profiles on a finer grid)
+        // measured: V8 0.0169 / 0.0349, V9 0.0040 / 0.0053, V9 within 0.0024 of the zone model up to Blending 50
+        // (its profiles on a finer grid)
         assert!(v9 < 0.005 && v9_worst < 0.007, "V9 {v9} / {v9_worst}");
         assert!(v9 < 0.35 * v8 && v9_worst < 0.25 * v8_worst, "V9 {v9} / {v9_worst} vs V8 {v8} / {v8_worst}");
         assert!(model < 0.004, "V9 is {model} off the fitted model");
+    }
+
+    /// Round 19: LrC's split on g07's raw (shadows 18 / 12, highlights 42 / 9, balance +21), the median OkLab
+    /// change per lightness band of the zero-slider export: (band lightness, (L, a, b) change).
+    #[rustfmt::skip]
+    const R19_G07_BLEND50: [(f32, [f32; 3]); 15] = [(0.2367, [0.00091, 0.00903, 0.00245]), (0.2761, [0.00090, 0.00929, 0.00268]), (0.3257, [0.00089, 0.00845, 0.00270]), (0.3747, [0.00075, 0.00685, 0.00264]), (0.4261, [0.00059, 0.00530, 0.00280]), (0.4738, [0.00047, 0.00418, 0.00301]), (0.5220, [0.00044, 0.00354, 0.00310]), (0.5688, [0.00047, 0.00348, 0.00299]), (0.6196, [0.00051, 0.00383, 0.00284]), (0.6744, [0.00045, 0.00412, 0.00364]), (0.7247, [0.00038, 0.00431, 0.00470]), (0.7684, [0.00034, 0.00412, 0.00513]), (0.8245, [0.00021, 0.00346, 0.00582]), (0.8797, [0.00008, 0.00285, 0.00600]), (0.9323, [0.00001, 0.00204, 0.00505])];
+    #[rustfmt::skip]
+    const R19_G07_BLEND100: [(f32, [f32; 3]); 15] = [(0.2367, [0.00110, 0.01092, 0.00280]), (0.2761, [0.00119, 0.01228, 0.00311]), (0.3257, [0.00150, 0.01359, 0.00324]), (0.3747, [0.00172, 0.01433, 0.00328]), (0.4261, [0.00183, 0.01472, 0.00374]), (0.4738, [0.00188, 0.01459, 0.00438]), (0.5220, [0.00185, 0.01404, 0.00525]), (0.5688, [0.00173, 0.01311, 0.00622]), (0.6196, [0.00140, 0.01174, 0.00896]), (0.6744, [0.00098, 0.01012, 0.01042]), (0.7247, [0.00072, 0.00880, 0.01132]), (0.7684, [0.00048, 0.00690, 0.01084]), (0.8245, [0.00018, 0.00507, 0.01058]), (0.8797, [0.00003, 0.00384, 0.00890]), (0.9323, [0.00003, 0.00252, 0.00595])];
+
+    /// Mean and worst OkLab error of the split offset against round 19's bands at `blending`.
+    fn r19_error(blending: f64, bands: &[(f32, [f32; 3])]) -> (f32, f32) {
+        let g = ColorGrading {
+            shadows: Wheel { hue: 18.0, sat: 12.0, lum: 0.0 },
+            highlights: Wheel { hue: 42.0, sat: 9.0, lum: 0.0 },
+            balance: 21.0,
+            blending,
+            ..Default::default()
+        };
+        let Some(k) = SplitK::new(&g) else { return (f32::MAX, f32::MAX) };
+        let e: Vec<f32> = bands
+            .iter()
+            .map(|(l, d)| {
+                let o = k.offset(*l);
+                ((o[0] - d[0]).powi(2) + (o[1] - d[1]).powi(2) + (o[2] - d[2]).powi(2)).sqrt()
+            })
+            .collect();
+        (e.iter().sum::<f32>() / e.len() as f32, e.iter().fold(0.0, |a, b| a.max(*b)))
+    }
+
+    #[test]
+    fn blending_100_tints_all_tones_of_a_raw_like_lightroom_classic() {
+        let (m50, w50) = r19_error(50.0, &R19_G07_BLEND50);
+        let (m100, w100) = r19_error(100.0, &R19_G07_BLEND100);
+        eprintln!("round 19 g07 split, mean / worst OkLab error: Blending 50 {m50:.4} / {w50:.4}, 100 {m100:.4} / {w100:.4}");
+        // measured: Blending 50 0.0015 / 0.0029, 100 0.0031 / 0.0045 (the zone sum alone at 100: 0.0070 / 0.0107)
+        assert!(m50 < 0.002 && w50 < 0.0035, "Blending 50 {m50} / {w50}");
+        assert!(m100 < 0.0038 && w100 < 0.0055, "Blending 100 {m100} / {w100}");
+    }
+
+    #[test]
+    fn blending_at_or_below_50_keeps_the_zone_sum() {
+        for blending in [0.0, 25.0, 50.0] {
+            let g = ColorGrading {
+                shadows: Wheel { hue: 200.0, sat: 40.0, lum: 0.0 },
+                highlights: Wheel { hue: 40.0, sat: 30.0, lum: 0.0 },
+                balance: -30.0,
+                blending,
+                ..Default::default()
+            };
+            let Some(k) = SplitK::new(&g) else { panic!("no split at Blending {blending}") };
+            assert_eq!(k.mix, 0.0);
+            assert_eq!(k.mix_shadows, [0.0; 3]);
+        }
     }
 
     #[test]

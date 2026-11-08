@@ -300,7 +300,14 @@ fn split_offset(l: f32) -> vec3<f32> {
     let k = F_SPLIT_K;
     let ws = split_zone(F_SPLIT_ZSH, SPLIT_CENTRE + (l - pf(k + 6u) - SPLIT_CENTRE) / pf(k + 8u));
     let wh = split_zone(F_SPLIT_ZHL, SPLIT_CENTRE + (l - pf(k + 7u) - SPLIT_CENTRE) / pf(k + 8u));
-    return ws * vec3<f32>(pf(k), pf(k + 1u), pf(k + 2u)) + wh * vec3<f32>(pf(k + 3u), pf(k + 4u), pf(k + 5u));
+    var o = ws * vec3<f32>(pf(k), pf(k + 1u), pf(k + 2u)) + wh * vec3<f32>(pf(k + 3u), pf(k + 4u), pf(k + 5u));
+    if (pf(k + 9u) > 0.0) {
+        let a = split_zone(F_SPLIT_ZMIX, l);
+        let t = clamp((l - pf(k + 16u)) / max(pf(k + 17u), 1e-3), -60.0, 60.0);
+        let s = 1.0 / (1.0 + exp(-t));
+        o += a * ((1.0 - s) * vec3<f32>(pf(k + 10u), pf(k + 11u), pf(k + 12u)) + s * vec3<f32>(pf(k + 13u), pf(k + 14u), pf(k + 15u)));
+    }
+    return o;
 }
 
 // `colorops::calibrate`: primaries matrix, then the shadows tint (luminance kept).
