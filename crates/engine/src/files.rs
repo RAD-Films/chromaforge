@@ -810,7 +810,11 @@ fn load_bytes_now(
         let (img, clip_mask) = match binned {
             Some((img, mask)) => (img, Some(mask)),
             None => {
-                let method = if max_edge <= 600 { lcc_raw::Method::Bilinear } else { lcc_raw::Method::Ahd };
+                let method = match (max_edge <= 600, options.ahd_blend) {
+                    (true, _) => lcc_raw::Method::Bilinear,
+                    (false, true) => lcc_raw::Method::AhdBlend,
+                    (false, false) => lcc_raw::Method::Ahd,
+                };
                 (raw.develop(method).map_err(|e| e.to_string())?, None)
             }
         };

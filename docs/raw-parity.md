@@ -201,7 +201,7 @@ sample files. A pointer for contributors, not legal advice.
 
 | Stage | Target | The app | Status |
 |---|---|---|---|
-| Bayer demosaic | Adobe's own, plus AI "Raw Details" | AHD (default; blends its horizontal and vertical candidates where neither is clearly more homogeneous, so flat noise doesn't become a maze), PPG, bilinear (`crates/raw/src/demosaic`) | 🟡 quality unmeasured against Lightroom; no Raw Details |
+| Bayer demosaic | Adobe's own, plus AI "Raw Details" | AHD (default; from process V9 it blends its horizontal and vertical candidates where neither is clearly more homogeneous, so flat noise doesn't become a maze; V1–V8 keep the outright pick), PPG, bilinear (`crates/raw/src/demosaic`) | 🟡 quality unmeasured against Lightroom; no Raw Details |
 | X-Trans demosaic | ✅ | classified LMMSE green + residual-interpolated red/blue on the white-balanced mosaic, trained on CC0 X-Trans raws (`crates/raw/src/demosaic/xtrans_ri.rs`, [xtrans-demosaic.md](xtrans-demosaic.md)) | 🟡 +4.8 dB CPSNR and 40 % less false colour than the previous directional method on held-out real X-Trans scenes; not measured against Lightroom |
 | Foveon | ✅ (older bodies) | — | ⬜ |
 | Monochrome / LinearRaw | ✅ | handled, no demosaic | ✅ |
@@ -339,4 +339,4 @@ Beyond decoding:
 | 2026-10-14 | minor | 97 Canon CR2, Pentax and Ricoh models verified (one CC0 raw.pixls.us file each, pinned, checked against the camera JPEG; `canon_pentax_corpus.rs`): 334 verified, 844 unverified, 232 preview; 50% of photographers on a verified body; use-weighted 85% unchanged |
 | 2026-10-14 | minor | Integration batch 36: CC0 per-model verification for 117 Nikon/Fujifilm, 97 Canon CR2/Pentax/Ricoh, 21 Sony/Leica and 23 Olympus/Samsung bodies, 22 more CR3 bodies and 30 more models; Epson ERF and Mamiya MEF decode; measured Nikon image areas (#1053, #1770): 515 verified, 675 unverified, 218 preview, 38 unsupported (re-measured with `coverage.py`) |
 | 2026-10-15 | minor | Upstream (batch 40): by-maker and by-use tables re-measured with `coverage.py` after batches 36–39 (545 verified, 651 unverified, 212 preview, 38 unsupported; ~94% of photographers' cameras fully work, ~85% on a verified body); rows the per-model PRs had updated are current again |
-| 2026-11-07 | minor | Upstream #2094: AHD blends its horizontal and vertical candidates where their homogeneity is close, so flat noise no longer becomes a maze pattern; scores unchanged |
+| 2026-11-07 | minor | Upstream #2094: AHD blends its horizontal and vertical candidates where their homogeneity is close, so flat noise no longer becomes a maze pattern (process V9; V1–V8 keep the outright pick); scores unchanged |

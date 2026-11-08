@@ -32,8 +32,13 @@ use serde::{Deserialize, Serialize};
 pub enum Method {
     Bilinear,
     Ppg,
+    /// Adaptive homogeneity-directed: per pixel, the horizontal or vertical candidate that is more homogeneous
+    /// (processes V1-V8).
     #[default]
     Ahd,
+    /// [`Method::Ahd`] that blends the two candidates where their homogeneity is close, so noise alone no longer picks
+    /// one and flat noisy areas don't turn into a maze (process V9, upstream #2094).
+    AhdBlend,
     /// Enhance ▸ Raw Details: gradient-weighted green and edge-aware residual red/blue (`detail.rs`). Slower than
     /// AHD; used for the enhanced DNG, not live previews. Non-Bayer patterns use the directional method.
     Detail,
@@ -128,7 +133,7 @@ pub fn demosaic_with(n: &Normalized, method: Method, opts: Options) -> Rgb32f {
                 return match method {
                     Method::Bilinear => bilinear::bilinear(&m),
                     Method::Ppg => xtrans::directional(&m),
-                    Method::Ahd | Method::Detail => xtrans_ri::demosaic(&m, opts.balance).unwrap_or_else(|| xtrans::directional(&m)),
+                    Method::Ahd | Method::AhdBlend | Method::Detail => xtrans_ri::demosaic(&m, opts.balance).unwrap_or_else(|| xtrans::directional(&m)),
                 };
             }
             if w < 4 || h < 4 {
@@ -137,7 +142,8 @@ pub fn demosaic_with(n: &Normalized, method: Method, opts: Options) -> Rgb32f {
             match method {
                 Method::Bilinear => bilinear::bilinear(&m),
                 Method::Ppg => ppg::ppg(&m),
-                Method::Ahd => ahd::ahd(&m),
+                Method::Ahd => ahd::ahd(&m, false),
+                Method::AhdBlend => ahd::ahd(&m, true),
                 Method::Detail => detail::detail(&m),
             }
         }
@@ -202,7 +208,7 @@ mod tests {
         let img = Rgb32f::filled(17, 13, [0.3, 0.55, 0.8]);
         for pat in ["RGGB", "BGGR", "GRBG", "GBRG"] {
             let cfa = Cfa::bayer(pat).unwrap();
-            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::Detail] {
+            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::AhdBlend, Method::Detail] {
                 let out = run(&img, &cfa, m);
                 for p in &out.data {
                     for c in 0..3 {
@@ -242,7 +248,7 @@ mod tests {
     fn known_samples_are_preserved() {
         let img = edgy_scene(40, 32);
         let cfa = Cfa::bayer("GRBG").unwrap();
-        for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::Detail] {
+        for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::AhdBlend, Method::Detail] {
             let out = run(&img, &cfa, m);
             for y in 0..32 {
                 for x in 0..40 {
@@ -294,10 +300,13 @@ mod tests {
         let cfa = Cfa::bayer("RGGB").unwrap();
         let data = (0..w * h).map(|_| 0.2 + noise()).collect();
         let n = Normalized { width: w, height: h, cpp: 1, data, cfa: Some(cfa) };
-        let (ahd, bilinear) = (anisotropy(&demosaic(&n, Method::Ahd)), anisotropy(&demosaic(&n, Method::Bilinear)));
-        eprintln!("anisotropy: ahd {ahd:.3e}, bilinear {bilinear:.3e}");
+        let bilinear = anisotropy(&demosaic(&n, Method::Bilinear));
+        let (outright, ahd) = (anisotropy(&demosaic(&n, Method::Ahd)), anisotropy(&demosaic(&n, Method::AhdBlend)));
+        eprintln!("anisotropy: ahd {outright:.3e}, blended {ahd:.3e}, bilinear {bilinear:.3e}");
         // the hard choice gave about 11 times bilinear's, the blend about 7.5 times
         assert!(ahd < 9.0 * bilinear, "ahd {ahd:.3e} bilinear {bilinear:.3e}");
+        // processes V1-V8 keep the outright pick, maze and all (their renders don't change)
+        assert!(outright > 9.0 * bilinear, "outright ahd {outright:.3e} bilinear {bilinear:.3e}");
     }
 
     #[test]
@@ -305,7 +314,7 @@ mod tests {
         let cfa = Cfa::bayer("RGGB").unwrap();
         for (w, h) in [(1, 1), (2, 2), (3, 5), (5, 3), (1, 7)] {
             let img = Rgb32f::filled(w, h, [0.5; 3]);
-            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::Detail] {
+            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::AhdBlend, Method::Detail] {
                 let out = run(&img, &cfa, m);
                 assert_eq!((out.width, out.height), (w, h));
                 assert!(out.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
@@ -325,10 +334,12 @@ mod tests {
         let cfa = Cfa::bayer("RGGB").unwrap();
         let mut n = mosaic_from_rgb(&img, &cfa);
         n.data[12 * 32 + 16] = f32::NAN;
-        let out = demosaic(&n, Method::Ahd);
-        let bad = out.data.iter().filter(|p| p.iter().any(|v| !v.is_finite())).count();
-        // the pixels that read the NaN sample themselves, as many as the outright pick gave; the blend made it 33
-        assert!(bad <= 9, "{bad} pixels not finite");
+        for method in [Method::Ahd, Method::AhdBlend] {
+            let out = demosaic(&n, method);
+            let bad = out.data.iter().filter(|p| p.iter().any(|v| !v.is_finite())).count();
+            // the pixels that read the NaN sample themselves, as many as the outright pick gave; the blend made it 33
+            assert!(bad <= 9, "{method:?}: {bad} pixels not finite");
+        }
     }
 
     #[test]
@@ -346,7 +357,7 @@ mod tests {
         }
         let all_nan = Normalized { width: 9, height: 7, cpp: 1, data: vec![f32::NAN; 63], cfa: Some(cfa) };
         for n in [&patchy, &all_nan] {
-            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::Detail] {
+            for m in [Method::Bilinear, Method::Ppg, Method::Ahd, Method::AhdBlend, Method::Detail] {
                 let out = demosaic(n, m);
                 assert_eq!((out.width, out.height), (n.width, n.height), "{m:?}");
             }

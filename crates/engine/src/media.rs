@@ -174,6 +174,9 @@ pub struct LoadOptions {
     /// [`lcc_pipeline::CameraColor::deferred_tables_gain`]); false: applied while decoding, at the as-shot white
     /// (V1–V7).
     pub defer_tables: bool,
+    /// Demosaic a raw with the AHD that blends its candidates where noise alone would pick one
+    /// ([`lcc_raw::Method::AhdBlend`], process V9); false: the outright pick of V1-V8 ([`lcc_raw::Method::Ahd`]).
+    pub ahd_blend: bool,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -191,6 +194,7 @@ impl Default for LoadOptions {
             // (baked in: callers that use the decoded pixels directly, such as chart profiling, merges and the colour
             // fitter, see the camera profile's colours; photo renders decode with `for_photo`, which follows the process)
             defer_tables: false,
+            ahd_blend: false,
             path: None,
         }
     }
@@ -205,6 +209,7 @@ impl LoadOptions {
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
             defer_tables: s.process.process() >= lcc_develop::Process::V9,
+            ahd_blend: s.process.process() >= lcc_develop::Process::V9,
             path: None,
         }
     }
@@ -314,7 +319,8 @@ impl DecodedSource {
                 && (self.options.colour == options.colour || !info.is_some_and(|i| i.colorimetric))
                 && ((self.options.camera == options.camera && self.options.camera_look == options.camera_look) || !info.is_some_and(|i| i.raw))
                 && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
-                && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw)))
+                && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw))
+                && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
