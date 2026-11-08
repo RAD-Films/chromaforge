@@ -5,7 +5,7 @@
 //! - [`look_cube`]: a photo's global look (white balance aside: Light, tone curve, colour, mixer, colour grading,
 //!   profile look) as a 33³ `.cube` LUT from sRGB to sRGB, for editors and tools that apply LUTs (Capture One,
 //!   darktable's lut 3D module, Photoshop, video graders);
-//! - [`with_photo_colour`]: the same camera colour written into a raw before it is saved as a DNG.
+//! - [`with_photo_colour_at`]: the same camera colour written into a raw before it is saved as a DNG.
 //!
 //! Sources: own design; DNG specification 1.7 chapter 6 (camera profiles); Cube LUT format.
 use lcc_develop::DevelopSettings;
@@ -14,12 +14,8 @@ use lcc_raw::RawImage;
 /// Give `raw` the camera colour a photo of it with camera-profile choice `choice` (`profile.camera`) renders with:
 /// the chosen (or the camera's default) `.dcp` or calibration look, else the file's own matrices, else the starting
 /// colour the app fits for a raw without matrices. Returns the profile's name when a `.dcp` or look was applied.
-pub(crate) fn with_photo_colour(raw: &mut RawImage, bytes: &[u8], choice: &str) -> Option<String> {
-    with_photo_colour_at(raw, bytes, choice, lcc_develop::Process::LATEST.version().0)
-}
-
-/// [`with_photo_colour`] for a photo on process number `process`: the calibration look and the fitted starting colour
-/// it renders with (processes V1 to V8 keep theirs, `camera_preview::FitGen`), so an export matches the render.
+/// `process` is the photo's process number: the calibration look and the fitted starting colour are the ones it
+/// renders with (processes V1 to V8 keep theirs, `camera_preview::FitGen`), so an export matches the render.
 pub(crate) fn with_photo_colour_at(raw: &mut RawImage, bytes: &[u8], choice: &str, process: u32) -> Option<String> {
     let meta = raw.metadata.clone();
     let applied = crate::camera_profiles::apply_choice_with(&mut raw.color, &meta, choice, true, process);
@@ -38,7 +34,7 @@ pub fn profile_model(make: Option<&str>, model: &str) -> String {
     if make.is_empty() || model.to_lowercase().starts_with(&make.to_lowercase()) { model.to_string() } else { format!("{make} {model}") }
 }
 
-/// A `.dcp` of the camera colour a photo of the raw in `bytes` renders with (see [`with_photo_colour`]), named
+/// A `.dcp` of the camera colour a photo of the raw in `bytes` renders with (see [`with_photo_colour_at`]), named
 /// `name`, for camera `unique` (`UniqueCameraModel`; default [`profile_model`]).
 pub fn photo_dcp(bytes: &[u8], choice: &str, name: &str, unique: Option<&str>) -> Result<Vec<u8>, String> {
     photo_dcp_at(bytes, choice, name, unique, lcc_develop::Process::LATEST.version().0)
@@ -172,7 +168,7 @@ mod tests {
         list.push(("dcp:colour-export-test".into(), profile));
         lcc_raw::dcp::install_library(list);
         let mut raw = lcc_raw::decode(&bytes).unwrap();
-        let name = with_photo_colour(&mut raw, &bytes, "dcp:colour-export-test");
+        let name = with_photo_colour_at(&mut raw, &bytes, "dcp:colour-export-test", lcc_develop::Process::LATEST.version().0);
         let out = photo_dcp(&bytes, "dcp:colour-export-test", "", None);
         lcc_raw::dcp::install_library(saved.iter().map(|(id, d)| (id.clone(), (**d).clone())).collect());
         assert_eq!(name.as_deref(), Some("Mine"));
