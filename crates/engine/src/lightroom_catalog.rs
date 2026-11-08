@@ -42,6 +42,16 @@ fn is_smart_collection(r: &Row) -> bool {
 fn is_collection_set(r: &Row) -> bool {
     text(r, "creationId").contains("group")
 }
+/// Seconds from the Unix epoch to 2001-01-01T00:00:00Z, where Lightroom's times start.
+const LIGHTROOM_EPOCH: i64 = 978_307_200;
+/// When Lightroom last changed the image (`Adobe_images.touchTime`: seconds since 2001-01-01T00:00:00Z, also for
+/// metadata changes), as the library writes times. `None` when it is missing, not a number, not after 2001 or past
+/// the years a date holds.
+fn touch_time(image: &Row) -> Option<String> {
+    let secs = image.get("touchTime").and_then(Value::as_f64).filter(|t| t.is_finite() && *t > 0.0)?;
+    // (a cast saturates: a huge time fails the checked add or the year check)
+    lcc_catalog::dates::local((secs.floor() as i64).checked_add(LIGHTROOM_EPOCH)?)
+}
 fn number(r: &Row, k: &str) -> i64 {
     r.get(k).and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0) as i64
 }
@@ -213,6 +223,25 @@ impl Reader {
         Ok(out)
     }
 
+    /// Fill `out` with the as-shot white of each image in `wanted`, from the last of its history steps that has one.
+    /// Streamed, a row at a time and none kept: only a wanted image's step is decoded, and each is bounded on its own.
+    fn as_shot_whites(&self, wanted: &HashSet<i64>, cancel: &AtomicBool, out: &mut HashMap<i64, (f64, f64)>) -> Result<(), String> {
+        self.each_row("Adobe_libraryImageDevelopHistoryStep", false, false, cancel, |r, blobs| {
+            let image = number(&r, "image");
+            if !wanted.contains(&image) {
+                return Ok(());
+            }
+            let white = match blobs.into_iter().find(|(column, _)| *column == "text") {
+                Some((_, bytes)) => decode_compressed(&bytes, "settings").ok().as_deref().and_then(step_as_shot_white),
+                None => step_as_shot_white(text(&r, "text")),
+            };
+            if let Some(white) = white {
+                out.insert(image, white);
+            }
+            Ok(())
+        })
+    }
+
     /// `Adobe_imageDevelopSettings`, streamed into image id -> settings text. The photos' edits come from here, so a
     /// failure to read it fails the import rather than quietly bringing every photo in unedited.
     fn develop_settings(&self, cancel: &AtomicBool) -> Result<HashMap<i64, String>, String> {
@@ -298,6 +327,10 @@ pub struct CatalogPhoto {
     /// Whether `path` may be looked at (derived when the catalog is read; not archived).
     #[serde(skip)]
     pub original: Original,
+    /// Lightroom's as-shot `(Temperature, Tint)` for a Custom white balance, from its history: what the Kelvin in
+    /// `settings` is measured from (upstream #3906; [`custom_as_shot`]). Not archived.
+    #[serde(skip)]
+    pub as_shot_white: Option<(f64, f64)>,
 }
 
 /// Whether the original a catalog lists may be looked at. Its path is resolved with the catalog
@@ -827,6 +860,8 @@ fn read_lightroom(path: &Path, reader: Reader, source_guard: SourceGuard, cancel
     ensure_read_active(cancel)?;
     let mut snapshots = reader.grouped("Adobe_libraryImageDevelopSnapshot", &mut warnings, cancel)?;
     done.fetch_add(1, Ordering::Relaxed);
+    let as_shot_whites = custom_as_shot(&reader, &develops, cancel, &mut warnings);
+    ensure_read_active(cancel)?;
     let mut out = CatalogImport {
         source: path.to_string_lossy().into(),
         photos: Vec::new(),
@@ -907,6 +942,7 @@ fn read_lightroom(path: &Path, reader: Reader, source_guard: SourceGuard, cancel
             history: history.remove(&id).unwrap_or_default(),
             snapshots: snapshots.remove(&id).unwrap_or_default(),
             original,
+            as_shot_white: as_shot_whites.get(&id).copied(),
         });
     }
     if left_out > LEFT_OUT_NAMED {
@@ -1065,16 +1101,66 @@ fn mapped_settings(
     orientation: Orientation,
     stored_aspect: f64,
 ) -> Result<(Value, Vec<String>), String> {
+    mapped_settings_from(text, None, target, aspect, orientation, stored_aspect)
+}
+
+/// [`mapped_settings`] with `as_shot`, the white a Custom Kelvin is measured from, when the catalog's history gave one.
+fn mapped_settings_from(
+    text: &str,
+    as_shot: Option<(f64, f64)>,
+    target: crate::crs::Target,
+    aspect: f64,
+    orientation: Orientation,
+    stored_aspect: f64,
+) -> Result<(Value, Vec<String>), String> {
     let mut root = crate::preset_import::parse_lua(text)?;
     let deferred = strip_lua_sentinels(&mut root);
     // A catalog's develop settings carry no `HasCrop`: `crs::to_partial` takes any crop field as a crop.
-    let (props, values) = crate::preset_import::lua_settings_props(&root)?;
+    let (mut props, values) = crate::preset_import::lua_settings_props(&root)?;
+    if let Some((temperature, tint)) = as_shot {
+        props.entry("crs:AsShotTemperature".into()).or_insert_with(|| vec![temperature.to_string()]);
+        props.entry("crs:AsShotTint".into()).or_insert_with(|| vec![tint.to_string()]);
+    }
     let (mut partial, mut unknown) = crate::crs::to_partial_report(&props, Some(&values), target, aspect);
     catalog_crop(&mut partial, orientation, stored_aspect);
     if deferred > 0 {
         unknown.push("Deferred Lightroom adjustments (-999999)".into());
     }
     Ok((partial, unknown))
+}
+
+/// The `(Temperature, Tint)` of a history step whose white balance is As Shot. Lightroom writes them there as it read
+/// them from the file, and keeps them nowhere else once the photo has a Custom white balance. `None` for any other
+/// step, and for a photo's first steps, which say As Shot without the values.
+fn step_as_shot_white(text: &str) -> Option<(f64, f64)> {
+    let props = settings_with_white_balance(text, "As Shot")?;
+    let number = |k: &str| props.get(k)?.first()?.parse::<f64>().ok().filter(|v| v.is_finite());
+    Some((number("crs:Temperature").filter(|t| *t > 0.0)?, number("crs:Tint")?))
+}
+
+/// The parsed develop settings in `text` when their white balance is `mode`; `None` for another mode or text that
+/// does not parse. The substring test only skips parsing text that cannot match.
+fn settings_with_white_balance(text: &str, mode: &str) -> Option<crate::crs::Props> {
+    if !text.contains(mode) {
+        return None;
+    }
+    let root = crate::preset_import::parse_lua(text).ok()?;
+    let (props, _) = crate::preset_import::lua_settings_props(&root).ok()?;
+    (props.get("crs:WhiteBalance")?.first()?.as_str() == mode).then_some(props)
+}
+
+/// The as-shot white of each photo with a Custom white balance (issue #510: without it a raw developed relative to
+/// its as-shot look can't take the Kelvin). Optional: what was read before a failure is kept, with a warning.
+fn custom_as_shot(reader: &Reader, develops: &HashMap<i64, String>, cancel: &AtomicBool, warnings: &mut Vec<String>) -> HashMap<i64, (f64, f64)> {
+    let wanted: HashSet<i64> = develops.iter().filter(|(_, t)| settings_with_white_balance(t, "Custom").is_some()).map(|(id, _)| *id).collect();
+    let mut found = HashMap::new();
+    if !wanted.is_empty()
+        && let Err(error) = reader.as_shot_whites(&wanted, cancel, &mut found)
+        && !cancel.load(Ordering::Relaxed)
+    {
+        warnings.push(format!("as-shot white balance from Lightroom history: {error}"));
+    }
+    found
 }
 
 /// Lightroom's `Adobe_images.orientation`: where the stored image's top-left and top-right corners
@@ -1108,7 +1194,7 @@ fn lightroom_orientation(code: &str) -> Option<Orientation> {
 /// then the rotation; `stored_aspect` (width / height of the stored image) matters once the
 /// rectangle turns. On a real catalog this reproduced the frame aspect of all 223 straightened crops
 /// in Lightroom's exports within 1%.
-fn catalog_crop(partial: &mut Value, orientation: Orientation, stored_aspect: f64) {
+pub(crate) fn catalog_crop(partial: &mut Value, orientation: Orientation, stored_aspect: f64) {
     let Some(geometry) = partial.pointer_mut("/crop/geometry").and_then(Value::as_object_mut) else { return };
     let edge = |k: &str| geometry.get("rect").and_then(|r| r.get(k)).and_then(Value::as_f64);
     let (Some(x0), Some(y0), Some(x1), Some(y1)) = (edge("x0"), edge("y0"), edge("x1"), edge("y1")) else { return };
@@ -1281,6 +1367,8 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
     let mut preserved = 0;
     let mut history_imported = 0usize;
     let mut snapshots_imported = 0usize;
+    // images dated at the import, or left undated, because their Lightroom edit time can't be read
+    let mut untimed = Vec::new();
     // Masters precede their virtual copies.
     let mut photos: Vec<_> = data.photos.iter().collect();
     photos.sort_by_key(|p| number(&p.image, "masterImage") != 0);
@@ -1315,7 +1403,6 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
                 .ok_or_else(|| error("virtual copy master is unavailable"))?;
             p.id = s.catalog.alloc_photo_id();
             p.copy_of = Some(master_id);
-            p.copy_name = Some(text(&src.image, "copyName").to_string());
             p
         } else if let Some(duplicate) = duplicates.get(&key(&src.path)).and_then(|id| s.catalog.photo(*id)) {
             // Catalogs can contain distinct originals with identical bytes and independent edits.
@@ -1341,6 +1428,9 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
             }
             p
         };
+        // Lightroom gives any photo a Copy Name, not only a virtual copy (some use it as a short title).
+        let copy_name = text(&src.image, "copyName");
+        p.copy_name = if master != 0 { Some(copy_name.to_string()) } else { Some(copy_name.to_string()).filter(|n| !n.is_empty()) };
         // Offline videos bypass file probing; Lightroom's format still identifies their kind.
         if text(&src.image, "fileFormat").eq_ignore_ascii_case("VIDEO") {
             p.kind = lcc_catalog::MediaKind::Video;
@@ -1350,7 +1440,13 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
         // A record this import added, or a Local one untouched since browsing (an offline original
         // never reaches the add step, so it is judged here), holds no edits of the library's own.
         let fresh = existing_id.is_some_and(|id| added.contains(&id) || s.catalog.photo(id).is_some_and(|q| q.untouched_local()));
-        let keep_develop = existing_id.is_some() && !fresh && p.edited.is_some() && !update_existing;
+        // Every photo Lightroom has carries its edit date (below), so a date alone doesn't say the library edited it:
+        // its settings or its History do.
+        let library_edits = existing_id.is_some() && !fresh && p.edited.is_some() && (p.is_edited() || !p.history.is_empty());
+        let keep_develop = library_edits && !update_existing;
+        let touched = touch_time(&src.image);
+        // dated from the catalog's develop settings (below); otherwise from `touched` alone
+        let mut dated = false;
         let previous_develop = (p.develop.clone(), p.edited.clone());
         if keep_develop {
             preserved += 1;
@@ -1417,12 +1513,16 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
             let target = crate::crs::Target::for_photo(&p);
             let aspect = p.width.max(1) as f64 / p.height.max(1) as f64;
             let base = p.develop.clone();
-            match mapped_settings(&src.settings, target, aspect, orientation, stored_aspect) {
+            match mapped_settings_from(&src.settings, src.as_shot_white, target, aspect, orientation, stored_aspect) {
                 Ok((partial, unknown)) => {
                     let mut develop = lcc_develop::apply_partial(&base, &partial, 1.0);
                     crate::crs::keep_chosen_dcp(&base, &mut develop);
                     p.develop = Arc::new(develop);
-                    p.edited = Some(now.clone());
+                    if touched.is_none() {
+                        untimed.push(src.source_id);
+                    }
+                    p.edited = Some(touched.clone().unwrap_or_else(|| now.clone()));
+                    dated = true;
                     if !unknown.is_empty() {
                         unmapped.insert(src.source_id, unknown);
                     }
@@ -1447,6 +1547,14 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
                 p.versions = versions;
             }
         }
+        // Lightroom dates every photo at its last edit, settings or not (or settings that can't be read); one edited
+        // in the library keeps its own date.
+        if !dated && !library_edits {
+            match &touched {
+                Some(t) => p.edited = Some(t.clone()),
+                None => untimed.push(src.source_id),
+            }
+        }
         if keep_develop {
             (p.develop, p.edited) = previous_develop;
         }
@@ -1461,11 +1569,13 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
             planned.insert(photo_id, p.clone());
         }
         if let Some(old) = s.catalog.photo(p.id) {
-            if old.kind != p.kind {
-                // Repair older imports with existing reversible operations. Removing just the
-                // record leaves album/stack membership intact; the enclosing batch is atomic.
+            if old.kind != p.kind || old.copy_name != p.copy_name {
+                // Repair older imports, and bring a changed Copy Name across (no op sets one), with existing
+                // reversible operations. Removing just the record leaves album/stack membership intact; the
+                // enclosing batch is atomic. The record's cached previews go with it, so they render again.
                 let mut repaired = (**old).clone();
                 repaired.kind = p.kind;
+                repaired.copy_name = p.copy_name.clone();
                 ops.extend([Op::RemovePhoto { id: p.id }, Op::AddPhoto { photo: Box::new(repaired) }]);
             }
             if was_local && promoted.insert(p.id) {
@@ -1503,6 +1613,15 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
             ops.push(Op::AddPhoto { photo: Box::new(p) });
         }
         by_path.entry(key(&src.path)).or_insert(photo_id);
+    }
+    if let Some(first) = untimed.first() {
+        let named: Vec<String> = untimed.iter().take(LEFT_OUT_NAMED).map(i64::to_string).collect();
+        let more = untimed.len() - named.len();
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        let which = if untimed.len() == 1 { format!("image {first}") } else { format!("images {}{more}", named.join(", ")) };
+        warnings.push(format!(
+            "{which}: Lightroom's last edit time is missing or not a date; photos with develop settings are dated at the import, the others keep any edit date they already had"
+        ));
     }
     let rows = first_of_each_collection(&data, &mut warnings);
     let mut albums = HashMap::new();
@@ -1861,18 +1980,19 @@ pub(crate) mod tests {
             source_id: 1,
             uuid: "test-master".into(),
             path: "/missing/test.ARW".into(),
-            image: row(json!({"id_local":1,"rating":5,"pick":1,"fileFormat":"ARW","fileWidth":20,"fileHeight":10})),
+            image: row(json!({"id_local":1,"rating":5,"pick":1,"fileFormat":"ARW","fileWidth":20,"fileHeight":10,"touchTime":814_504_925.0})),
             settings: "s = { Exposure2012 = 1.25, Contrast2012 = 17, CameraProfile = \"Example\" }".into(),
             xmp: String::new(),
             keywords: vec!["Travel|Goa".into()],
             history: vec![row(json!({"text":"s = { Exposure2012 = 0.5 }"}))],
             snapshots: Vec::new(),
             original: Original::Local,
+            as_shot_white: None,
         };
         let mut copy = photo.clone();
         copy.source_id = 2;
         copy.uuid = "test-copy".into();
-        copy.image = row(json!({"id_local":2,"masterImage":1,"copyName":"Mono","rating":2,"pick":-1}));
+        copy.image = row(json!({"id_local":2,"masterImage":1,"copyName":"Mono","rating":2,"pick":-1,"touchTime":814_504_925.0}));
         copy.settings = "s = { ConvertToGrayscale = true, Exposure2012 = -0.5 }".into();
         photo.image.insert("captureTime".into(), json!("2024-01-16T12:34:56"));
         CatalogImport {
@@ -2604,6 +2724,56 @@ pub(crate) mod tests {
             (Some("custom"), Some(3578.0), Some(-5.0))
         );
         assert!(!unknown.iter().any(|k| k.starts_with("Temperature")), "{unknown:?}");
+    }
+
+    /// Upstream #3906: a Custom white balance is shifted from the as-shot white the photo's history still holds, as
+    /// its text or compressed step; steps without the values, damaged steps and other photos' steps give none.
+    #[test]
+    fn a_custom_white_balance_is_shifted_from_the_as_shot_white_in_its_history() {
+        use crate::lightroom_fixture::{self as fixture, Table};
+        let custom = "s = { WhiteBalance = \"Custom\", Temperature = 3578, Tint = -5, Exposure2012 = 0.5 }";
+        let as_shot = "s = { WhiteBalance = \"As Shot\", Temperature = 3650, Tint = -2 }";
+        let bare = "s = { WhiteBalance = \"As Shot\" }";
+        let damaged = "s = { WhiteBalance = \"As Shot\", Temperature = 0, Tint = 1";
+        type Case = (&'static str, Vec<Vec<fixture::Field>>, Option<(f64, f64)>);
+        let cases: Vec<Case> = vec![
+            (
+                "text",
+                vec![fixture::history_step(1, 1, 1.0, "Import", fixture::text(bare)), fixture::history_step(2, 1, 2.0, "WB", fixture::text(as_shot))],
+                Some((3650.0, -2.0)),
+            ),
+            ("blob", vec![fixture::history_step(1, 1, 1.0, "WB", fixture::Field::Blob(fixture::compressed(as_shot)))], Some((3650.0, -2.0))),
+            ("bare", vec![fixture::history_step(1, 1, 1.0, "Import", fixture::text(bare))], None),
+            (
+                "damaged",
+                vec![
+                    fixture::history_step(1, 1, 1.0, "WB", fixture::Field::Blob(vec![0xff; 9])),
+                    fixture::history_step(2, 1, 2.0, "WB", fixture::text(damaged)),
+                    fixture::history_step(3, 2, 3.0, "Other photo", fixture::text(as_shot)),
+                ],
+                None,
+            ),
+        ];
+        for (tag, steps, expected) in cases {
+            let dir = fixture::dir(&format!("as-shot-white-{tag}"));
+            let mut tables = fixture::one_photo(&dir.join("originals"), custom);
+            tables.push(Table { name: "Adobe_libraryImageDevelopHistoryStep", columns: fixture::HISTORY_COLUMNS, rows: steps });
+            let catalog = dir.join("test.lrcat");
+            fixture::write(&catalog, &tables);
+            let imported = read(&catalog).unwrap();
+            assert_eq!(imported.photos[0].as_shot_white, expected, "{tag}: {:?}", imported.warnings);
+            let (partial, unknown) =
+                mapped_settings_from(custom, imported.photos[0].as_shot_white, crate::crs::Target::RawRelative, 1.5, Orientation::Normal, 1.5)
+                    .unwrap();
+            if expected.is_some() {
+                assert_eq!(partial["wb"]["mode"], "custom", "{partial}");
+                assert!(partial["wb"]["temp"].as_f64().is_some_and(|t| t.is_finite()), "{partial}");
+                assert!(!unknown.iter().any(|k| k.starts_with("Temperature")), "{unknown:?}");
+            } else {
+                assert_eq!(partial["wb"], json!({"mode": "asShot"}), "{partial}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -4566,6 +4736,7 @@ pub(crate) mod tests {
             ],
             snapshots: Vec::new(),
             original: Original::Local,
+            as_shot_white: None,
         };
         let data = CatalogImport {
             source: "test.lrcat".into(),
@@ -4624,6 +4795,7 @@ pub(crate) mod tests {
                 history: Vec::new(),
                 snapshots: Vec::new(),
                 original: Original::Local,
+                as_shot_white: None,
             }],
             collections: Vec::new(),
             members: Vec::new(),
@@ -4717,5 +4889,170 @@ pub(crate) mod tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// 2026-09-29T12:00:00Z and 2020-05-01T08:00:00Z, as Lightroom's `touchTime` (seconds since 2001-01-01T00:00:00Z)
+    /// and as Unix seconds. Smart albums are judged a day after `RECENT` ([`smart_album_photos`]).
+    const RECENT: (f64, i64) = (812_376_000.0, 1_790_683_200);
+    const OLD: (f64, i64) = (610_012_800.0, 1_588_320_000);
+    /// An imported photo's edit date, as Unix seconds.
+    fn edit_instant(s: &crate::Session, id: PhotoId) -> Option<i64> {
+        s.catalog.photo(id).unwrap().edited.as_deref().and_then(lcc_catalog::dates::instant)
+    }
+    /// A photo Lightroom holds no develop settings for.
+    fn plain_photo(source_id: i64, image: Value) -> CatalogPhoto {
+        let mut row = row(json!({"id_local":source_id,"fileFormat":"JPEG","fileWidth":20,"fileHeight":10}));
+        if let Value::Object(extra) = image {
+            row.extend(extra);
+        }
+        CatalogPhoto {
+            source_id,
+            uuid: format!("plain-{source_id}"),
+            path: format!("/missing/plain-{source_id}.jpg"),
+            image: row,
+            settings: String::new(),
+            xmp: String::new(),
+            keywords: Vec::new(),
+            history: Vec::new(),
+            snapshots: Vec::new(),
+            original: Original::Local,
+            as_shot_white: None,
+        }
+    }
+    /// `sample()` (a virtual copy, then its master) with a Copy Name on the master, Lightroom's edit times, a photo
+    /// with no develop settings (image 3), and smart collections that test both.
+    fn copy_name_and_edit_date_sample() -> CatalogImport {
+        let mut data = sample();
+        data.photos[0].image.insert("touchTime".into(), json!(OLD.0));
+        data.photos[1].image.insert("copyName".into(), json!("Web title"));
+        data.photos[1].image.insert("touchTime".into(), json!(RECENT.0));
+        data.photos.push(plain_photo(3, json!({"touchTime": RECENT.0})));
+        data.collections.push(row(json!({"id_local":11,"name":"Has Copy Name","creationId":"com.adobe.ag.library.smart_collection"})));
+        data.collections.push(row(json!({"id_local":12,"name":"Recently modified","creationId":"com.adobe.ag.library.smart_collection"})));
+        data.collection_content = vec![
+            row(json!({"collection":11,"owningModule":"ag.library.smart_collection",
+                "content":"s = { { criteria = \"copyname\", operation = \"notEmpty\" } }"})),
+            row(json!({"collection":12,"owningModule":"ag.library.smart_collection",
+                "content":"s = { { criteria = \"touchTime\", operation = \"inLast\", value = 2, value_units = \"days\" } }"})),
+        ];
+        data
+    }
+    /// A smart album's photos, judged a day after `RECENT`.
+    fn smart_album_photos(s: &crate::Session, name: &str) -> Vec<PhotoId> {
+        let album = s.catalog.albums().find(|a| a.name == name).unwrap();
+        assert!(album.is_smart(), "{name} is a smart album");
+        lcc_catalog::rules::set_now(lcc_catalog::dates::local(RECENT.1 + 86_400));
+        let photos = s.catalog.album_photos(album.id);
+        lcc_catalog::rules::set_now(None);
+        photos
+    }
+
+    #[test]
+    fn copy_names_come_across_for_every_photo() {
+        let mut s = crate::Session::new();
+        let r = apply(&mut s, copy_name_and_edit_date_sample(), false).unwrap();
+        let master = PhotoId(r["mapping"]["1"].as_u64().unwrap());
+        let copy = PhotoId(r["mapping"]["2"].as_u64().unwrap());
+        let plain = PhotoId(r["mapping"]["3"].as_u64().unwrap());
+        let m = s.catalog.photo(master).unwrap();
+        assert_eq!((m.copy_of, m.copy_name.as_deref()), (None, Some("Web title")), "a photo that isn't a virtual copy keeps its Copy Name");
+        let c = s.catalog.photo(copy).unwrap();
+        assert_eq!((c.copy_of, c.copy_name.as_deref()), (Some(master), Some("Mono")), "a virtual copy keeps its Copy Name");
+        assert_eq!(s.catalog.photo(plain).unwrap().copy_name, None, "a photo with no Copy Name gets none");
+        let named = smart_album_photos(&s, "Has Copy Name");
+        assert!(named.contains(&master) && named.contains(&copy) && !named.contains(&plain), "{named:?}");
+        assert_eq!(s.execute("photo.inspect", &json!({"id": master.0})).unwrap()["copy_name"], "Web title");
+    }
+
+    #[test]
+    fn each_photo_is_dated_at_its_last_edit_in_lightroom() {
+        let mut s = crate::Session::new();
+        let r = apply(&mut s, copy_name_and_edit_date_sample(), false).unwrap();
+        let id = |n: &str| PhotoId(r["mapping"][n].as_u64().unwrap());
+        let (master, copy, plain) = (id("1"), id("2"), id("3"));
+        assert_eq!(edit_instant(&s, master), Some(RECENT.1), "a photo with develop settings: Lightroom's edit time, not the import's");
+        assert_eq!(edit_instant(&s, copy), Some(OLD.1));
+        assert_eq!(edit_instant(&s, plain), Some(RECENT.1), "a photo with no develop settings is dated too");
+        assert!(!s.catalog.photo(plain).unwrap().is_edited(), "a date doesn't make a photo edited");
+        let recent = smart_album_photos(&s, "Recently modified");
+        assert!(recent.contains(&master) && recent.contains(&plain) && !recent.contains(&copy), "{recent:?}");
+        // an edit in the app dates the photo again (the test clock)
+        let mut settings = (*s.catalog.photo(plain).unwrap().develop).clone();
+        settings.light.exposure = 0.5;
+        s.set_develop(plain, settings, "Personal edit").unwrap();
+        assert_eq!(s.catalog.photo(plain).unwrap().edited.as_deref(), Some("2026-09-30T12:00:00"));
+    }
+
+    #[test]
+    fn a_missing_or_broken_lightroom_edit_time_never_fails_the_import() {
+        let mut s = crate::Session::new();
+        let mut data = sample();
+        // the master has develop settings and no `touchTime`; the plain photos have none and a broken one
+        let broken = [json!(0), json!(-5.0), json!("yesterday"), json!(1e15), json!(1e300), Value::Null];
+        for (n, t) in broken.iter().enumerate() {
+            data.photos.push(plain_photo(3 + n as i64, json!({"touchTime": t})));
+        }
+        data.photos.push(plain_photo(20, json!({})));
+        data.photos[0].image.insert("touchTime".into(), json!(OLD.0));
+        data.photos[1].image.remove("touchTime");
+        let r = apply(&mut s, data, false).unwrap();
+        let id = |n: i64| PhotoId(r["mapping"][n.to_string()].as_u64().unwrap());
+        assert_eq!(s.catalog.photo(id(1)).unwrap().edited.as_deref(), Some("2026-09-30T12:00:00"), "with settings: dated at the import");
+        for n in (3..3 + broken.len() as i64).chain([20]) {
+            assert_eq!(s.catalog.photo(id(n)).unwrap().edited, None, "image {n} without settings: no edit date");
+        }
+        assert_eq!(edit_instant(&s, id(2)), Some(OLD.1));
+        let warnings: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|w| w.contains("edit time")).collect();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        let named = warnings[0].strip_prefix("images ").and_then(|w| w.split(':').next()).unwrap_or_default();
+        assert_eq!(named, "1, 3, 4, 5, 6, 7, 8, 20", "the warning names each image whose time can't be read: {}", warnings[0]);
+    }
+
+    #[test]
+    fn a_photo_whose_settings_cant_be_read_is_still_dated_from_lightroom() {
+        let mut s = crate::Session::new();
+        let mut data = copy_name_and_edit_date_sample();
+        data.photos[2].settings = format!("{}0{}", "{".repeat(1000), "}".repeat(1000));
+        let r = apply(&mut s, data, false).unwrap();
+        let plain = PhotoId(r["mapping"]["3"].as_u64().unwrap());
+        assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().is_some_and(|w| w.starts_with("image 3 settings"))), "{r}");
+        assert_eq!(edit_instant(&s, plain), Some(RECENT.1));
+    }
+
+    #[test]
+    fn reimporting_brings_a_changed_copy_name_and_edit_time_across() {
+        let mut s = crate::Session::new();
+        let mut data = copy_name_and_edit_date_sample();
+        data.photos[1].image.insert("copyName".into(), json!("Old title"));
+        data.photos[1].image.insert("touchTime".into(), json!(OLD.0));
+        let r = apply(&mut s, data, false).unwrap();
+        let master = PhotoId(r["mapping"]["1"].as_u64().unwrap());
+        let album = s.catalog.albums().find(|a| a.name == "Keepers").unwrap().id;
+        assert!(s.catalog.album_photos(album).contains(&master));
+        let before = (**s.catalog.photo(master).unwrap()).clone();
+        let r = apply(&mut s, copy_name_and_edit_date_sample(), true).unwrap();
+        assert_eq!(r["mapping"]["1"], master.0, "the same record");
+        assert_eq!(s.catalog.photo(master).unwrap().copy_name.as_deref(), Some("Web title"));
+        assert_eq!(edit_instant(&s, master), Some(RECENT.1));
+        assert!(s.catalog.album_photos(album).contains(&master), "the photo stays in its album");
+        s.undo_step().unwrap();
+        assert_eq!(s.catalog.photo(master).unwrap().as_ref(), &before, "one undo step puts the earlier name and date back");
+        assert!(s.catalog.album_photos(album).contains(&master));
+    }
+
+    #[test]
+    fn a_photo_imported_without_settings_takes_lightrooms_later_ones() {
+        let mut s = crate::Session::new();
+        let data = copy_name_and_edit_date_sample();
+        let r = apply(&mut s, data.clone(), false).unwrap();
+        let plain = PhotoId(r["mapping"]["3"].as_u64().unwrap());
+        assert!(s.catalog.photo(plain).unwrap().edited.is_some(), "dated, though unedited");
+        // edited in Lightroom since, imported again without updating existing photos
+        let mut later = data;
+        later.photos[2].settings = "s = { Exposure2012 = 1.5 }".into();
+        let r = apply(&mut s, later, false).unwrap();
+        assert_eq!(s.catalog.photo(plain).unwrap().develop.light.exposure, 1.5, "Lightroom's settings apply");
+        // (this test's imports keep no index, so the virtual copy comes in again as a new photo)
+        assert_eq!(r["preservedExistingEdits"], 1, "only the master, imported with settings, keeps them: {r}");
     }
 }

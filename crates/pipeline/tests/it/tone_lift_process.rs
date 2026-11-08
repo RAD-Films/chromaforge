@@ -100,8 +100,8 @@ fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
         raw_centre(&bright, &whites(Process::V9, 100.0)),
     );
     assert!(v9 > flat && v9 - flat < v7 - flat, "a bright raw: V9 lifts {flat} to {v9}, less than V7's {v7}");
-    // Whites down and older processes keep the tone map's response
-    assert_eq!(raw_centre(&bright, &whites(Process::V9, -100.0)), raw_centre(&bright, &whites(Process::V7, -100.0)));
+    // Whites down keeps the tone map's response (V8's, which V9 is built on)
+    assert_eq!(raw_centre(&bright, &whites(Process::V9, -100.0)), raw_centre(&bright, &whites(Process::V8, -100.0)));
 }
 
 /// A wall at `dark` EV over grey on the left half, a window at `bright` EV on the right, `w` × `w / 2`.

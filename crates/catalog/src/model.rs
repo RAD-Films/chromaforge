@@ -198,11 +198,20 @@ pub struct Meta {
     /// two bodies of one model apart for their own camera profiles ([`Meta::camera_model`] says the model).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub camera_serial: String,
+    /// The lens maker (Exif `LensMake`), written back on export. Left out of the catalog JSON when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lens_make: String,
     pub lens: String,
     pub focal_mm: Option<f32>,
     pub aperture: Option<f32>,
     pub shutter: String,
     pub iso: Option<u32>,
+    /// Whether the flash fired (Exif `Flash`); `None` when the file does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash: Option<bool>,
+    /// Exposure compensation in EV (Exif `ExposureBiasValue`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure_bias: Option<f32>,
     /// The lens's focal range (mm, shortest and longest), from the file's LensSpecification: the loupe's shot info
     /// adds it to a lens name that doesn't say it (OneSlips PERF-CULL-7 a5f6da85e). Left out of the catalog JSON when
     /// unknown, so older catalogs read unchanged.
@@ -360,7 +369,8 @@ pub struct Photo {
     /// settings, metadata and history).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_of: Option<PhotoId>,
-    /// Virtual copies' name ("Copy 1").
+    /// Copy Name: a virtual copy's name ("Copy 1"), or any photo's that a Lightroom catalog gave one (some people
+    /// use it as a short title). Whether a photo is a virtual copy is [`Photo::copy_of`], not this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_name: Option<String>,
     /// The settings import gave the photo when a user default (a raw/JPEG default preset, see
@@ -749,6 +759,11 @@ impl Photo {
             defaults.wb = self.develop.wb;
         }
         *self.develop != defaults && !self.develop.is_unedited()
+    }
+    /// The name a virtual copy is shown with (its Copy Name), and `None` for a photo that isn't one, whatever Copy
+    /// Name it carries.
+    pub fn virtual_copy_name(&self) -> Option<&str> {
+        self.copy_of.and(self.copy_name.as_deref())
     }
     /// Capture time if known, else import time (sort key).
     pub fn date(&self) -> &str {
