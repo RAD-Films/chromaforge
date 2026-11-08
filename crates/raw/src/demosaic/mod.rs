@@ -133,7 +133,9 @@ pub fn demosaic_with(n: &Normalized, method: Method, opts: Options) -> Rgb32f {
                 return match method {
                     Method::Bilinear => bilinear::bilinear(&m),
                     Method::Ppg => xtrans::directional(&m),
-                    Method::Ahd | Method::AhdBlend | Method::Detail => xtrans_ri::demosaic(&m, opts.balance).unwrap_or_else(|| xtrans::directional(&m)),
+                    Method::Ahd | Method::AhdBlend | Method::Detail => {
+                        xtrans_ri::demosaic(&m, opts.balance).unwrap_or_else(|| xtrans::directional(&m))
+                    }
                 };
             }
             if w < 4 || h < 4 {

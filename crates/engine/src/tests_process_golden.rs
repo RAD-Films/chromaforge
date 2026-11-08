@@ -35,16 +35,11 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 }
 
 fn golden_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/process-golden")
-        .join(format!("{}-{}.json", std::env::consts::OS, std::env::consts::ARCH))
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/process-golden").join(format!("{}-{}.json", std::env::consts::OS, std::env::consts::ARCH))
 }
 
 fn corpus_dir() -> PathBuf {
-    lcc_brand::env_os("CORPUS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
-        .join("raw")
+    lcc_brand::env_os("CORPUS").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus")).join("raw")
 }
 
 /// The edits every picture is rendered with, as (name, settings, request).
