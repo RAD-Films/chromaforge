@@ -72,6 +72,26 @@ const MAX_SHIFT: f32 = 8.0;
 /// How far (EV) the +100 Shadows curve may darken a tone, and the −100 Highlights curve brighten one.
 const SIGN_SLACK: f32 = 0.5;
 
+/// A raw's display white for Highlights (EV over grey): 8-bit level 254 of an sRGB export. (At level 250, the
+/// near-white tones the curves were fitted on took the pull too: bright frames' near-white went −0.5 EV where
+/// Lightroom's went −0.1.)
+const SHOWN_WHITE: f32 = 2.461;
+/// Highlights down on a raw's tones at and above its display white, which the curves can't reach: they are read
+/// at the shown tone, and the camera curve holds every tone past white at white, so a window in a dark room kept
+/// its one shift and stayed white. Lightroom pulls those tones down by a scene shift that grows with how dark the
+/// picture is: `ABOVE_WHITE_BASE + ABOVE_WHITE_DARK × (share of tones over 2 EV under the scene's mid grey)`, at
+/// the Highlights amounts [`ABOVE_WHITE_AT`] ([`highlights_gain`] of 0, −50 and −100), linear in between. Measured
+/// on our R5 C raws (rounds 9b and 10, OneSlips, Nov 2026), all on Lightroom's side: each pixel white at zero
+/// sliders got its scene tone from Lightroom's Exposure −1/−2/−3 exports (its response recovered from those
+/// brackets), and its Highlights output the scene shift it takes. Only pixels Lightroom brings under level 250
+/// count; a shot whose whites it leaves white counts as no pull (a white output only bounds the shift, and taking
+/// the bound put a −1.45 EV pull on every bright frame). 37–38 shots. Lightroom's HDR exports (no clip) agree: a
+/// frame with no dark tones gets about none, one half dark about −1.4 EV. A window in a dark interior needs −3.4 to
+/// −5.3 EV; CF gave −0.9 to −2.6.
+const ABOVE_WHITE_AT: [f32; 3] = [0.0, 0.46, 1.0];
+const ABOVE_WHITE_BASE: [f32; 3] = [0.0, -0.13, -0.74];
+const ABOVE_WHITE_DARK: [f32; 3] = [0.0, -3.32, -4.47];
+
 /// A histogram feature: a percentile relative to the 99th, the 99th itself, the share of tones under `−k` EV, or the
 /// share of tones over `k` EV (how much of a raw shows white, which its percentiles, all at white, can't tell).
 #[derive(Clone, Copy, Debug)]
@@ -112,7 +132,7 @@ pub(crate) struct Model {
 
 /// The tones of a picture (EV over grey, sorted, at least one).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Tones(Vec<f32>);
+pub struct Tones(Vec<f32>, Option<f32>);
 
 impl Tones {
     /// The finite tones of `ev` (each at least [`EV_FLOOR`]); `None` when none is finite.
@@ -122,7 +142,13 @@ impl Tones {
             return None;
         }
         v.sort_unstable_by(f32::total_cmp);
-        Some(Tones(v))
+        Some(Tones(v, None))
+    }
+
+    /// The same tones with a raw's clip tone `clip` (EV): the tone its sensor-clipped pixels show at, `None` for none.
+    pub fn with_clip(mut self, clip: Option<f32>) -> Tones {
+        self.1 = clip.filter(|c| c.is_finite());
+        self
     }
 
     /// The `q`th percentile (0–100), linearly interpolated between the sorted tones (numpy's default).
@@ -145,7 +171,7 @@ impl Tones {
     fn mapped(&self, f: impl Fn(f32) -> f32) -> Tones {
         let mut v: Vec<f32> = self.0.iter().map(|&e| f(e)).map(|e| if e.is_finite() { e.max(EV_FLOOR) } else { EV_FLOOR }).collect();
         v.sort_unstable_by(f32::total_cmp);
-        Tones(v)
+        Tones(v, self.1.map(&f))
     }
 }
 
@@ -237,20 +263,92 @@ fn highlights_gain(h: f32) -> f32 {
     if h <= 0.0 { g } else { -HIGHLIGHTS_UP_SCALE * g }
 }
 
-/// The shift (EV) of each base-layer tone for a picture: [`LIFT_N`] values from [`LIFT_LO`].
+/// The shift (EV) of each base-layer tone for a picture, as two tables of [`LIFT_N`] values from [`LIFT_LO`]: Shadows'
+/// part (`0`, with the pair's correction) and Highlights' (`2`, with a raw's Whites). They are read at different bases
+/// ([`crate::local::NarrowBase`]): Shadows at the brighter of the picture's base and the narrow one, Highlights at the
+/// darker, so neither spreads across an edge into the other region. `1`: a raw's past-white term.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Lift(pub Vec<f32>);
+pub struct Lift(pub Vec<f32>, pub Option<Regional>, pub Vec<f32>);
+
+/// Highlights down on a raw's tones past its display white, read at the picture's wide base
+/// ([`crate::local::wide_sigma`]) rather than the tone table: a gain of `amp` EV weighted by how far the wide base
+/// sits past white, from none [`REGION_BELOW`] EV under white to all of it [`REGION_ABOVE`] EV over, and back to none
+/// at the raw's clip tone (a clipped sun stays white, as Lightroom keeps it). Read at the wide base, the gain is nearly
+/// constant inside a bright region, so a sky's gradient keeps its slope instead of folding where its tones cross white.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Regional {
+    pub amp: f32,
+    pub rise: (f32, f32),
+    pub fall: Option<(f32, f32)>,
+}
+
+impl Regional {
+    /// The gain (EV, ≤ 0) at wide-base tone `wb`.
+    #[inline]
+    pub fn at(&self, wb: f32) -> f32 {
+        if !wb.is_finite() {
+            return 0.0;
+        }
+        let up = smoothstep(self.rise.0, self.rise.1, wb);
+        let down = match self.fall {
+            Some((a, b)) => 1.0 - smoothstep(a, b, wb),
+            None => 1.0,
+        };
+        let v = self.amp * up * down;
+        if v.is_finite() { v.clamp(-MAX_SHIFT, 0.0) } else { 0.0 }
+    }
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    if e1 <= e0 {
+        return if x >= e1 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// [`Regional`]: the wide base's tones under white (EV) where the pull starts, and over white where it is complete.
+const REGION_BELOW: f32 = 1.0;
+const REGION_ABOVE: f32 = 1.0;
+/// [`Regional`]: the least slope of a tone's output against its own tone where the wide base follows it (a sky ramp
+/// filling the frame): the pull's rise is spread over enough tones that the ramp keeps this much of its slope, so it
+/// never folds into a contour.
+const REGION_MIN_SLOPE: f32 = 0.3;
+/// [`Regional`]: the tones under the raw's clip tone (EV) over which the pull eases back to none.
+const REGION_FALL: f32 = 1.5;
+/// A raw counts as clipped when at least this share of its pixels hold its brightest channel value (within
+/// [`CLIP_BAND`] of it, before white balance): a sensor's clip piles pixels up at one value, a bright window that
+/// isn't clipped doesn't.
+const CLIP_SHARE: f32 = 0.002;
+const CLIP_BAND: f32 = 0.995;
+
+/// Table `v`'s entry at tone `ev` (linear between entries, the ends held).
+#[inline]
+fn table_at(v: &[f32], ev: f32) -> f32 {
+    let f = ((ev - LIFT_LO) / LIFT_STEP).clamp(0.0, (LIFT_N - 1) as f32);
+    let f = if f.is_finite() { f } else { 0.0 };
+    let i = (f as usize).min(LIFT_N - 2);
+    let t = f - i as f32;
+    let (a, b) = (v.get(i).copied().unwrap_or(0.0), v.get(i + 1).copied().unwrap_or(0.0));
+    a + (b - a) * t
+}
 
 impl Lift {
-    /// The shift at tone `ev` (linear between entries, the ends held).
+    /// Shadows' shift at tone `ev` (linear between entries, the ends held).
     #[inline]
     pub fn at(&self, ev: f32) -> f32 {
-        let f = ((ev - LIFT_LO) / LIFT_STEP).clamp(0.0, (LIFT_N - 1) as f32);
-        let f = if f.is_finite() { f } else { 0.0 };
-        let i = (f as usize).min(LIFT_N - 2);
-        let t = f - i as f32;
-        let (a, b) = (self.0.get(i).copied().unwrap_or(0.0), self.0.get(i + 1).copied().unwrap_or(0.0));
-        a + (b - a) * t
+        table_at(&self.0, ev)
+    }
+
+    /// Highlights' shift at tone `ev`.
+    #[inline]
+    pub fn at_h(&self, ev: f32) -> f32 {
+        table_at(&self.2, ev)
+    }
+
+    /// The whole shift at tone `ev` where both parts are read at the same base.
+    pub fn at_both(&self, ev: f32) -> f32 {
+        self.at(ev) + self.at_h(ev)
     }
 
     /// The table for tones `t` (scene EV) at slider fractions `shadows`, `highlights` (−1 to 1). `display` maps a
@@ -286,37 +384,97 @@ impl Lift {
         let gb = gs.max(0.0) * gh.max(0.0);
         // Shadows +100 never darkens much and Highlights −100 never brightens much (a fit's tail can say otherwise)
         let cw = whites::WHITES_UP_RAW.curve(td);
-        let shift = |d: f32| {
-            let pair = match &both {
-                Some(b) if gb > 0.0 => gb * b.at(d),
-                _ => 0.0,
-            };
-            gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d) + pair
+        let pair = |d: f32| match &both {
+            Some(b) if gb > 0.0 => gb * b.at(d),
+            _ => 0.0,
         };
-        let v = (0..LIFT_N)
-            .map(|i| {
-                let e = LIFT_LO + LIFT_STEP * i as f32;
-                // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
-                let s = match display {
-                    None => shift(e),
-                    Some(d) => scene_shift(d, e, shift(d(e).max(RAW_FIT_LOW))),
-                };
-                if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
-            })
-            .collect::<Vec<f32>>();
-        // tones keep their order: a darker tone never ends up brighter than a lighter one
-        let mut top = f32::MIN;
-        let v = v
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let e = LIFT_LO + LIFT_STEP * i as f32;
-                top = top.max(e + s);
-                (top - e).clamp(-MAX_SHIFT, MAX_SHIFT)
-            })
-            .collect();
-        Lift(v)
+        let s_part = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + pair(d);
+        let h_part = |d: f32| gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d);
+        // a raw's tones past its display white: Lightroom's pull for them ([`ABOVE_WHITE_BASE`]), read at the wide base
+        let region = display.and_then(|d| regional(t, d, gh));
+        // each part on its own: smoothed to a curvature cap, then with tones kept in order
+        let table = |shift: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            let v = (0..LIFT_N)
+                .map(|i| {
+                    let e = LIFT_LO + LIFT_STEP * i as f32;
+                    // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
+                    let s = match display {
+                        None => shift(e),
+                        Some(d) => scene_shift(d, e, shift(d(e).max(RAW_FIT_LOW))),
+                    };
+                    if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
+                })
+                .collect::<Vec<f32>>();
+            // tones keep their order: a darker tone never ends up brighter than a lighter one
+            let mut top = f32::MIN;
+            smooth_to_curvature(&v)
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let e = LIFT_LO + LIFT_STEP * i as f32;
+                    top = top.max(e + s);
+                    (top - e).clamp(-MAX_SHIFT, MAX_SHIFT)
+                })
+                .collect()
+        };
+        Lift(table(&s_part), region, table(&h_part))
     }
+}
+
+/// Most curvature (change of slope per EV) of tone + shift the table keeps between [`CURVE_FROM`] and [`CURVE_TO`] EV.
+/// A table can be smooth and still bend sharply: 433's Highlights -100 took the slope of its sky from 1.0 down to 0.4
+/// and back up to 1.2 within an EV around white, a dark and a bright ring around the sun (curvature 1.3 / EV).
+const MAX_CURVATURE: f32 = 0.4;
+const CURVE_FROM: f32 = -8.0;
+const CURVE_TO: f32 = 5.0;
+/// The widest smoothing [`smooth_to_curvature`] reaches for (EV, a Gaussian's sigma).
+const TABLE_SMOOTH_MAX: f32 = 1.2;
+
+/// The largest |curvature| of tone + shift of table `v` over [`CURVE_FROM`]..[`CURVE_TO`] EV.
+fn max_curvature(v: &[f32]) -> f32 {
+    let i0 = (((CURVE_FROM - LIFT_LO) / LIFT_STEP).max(1.0)) as usize;
+    let i1 = (((CURVE_TO - LIFT_LO) / LIFT_STEP) as usize).min(v.len().saturating_sub(2));
+    (i0..i1.max(i0))
+        .filter_map(|i| Some((v.get(i + 1)? - 2.0 * v.get(i)? + v.get(i - 1)?) / (LIFT_STEP * LIFT_STEP)))
+        .filter(|c| c.is_finite())
+        .fold(0.0f32, |m, c| m.max(c.abs()))
+}
+
+/// `v` smoothed by [`TABLE_SMOOTH`], or by the least wider Gaussian (steps of a quarter, up to [`TABLE_SMOOTH_MAX`])
+/// that keeps its curvature under [`MAX_CURVATURE`]: a table without sharp bends keeps its fitted shape.
+fn smooth_to_curvature(v: &[f32]) -> Vec<f32> {
+    let mut sigma = TABLE_SMOOTH;
+    loop {
+        let s = smoothed(v, sigma);
+        if max_curvature(&s) <= MAX_CURVATURE || sigma >= TABLE_SMOOTH_MAX {
+            return s;
+        }
+        sigma = (sigma * 1.25).min(TABLE_SMOOTH_MAX);
+    }
+}
+
+/// Width (EV, a Gaussian's sigma) the table is smoothed over before tones are put back in order. The table sums
+/// piecewise-linear curves whose knots sit at different tones (each block's own percentile), so its slope steps every
+/// few tenths of an EV; read at a smooth base, every step drew an arc across a smooth wall (round 10, 6719: Lightroom's
+/// change on that wall is one smooth hump). Smoothed, those steps go.
+const TABLE_SMOOTH: f32 = 0.35;
+
+/// `v` (one value per [`LIFT_STEP`]) smoothed by a Gaussian of `sigma` EV, the ends held.
+fn smoothed(v: &[f32], sigma: f32) -> Vec<f32> {
+    let r = (3.0 * sigma / LIFT_STEP).ceil() as isize;
+    if r <= 0 || v.is_empty() {
+        return v.to_vec();
+    }
+    let k: Vec<f32> = (-r..=r).map(|i| (-0.5 * (i as f32 * LIFT_STEP / sigma).powi(2)).exp()).collect();
+    let sum: f32 = k.iter().sum();
+    let n = v.len() as isize;
+    (0..n)
+        .map(|i| {
+            let acc: f32 = (-r..=r).zip(&k).map(|(j, w)| w * v.get((i + j).clamp(0, n - 1) as usize).copied().unwrap_or(0.0)).sum();
+            let x = acc / sum;
+            if x.is_finite() { x } else { 0.0 }
+        })
+        .collect()
 }
 
 /// Knots of the Whites curve: `E − P` from `knot_lo` EV in steps of 0.5.
@@ -367,6 +525,60 @@ impl WhitesCurve {
         let (a, b) = (self.k.get(i).copied().unwrap_or(0.0), self.k.get(i + 1).copied().unwrap_or(0.0));
         a + (b - a) * t
     }
+}
+
+/// The scene tone (EV) at which the increasing display mapping `d` shows `shown`, or `None` where it never does
+/// within the table's range.
+fn scene_tone_showing(d: &dyn Fn(f32) -> f32, shown: f32) -> Option<f32> {
+    let (mut lo, mut hi) = (LIFT_LO, LIFT_LO + LIFT_STEP * (LIFT_N - 1) as f32);
+    if !(d(lo) <= shown && shown <= d(hi)) {
+        return None;
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if d(mid) < shown {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let e = 0.5 * (lo + hi);
+    e.is_finite().then_some(e)
+}
+
+/// For a raw (display mapping `d`) at Highlights gain `gh`: the scene tone its display white sits at, and the
+/// scene shift Lightroom gives the tones from there up ([`ABOVE_WHITE_BASE`]) and its dark-picture part; `None` when Highlights doesn't darken, or the
+/// picture's camera curve never reaches white.
+fn above_white(t: &Tones, d: &dyn Fn(f32) -> f32, gh: f32) -> Option<(f32, f32, f32)> {
+    let g = finite(gh).clamp(0.0, 1.0);
+    if g <= 0.0 {
+        return None;
+    }
+    let white = scene_tone_showing(d, SHOWN_WHITE)?;
+    let grey = scene_tone_showing(d, 0.0)?;
+    let dark = t.below(grey - 2.0);
+    let at = |k: &[f32; 3]| {
+        let i = if g <= ABOVE_WHITE_AT[1] { 0 } else { 1 };
+        let (lo, hi) = (ABOVE_WHITE_AT.get(i).copied().unwrap_or(0.0), ABOVE_WHITE_AT.get(i + 1).copied().unwrap_or(1.0));
+        let f = if hi > lo { (g - lo) / (hi - lo) } else { 0.0 };
+        let (a, b) = (k.get(i).copied().unwrap_or(0.0), k.get(i + 1).copied().unwrap_or(0.0));
+        a + (b - a) * f
+    };
+    let part = at(&ABOVE_WHITE_DARK) * dark;
+    let pull = at(&ABOVE_WHITE_BASE) + part;
+    (pull.is_finite() && part.is_finite()).then_some((white, pull.clamp(-MAX_SHIFT, 0.0), part.clamp(-MAX_SHIFT, 0.0)))
+}
+
+/// The regional pull of a raw (display mapping `d`) with tones `t` at Highlights gain `gh` ([`Regional`]).
+fn regional(t: &Tones, d: &dyn Fn(f32) -> f32, gh: f32) -> Option<Regional> {
+    let (white, pull, _) = above_white(t, d, gh)?;
+    if pull >= 0.0 {
+        return None;
+    }
+    let fall = t.1.map(|clip| (clip - REGION_FALL, clip));
+    // a smoothstep's steepest slope is 1.5 / its width
+    let width = (REGION_BELOW + REGION_ABOVE).max(1.5 * -pull / (1.0 - REGION_MIN_SLOPE));
+    Some(Regional { amp: pull, rise: (white - REGION_BELOW, white - REGION_BELOW + width), fall })
 }
 
 /// A raw's scene shift at scene tone `e` for the displayed shift `shown` of its displayed tone `d(e)`.
@@ -444,8 +656,20 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
         return Some(t.clone());
     }
     let mut img = Rgb32f::clone(&frame_proxy(src, frame, w, h));
+    // a raw's clipped pixels: those at its brightest channel value before white balance
+    let peak = |c: &[f32; 3]| c[0].max(c[1]).max(c[2]);
+    let top = img.data.iter().map(peak).filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+    let clipped: Vec<bool> = img.data.iter().map(|c| info.raw && top > 0.0 && peak(c) >= CLIP_BAND * top).collect();
     white_balance(&mut img, info, s);
-    let t = Arc::new(Tones::new(img.data.iter().map(|c| log_lum(*c) + ev))?);
+    let n_clip = clipped.iter().filter(|c| **c).count();
+    let clip = if n_clip as f32 >= CLIP_SHARE * img.data.len().max(1) as f32 {
+        let mut v: Vec<f32> = img.data.iter().zip(&clipped).filter(|(_, c)| **c).map(|(p, _)| log_lum(*p) + ev).filter(|e| e.is_finite()).collect();
+        v.sort_unstable_by(f32::total_cmp);
+        v.get(v.len() / 2).copied()
+    } else {
+        None
+    };
+    let t = Arc::new(Tones::new(img.data.iter().map(|c| log_lum(*c) + ev))?.with_clip(clip));
     *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, t.clone()));
     Some(t)
 }
@@ -512,27 +736,30 @@ mod tests {
     fn shadows_lift_darks_and_highlights_pull_brights() {
         let t = picture();
         let s = Lift::new(&t, 1.0, 0.0, None);
-        assert!(s.at(-5.0) > 0.4, "Shadows +100 lifts a dark tone: {}", s.at(-5.0));
-        assert!(s.at(2.0).abs() < s.at(-5.0) * 0.5, "and leaves the brightest mostly alone");
+        assert!(s.at_both(-5.0) > 0.4, "Shadows +100 lifts a dark tone: {}", s.at_both(-5.0));
+        assert!(s.at_both(2.0).abs() < s.at_both(-5.0) * 0.5, "and leaves the brightest mostly alone");
         let h = Lift::new(&t, 0.0, -1.0, None);
-        assert!(h.at(1.5) < -0.3, "Highlights −100 pulls a bright tone down: {}", h.at(1.5));
-        assert!(h.at(-5.0).abs() < h.at(1.5).abs() * 0.2, "and the darks much less: {}", h.at(-5.0));
+        assert!(h.at_both(1.5) < -0.3, "Highlights −100 pulls a bright tone down: {}", h.at_both(1.5));
+        assert!(h.at_both(-5.0).abs() < h.at_both(1.5).abs() * 0.2, "and the darks much less: {}", h.at_both(-5.0));
         // the slider's other side goes the other way
-        assert!(Lift::new(&t, -1.0, 0.0, None).at(-5.0) < 0.0);
-        assert!(Lift::new(&t, 0.0, 1.0, None).at(1.5) > 0.0);
+        assert!(Lift::new(&t, -1.0, 0.0, None).at_both(-5.0) < 0.0);
+        assert!(Lift::new(&t, 0.0, 1.0, None).at_both(1.5) > 0.0);
         // and half the slider does about half
-        let half = Lift::new(&t, 0.5, 0.0, None).at(-5.0);
-        assert!((half / s.at(-5.0) - 0.46).abs() < 0.01, "{half}");
+        let half = Lift::new(&t, 0.5, 0.0, None).at_both(-5.0);
+        // (0.46 of the curve; the full slider's table bends more, so it is smoothed wider and its peak drops more:
+        // half the slider keeps 0.50 of it here)
+        assert!((half / s.at_both(-5.0) - 0.48).abs() < 0.03, "{half}");
     }
 
     #[test]
     fn matches_the_fitted_reference() {
-        // the Python reference (fit/final6 + refcurve.design) on `picture()`: shift (EV) at -5, -2, 0, 1.5
+        // the Python reference (fit/final6 + refcurve.design) on `picture()`, its table smoothed to the curvature cap
+        // ([`smooth_to_curvature`]) and kept in order: shift (EV) at -5, -2, 0, 1.5
         let s = Lift::new(&picture(), 1.0, 0.0, None);
         let h = Lift::new(&picture(), 0.0, -1.0, None);
         for (e, want_s, want_h) in GOLDEN {
-            assert!((s.at(e) - want_s).abs() < 2e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
-            assert!((h.at(e) - want_h).abs() < 2e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
+            assert!((s.at_both(e) - want_s).abs() < 2e-3, "shadows at {e}: {} vs {want_s}", s.at_both(e));
+            assert!((h.at_both(e) - want_h).abs() < 2e-3, "highlights at {e}: {} vs {want_h}", h.at_both(e));
         }
     }
 
@@ -549,24 +776,25 @@ mod tests {
     fn a_picture_unlike_the_fitted_ones_gets_a_guarded_curve() {
         let (s, h) = (Lift::new(&far_picture(), 1.0, 0.0, None), Lift::new(&far_picture(), 0.0, -1.0, None));
         for (e, want_s, want_h) in GOLDEN_FAR {
-            assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
-            assert!((h.at(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
+            assert!((s.at_both(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at_both(e));
+            assert!((h.at_both(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at_both(e));
         }
         for l in [&s, &h] {
             assert!(l.0.iter().enumerate().all(|(i, v)| i == 0 || LIFT_STEP + v >= l.0[i - 1] - 1e-5), "monotone");
         }
     }
 
-    const GOLDEN_FAR: [(f32, f32, f32); 4] = [(-8.0, -0.5, -0.42068), (-4.0, 1.84084, 0.06388), (0.0, 1.04332, -0.72077), (1.5, 0.09962, -0.96107)];
+    const GOLDEN_FAR: [(f32, f32, f32); 4] =
+        [(-8.0, -0.28447, -0.37753), (-4.0, 1.91148, 0.08584), (0.0, 0.75536, -0.55538), (1.5, 0.27279, -1.00346)];
 
-    const GOLDEN: [(f32, f32, f32); 4] = [(-5.0, 1.13535, -0.16782), (-2.0, 0.27426, -0.49203), (0.0, -0.01171, -0.82795), (1.5, -0.06334, -1.70216)];
+    const GOLDEN: [(f32, f32, f32); 4] = [(-5.0, 0.97033, -0.17011), (-2.0, 0.26340, -0.54558), (0.0, 0.03489, -1.08222), (1.5, -0.04849, -1.95687)];
 
     #[test]
     fn a_raw_keeps_the_order_of_tones_past_the_camera_curves_white() {
         // a camera curve that clips 2 EV over grey: every scene tone above shows as white
         let d = |e: f32| e.min(2.0);
         let l = Lift::new(&picture(), 0.0, -1.0, Some(&d));
-        let (a, b) = (3.0 + l.at(3.0), 5.0 + l.at(5.0));
+        let (a, b) = (3.0 + l.at_both(3.0), 5.0 + l.at_both(5.0));
         assert!(b - a > 1.9, "tones past white stay apart: {a} and {b}");
     }
 
@@ -579,32 +807,152 @@ mod tests {
         let one = |e: f32| e;
         let shown = Lift::new(&t.mapped(d), 1.0, 0.0, Some(&one));
         for e in [-6.0, -3.0, 0.0] {
-            assert!((raw.at(e) - shown.at(e + 1.0)).abs() < 1e-3, "{e}: {} vs {}", raw.at(e), shown.at(e + 1.0));
+            assert!((raw.at_both(e) - shown.at_both(e + 1.0)).abs() < 1e-3, "{e}: {} vs {}", raw.at_both(e), shown.at_both(e + 1.0));
+        }
+    }
+
+    /// A camera curve that holds every tone past `white` at white, 1:1 below it.
+    fn shoulder(white: f32) -> impl Fn(f32) -> f32 {
+        move |e: f32| e.min(white)
+    }
+
+    /// Tones `n` of which in every hundred sit 4 EV under grey, the rest at grey, and a window 1.5 EV past white.
+    fn room(dark_pct: usize) -> Tones {
+        let v = (0..100).map(|i| {
+            if i < dark_pct {
+                -4.0
+            } else if i < 97 {
+                0.0
+            } else {
+                SHOWN_WHITE + 1.5
+            }
+        });
+        Tones::new(v.collect::<Vec<f32>>()).unwrap()
+    }
+
+    /// A tone's output where the wide base follows it (a ramp filling the frame): its own tone, the table's shift and
+    /// the regional pull.
+    fn ramp_out(l: &Lift, e: f32) -> f32 {
+        e + l.at_both(e) + l.1.as_ref().map_or(0.0, |r| r.at(e))
+    }
+
+    #[test]
+    fn highlights_pull_tones_past_white_more_in_a_dark_picture() {
+        let d = shoulder(SHOWN_WHITE);
+        let window = SHOWN_WHITE + 1.5;
+        let (bright, dark) = (Lift::new(&room(0), 0.0, -1.0, Some(&d)), Lift::new(&room(80), 0.0, -1.0, Some(&d)));
+        let (rb, rd) = (bright.1.clone().unwrap(), dark.1.clone().unwrap());
+        // the fitted pull: more in a dark room, read at a window's wide base
+        let wanted = |dark_share: f32| ABOVE_WHITE_BASE[2] + ABOVE_WHITE_DARK[2] * dark_share;
+        assert!((rb.amp - wanted(0.0)).abs() < 1e-4 && (rd.amp - wanted(0.8)).abs() < 1e-4, "{} {}", rb.amp, rd.amp);
+        // (it eases in over a span wide enough to keep a sky's slope, so a window just past white gets part of it)
+        assert!(rd.at(window) < rb.at(window), "{} {}", rd.at(window), rb.at(window));
+        assert!((rd.at(rd.rise.1 + 0.1) - rd.amp).abs() < 1e-4 && rd.amp < -1.0, "{} {}", rd.at(rd.rise.1 + 0.1), rd.amp);
+        // nothing far under white, and never brighter
+        assert_eq!(rd.at(SHOWN_WHITE - 1.5), 0.0);
+        assert!((-30..60).all(|i| rd.at(i as f32 * 0.1) <= 0.0));
+        // half the slider: less of it
+        let half = Lift::new(&room(80), 0.0, -0.5, Some(&d));
+        assert!(half.1.as_ref().unwrap().amp > rd.amp && half.1.as_ref().unwrap().amp < 0.0);
+        // Highlights up, none, or a display-referred picture: no pull
+        for (h, disp) in [(0.5, true), (0.0, true), (-1.0, false)] {
+            let l = if disp { Lift::new(&room(80), 0.0, h, Some(&d)) } else { Lift::new(&room(80), 0.0, h, None) };
+            assert!(l.1.is_none(), "h {h} raw {disp}");
+        }
+        // a camera curve that never reaches white: none either
+        let dim = |e: f32| e.min(1.0);
+        assert!(above_white(&room(80), &dim, 1.0).is_none());
+    }
+
+    #[test]
+    fn a_sky_ramp_crossing_white_keeps_its_slope() {
+        // a smooth sky filling the frame, so the wide base follows each tone: no tone may fold back under a darker
+        // one (the contour v4's step drew across a sky), at any dark share or slider amount
+        let d = shoulder(SHOWN_WHITE);
+        for dark in [0, 30, 60, 90] {
+            for h in [-0.3, -0.6, -1.0] {
+                let l = Lift::new(&room(dark), 0.0, h, Some(&d));
+                let step = 0.01;
+                for i in 0..800 {
+                    let e = SHOWN_WHITE - 3.0 + i as f32 * step;
+                    let slope = (ramp_out(&l, e + step) - ramp_out(&l, e)) / step;
+                    let table = (e + step + l.at_both(e + step) - e - l.at_both(e)) / step;
+                    // the regional pull takes at most its share of the table's slope, and nothing folds
+                    assert!(slope >= table - (1.0 - REGION_MIN_SLOPE) - 0.02, "dark {dark} % h {h}: slope {slope} (table {table}) at {e}");
+                    assert!(slope > -1e-3, "dark {dark} % h {h}: folds at {e} (slope {slope})");
+                }
+            }
         }
     }
 
     #[test]
+    fn a_clipped_sun_stays_white() {
+        // a raw whose brightest tones pile up at the sensor's clip (a sun): the pull eases back to none there, so the
+        // sun isn't pulled into a grey disc
+        let d = shoulder(SHOWN_WHITE);
+        let sun = SHOWN_WHITE + 4.0;
+        let t = Tones::new((0..1000).map(|i| {
+            if i < 600 {
+                -4.0
+            } else if i < 990 {
+                0.0
+            } else {
+                sun
+            }
+        }))
+        .unwrap()
+        .with_clip(Some(sun));
+        let l = Lift::new(&t, 0.0, -1.0, Some(&d));
+        let r = l.1.as_ref().unwrap();
+        assert!(r.fall.is_some());
+        assert_eq!(r.at(sun), 0.0);
+        assert!(r.at(sun - 2.0) < -0.5, "the glow round it is still pulled: {}", r.at(sun - 2.0));
+        // an unclipped bright tone (no pile-up at the top) keeps the whole pull
+        assert!(dark_room_window_unclipped() < -1.0);
+    }
+
+    fn dark_room_window_unclipped() -> f32 {
+        let d = shoulder(SHOWN_WHITE);
+        let t = Tones::new((0..1000).map(|i| {
+            if i < 600 {
+                -4.0
+            } else if i < 990 {
+                0.0
+            } else {
+                SHOWN_WHITE + 1.5
+            }
+        }))
+        .unwrap();
+        let l = Lift::new(&t, 0.0, -1.0, Some(&d));
+        let r = l.1.as_ref().unwrap();
+        assert!(r.fall.is_none());
+        r.at(SHOWN_WHITE + 5.0)
+    }
+
+    #[test]
     fn a_raw_adds_the_raw_correction_to_the_curve() {
-        // the Python reference (fit/rawgold10.py, from the r10-final tables) on `picture()` with a 1:1 display mapping
+        // the Python reference (fit/rawgold10.py, from the r10-final tables) on `picture()` with a 1:1 display mapping, its
+        // tables smoothed to the curvature cap ([`smooth_to_curvature`])
         let d = |e: f32| e;
         let s = Lift::new(&picture(), 1.0, 0.0, Some(&d));
         let h = Lift::new(&picture(), 0.0, -1.0, Some(&d));
         let b = Lift::new(&picture(), 1.0, -1.0, Some(&d));
         for (e, want_s, want_h, want_b) in GOLDEN_RAW {
-            assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
-            assert!((h.at(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
-            assert!((b.at(e) - want_b).abs() < 3e-3, "both at {e}: {} vs {want_b}", b.at(e));
+            assert!((s.at_both(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at_both(e));
+            // (the pull past white is read at the wide base, not in this table: [`Regional`])
+            assert!((h.at_both(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at_both(e));
+            assert!((b.at_both(e) - want_b).abs() < 3e-3, "both at {e}: {} vs {want_b}", b.at_both(e));
         }
         // and a display-referred picture doesn't get it
         let tiff = Lift::new(&picture(), 1.0, 0.0, None);
-        assert!((tiff.at(-5.0) - GOLDEN[0].1).abs() < 2e-3);
+        assert!((tiff.at_both(-5.0) - GOLDEN[0].1).abs() < 2e-3);
     }
 
     const GOLDEN_RAW: [(f32, f32, f32, f32); 4] = [
-        (-5.0, 1.32151, -0.33337, 0.16727),
-        (-2.0, 1.16265, -0.85710, -0.07288),
-        (0.0, 0.22921, -1.13222, -0.41995),
-        (1.5, -0.03449, -1.74150, -1.25166),
+        (-5.0, 1.07532, -0.38338, -0.02791),
+        (-2.0, 0.98369, -0.87188, -0.26515),
+        (0.0, 0.39400, -1.33055, -0.65591),
+        (1.5, 0.09293, -1.81559, -1.21474),
     ];
 
     #[test]
@@ -619,14 +967,13 @@ mod tests {
         let mut checked = 0;
         for i in 0..12 {
             let e = -3.0 + 0.25 * i as f32;
-            let want = shown.at(d(e));
+            let want = shown.at_both(d(e));
             if want < 0.2 {
                 continue;
             }
-            let got = d(e + raw.at(e)) - d(e);
-            // (0.03: where the curve falls faster than 1 EV per EV, tones keep their order by the peak of a darker
-            // tone, which the raw's table, 2× coarser here in shown EV, catches a little lower)
-            assert!((got - want).abs() < 0.03, "{e}: shows {got}, the curve asks {want}");
+            let got = d(e + raw.at_both(e)) - d(e);
+            // (the table is smoothed in scene EV, twice as wide in shown EV here: within 0.2 EV, never the multiple)
+            assert!((got - want).abs() < 0.2 && got < 1.5 * want, "{e}: shows {got}, the curve asks {want}");
             checked += 1;
         }
         assert!(checked >= 4, "the curve lifts the toe's tones: {checked} checked");
@@ -667,10 +1014,12 @@ mod tests {
         };
         let (a, b) = (Lift::new(&pic(-11.0), 1.0, 0.0, Some(&one)), Lift::new(&pic(-12.0), 1.0, 0.0, Some(&one)));
         for e in [-14.0, -11.0, -9.21, -6.0, -2.0, 0.0] {
-            assert!((a.at(e) - b.at(e)).abs() < 1e-3, "{e}: {} vs {}", a.at(e), b.at(e));
+            assert!((a.at_both(e) - b.at_both(e)).abs() < 1e-3, "{e}: {} vs {}", a.at_both(e), b.at_both(e));
         }
-        assert!((a.at(-14.0) - a.at(-9.21)).abs() < 0.05, "{} vs {}", a.at(-14.0), a.at(-9.21));
-        assert!(a.at(-12.0) < 3.0, "the deep shadows lift {} EV", a.at(-12.0));
+        // (the shift flattens out under the fit's darkest tone, -9.21, within the table's smoothing)
+        assert!((a.at_both(-14.0) - a.at_both(-11.0)).abs() < 0.05, "{} vs {}", a.at_both(-14.0), a.at_both(-11.0));
+        assert!(a.at_both(-14.0) < a.at_both(-9.21) + 0.35, "{} vs {}", a.at_both(-14.0), a.at_both(-9.21));
+        assert!(a.at_both(-12.0) < 3.0, "the deep shadows lift {} EV", a.at_both(-12.0));
     }
 
     #[test]
@@ -679,7 +1028,7 @@ mod tests {
         for (s, h) in [(f32::NAN, 1.0), (1e9, -1e9), (1.0, -1.0)] {
             let l = Lift::new(&t, s, h, None);
             assert!(l.0.iter().all(|v| v.is_finite() && v.abs() <= MAX_SHIFT));
-            assert!(l.at(f32::NAN).is_finite() && l.at(1e30).is_finite());
+            assert!(l.at_both(f32::NAN).is_finite() && l.at_both(1e30).is_finite());
         }
     }
 }

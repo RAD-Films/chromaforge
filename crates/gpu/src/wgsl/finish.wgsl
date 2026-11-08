@@ -50,9 +50,9 @@ fn lut_at(o: u32, x: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V8's Highlights / Shadows shift at base tone `ev` (`tone_lift::Lift::at`).
-fn lift_at(ev: f32) -> f32 {
-    let o = pu(F_LIFT_OFF);
+// Process V8's Shadows (`table` 0) or Highlights (1) shift at base tone `ev` (`tone_lift::Lift::at` / `at_h`).
+fn lift_at(table: u32, ev: f32) -> f32 {
+    let o = pu(F_LIFT_OFF) + table * pu(F_LIFT_N);
     let n = pu(F_LIFT_N);
     var f = clamp((ev - pf(F_LIFT_LO)) / pf(F_LIFT_STEP), 0.0, f32(n - 1u));
     if (!(f == f)) {
@@ -61,6 +61,33 @@ fn lift_at(ev: f32) -> f32 {
     let i = min(u32(f), n - 2u);
     let t = f - f32(i);
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
+// Highlights' past-white gain at wide-base tone `wb` (`tone_lift::Regional::at`), its record after the table.
+fn region_at(wb: f32) -> f32 {
+    if (!(wb == wb) || abs(wb) > 1e30) {
+        return 0.0;
+    }
+    let o = pu(F_LIFT_OFF) + 2u * pu(F_LIFT_N);
+    let up = sstep_o(aux[o + 1u], aux[o + 2u], wb);
+    var down = 1.0;
+    if (aux[o + 5u] != 0.0) {
+        down = 1.0 - sstep_o(aux[o + 3u], aux[o + 4u], wb);
+    }
+    let v = aux[o] * up * down;
+    if (!(v == v)) {
+        return 0.0;
+    }
+    return clamp(v, -8.0, 0.0);
+}
+
+// `tone_lift::smoothstep`: a step at `e1` when the edges are not in order.
+fn sstep_o(e0: f32, e1: f32, x: f32) -> f32 {
+    if (e1 <= e0) {
+        return select(0.0, 1.0, x >= e1);
+    }
+    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 // `finish::eval_curves` on one channel: for HDR renders (`hdr`) a value above SDR white continues
@@ -821,7 +848,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var ss = pf(F_SH) + lt[5];
     // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
     if (pu(F_LIFT) != 0u) {
-        delta += lift_at(base);
+        var lb = base;
+        if (pu(F_WIDE) != 0u) {
+            let wv = base_p[pu(F_WIDE_OFF) + i] + ev + shift;
+            if (wv == wv && abs(wv) < 1e30) {
+                lb = base + pf(F_WIDE_W) * (wv - base);
+                if (pu(F_REGION) != 0u) {
+                    delta += region_at(wv);
+                }
+            }
+        }
+        var nb = lb;
+        if (pu(F_NARROW) != 0u) {
+            let nv = base_p[pu(F_NARROW_OFF) + i] + ev + shift;
+            if (nv == nv && abs(nv) < 1e30) {
+                nb = lb + pf(F_NARROW_W) * (nv - lb);
+            }
+        }
+        delta += lift_at(0u, max(lb, nb)) + lift_at(1u, min(lb, nb));
         hh = lt[4];
         ss = lt[5];
     }

@@ -1285,6 +1285,12 @@ fn windows_match() {
         s.vignette.amount = -80.0;
         s.vignette.midpoint = 10.0;
     }));
+    // V8's Highlights / Shadows read a wide base of the whole frame, which a window can't hold
+    cases.push(("v8 highlights and shadows", |s| {
+        s.process = Process::V8.version();
+        s.light.highlights = -100.0;
+        s.light.shadows = 100.0;
+    }));
     cases.push(("spot reading from outside", |s| {
         s.spots.push(Spot {
             points: vec![Point::new(0.45, 0.45)],

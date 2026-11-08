@@ -788,7 +788,18 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let mut delta = 0.0f32;
             // (V8: the global sliders are the picture's own curve; the masks' keep the response below)
             let (hh, ss) = if let Some(lf) = lift {
-                delta += lf.at(base);
+                // the table is read at a blend of the small base and the wide, leaky one (`local::ToneBase`)
+                let wide = p.wide.as_deref().and_then(|wp| wp.data.get(i)).map(|v| v + ev + shift).filter(|v| v.is_finite());
+                let wt = crate::local::TONE_BASE.weight;
+                let b0 = wide.map_or(base, |wv| base + wt * (wv - base));
+                // Shadows read at the brighter, Highlights at the darker of that and the narrow, leaky base
+                // (`local::NarrowBase`): each eases off next to the other's region and never spreads into it
+                let nb = p.narrow.as_deref().and_then(|np| np.data.get(i)).map(|v| v + ev + shift).filter(|v| v.is_finite());
+                let nb = nb.map_or(b0, |n| b0 + crate::local::NARROW_BASE.weight * (n - b0));
+                delta += lf.at(b0.max(nb)) + lf.at_h(b0.min(nb));
+                if let (Some(r), Some(wv)) = (lf.1.as_ref(), wide) {
+                    delta += r.at(wv);
+                }
                 (l_hl, l_sh)
             } else {
                 (hl + l_hl, sh + l_sh)

@@ -51,6 +51,10 @@ struct Planes {
     sharpen: Option<(u32, Arc<Buf>)>,
     dark: Option<(u64, Arc<Buf>, f32)>,
     chroma: Option<(u32, Arc<Buf>)>,
+    /// The wide tone base ([`local::ToneBase`]), keyed by its radius and leak.
+    wide: Option<(u32, Arc<Buf>)>,
+    /// The narrow tone base ([`local::NarrowBase`]), keyed by its radius.
+    narrow: Option<(u32, Arc<Buf>)>,
     /// The masks' alpha planes (and the chromaticity after them): see [`MaskBufs`].
     masks: Option<MaskBufs>,
 }
@@ -156,6 +160,8 @@ impl GpuStages {
             p.sharpen.iter().for_each(|(_, b)| add(b));
             p.dark.iter().for_each(|(_, b, _)| add(b));
             p.chroma.iter().for_each(|(_, b)| add(b));
+            p.wide.iter().for_each(|(_, b)| add(b));
+            p.narrow.iter().for_each(|(_, b)| add(b));
             p.masks.iter().for_each(|m| add(&m.alpha));
         }
         if let Some((_, b)) = &*self.source.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -819,6 +825,10 @@ pub fn render(
         Some(p) if p.key == plan.lin_key => p,
         _ => Planes { key: plan.lin_key, ..Default::default() },
     };
+    // a window reads the wide tone base of the whole frame (`local::window_wide`)
+    if let Some(wp) = plan.fixed_wide.as_ref().filter(|wp| (wp.width, wp.height) == (plan.w, plan.h)) {
+        planes.wide = Some((local::wide_key(local::wide_sigma(plan.px_per_long)), Arc::new(cx.gpu.upload(&wp.data))));
+    }
     let mut prep = prepare(&mut cx, &lin, plan, req, &mut planes);
     // a window dehazes with the whole frame's airlight
     if let Some(a) = plan.fixed_air {
@@ -848,6 +858,21 @@ pub fn render(
         sharpen: prep.sharpen.is_some(),
         dark: prep.dark.is_some(),
         chroma: masks.is_some() && prep.chroma.is_some(),
+        wide: prep.wide.as_ref().map(|_| local::TONE_BASE.weight),
+        narrow: prep.narrow.as_ref().map(|_| local::NARROW_BASE.weight),
+    };
+    // the finish kernel's `base` binding: the small base, then the wide one (one binding for both, as `tex`)
+    // (then the narrow one, when V8's Highlights / Shadows reads it)
+    let extra: Vec<&Arc<Buf>> = prep.wide.iter().chain(prep.narrow.iter()).collect();
+    let base_buf: Arc<Buf> = if extra.is_empty() {
+        prep.base.clone()
+    } else {
+        let all = cx.gpu.buffer((1 + extra.len()) * n);
+        cx.copy_into(&prep.base, &all, 0);
+        for (k, b) in extra.iter().enumerate() {
+            cx.copy_into(b, &all, (k + 1) * n);
+        }
+        Arc::new(all)
     };
     // the finish kernel's `tex` binding: the texture plane, then the sharpening plane (one binding
     // for both keeps the kernel within the storage-buffer count every supported device has)
@@ -892,7 +917,7 @@ pub fn render(
             &[
                 Some(&lin),
                 Some(&prep.log_l),
-                Some(&prep.base),
+                Some(&base_buf),
                 prep.clarity.as_deref(),
                 tex_buf.as_deref(),
                 prep.dark.as_deref(),
@@ -1395,6 +1420,10 @@ struct Prep {
     dark: Option<Arc<Buf>>,
     /// Blurred chromaticity (local Moiré / Noise).
     chroma: Option<Arc<Buf>>,
+    /// The wide tone base ([`local::ToneBase`]).
+    wide: Option<Arc<Buf>>,
+    /// The narrow tone base ([`local::NarrowBase`]).
+    narrow: Option<Arc<Buf>>,
     air: f32,
 }
 
@@ -1451,7 +1480,9 @@ fn prepare(cx: &mut Cx<'_>, lin: &Buf, plan: &Plan<'_>, req: &RenderRequest, pla
             gaussian(cx, &ch, w, h, 3, sg)
         })
     });
-    Prep { log_l, base, clarity, texture, sharpen, dark, chroma, air }
+    let wide = sig.wide.map(|sg| plane_at(&mut planes.wide, local::wide_key(sg), || guided_fast(cx, &log_l, w, h, sg, local::TONE_BASE.leak)));
+    let narrow = sig.narrow.map(|sg| plane_at(&mut planes.narrow, sg.to_bits(), || gaussian(cx, &log_l, w, h, 1, sg)));
+    Prep { log_l, base, clarity, texture, sharpen, dark, chroma, wide, narrow, air }
 }
 
 /// Most brush dabs the mask kernel takes (more: the CPU rasterizes the brush).

@@ -332,6 +332,10 @@ pub(crate) struct Prepared {
     /// Log2 luminance relative to middle grey (before exposure: add `ev`).
     pub log_l: Arc<Plane>,
     pub base: Arc<Plane>,
+    /// Wide base of V8's Highlights past white ([`local::wide_sigma`]; log luminance before exposure).
+    pub wide: Option<Arc<Plane>>,
+    /// Narrow base of V8's Highlights / Shadows ([`local::NarrowBase`]; log luminance before exposure).
+    pub narrow: Option<Arc<Plane>>,
     pub clarity_blur: Option<Arc<Plane>>,
     pub texture_blur: Option<Arc<Plane>>,
     /// Log luminance blurred at the sharpen radius (the pixel-scale band sharpening boosts).
@@ -536,6 +540,8 @@ pub struct Plan<'a> {
     pub eyes: Vec<redeye::EyeK>,
     /// The whole frame's dehaze airlight, for a windowed render (which can't see the whole frame).
     pub fixed_air: Option<f32>,
+    /// The whole frame's wide tone base at a windowed render's pixels ([`local::window_wide`]).
+    pub fixed_wide: Option<Arc<lcc_raster::Plane>>,
     /// The tone range each visible mask's Whites / Blacks act on, fitted to the tones under it in a fixed-size
     /// render of the whole frame ([`mask_tone`]), so previews, zoomed windows and exports agree; empty when no mask
     /// has Whites or Blacks (the masks then use [`finish::DEFAULT_MASK_TONE`]).
@@ -684,6 +690,8 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     } else {
         info.mattes.clone()
     };
+    // a window reads the wide tone base of the whole frame
+    let fixed_wide = req.window.and_then(|_| local::window_wide(aux(), info, s, &whole_frame, (full_w, full_h), origin, w, h));
     let mask_tone = mask_tone::ranges(aux(), info, s, &whole_frame, mattes.as_deref());
     let tone_lift =
         if tone_lift::active(s) { tone_lift::for_frame(aux(), info, s, &whole_frame, finish::shown_tone(s, info).as_ref()) } else { None };
@@ -702,6 +710,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         pre_nr_key,
         eyes,
         fixed_air,
+        fixed_wide,
         mask_tone,
         tone_lift,
         keep,
@@ -944,6 +953,9 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         Some(p) if req.quality == Quality::Draft && p.pre_nr == plan.pre_nr_key => p.for_other_nr(),
         _ => local::Planes { key: lin_key, pre_nr: plan.pre_nr_key, ..Default::default() },
     };
+    if let Some(wp) = plan.fixed_wide.as_ref().filter(|wp| (wp.width, wp.height) == (w, h)) {
+        planes.wide = Some((local::wide_key(local::wide_sigma(px_per_long)), wp.clone()));
+    }
     let mut prep = local::prepare(lin.clone(), s, frame, px_per_long, req.quality, &mut planes, plan.mattes.as_ref());
     if let Some(a) = plan.fixed_air {
         prep.air = a;

@@ -154,6 +154,8 @@ impl GradeLut {
             img: std::sync::Arc::new(lin),
             log_l: log_l.clone(),
             base: log_l,
+            wide: None,
+            narrow: None,
             clarity_blur: None,
             texture_blur: None,
             sharpen_blur: None,

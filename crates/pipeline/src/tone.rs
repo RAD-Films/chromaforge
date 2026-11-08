@@ -128,6 +128,44 @@ impl CameraTone {
         let slope = ((b[1] - a[1]) / (b[0] - a[0])).clamp(0.1, 16.0);
         1.0 - (1.0 - b[1]) * (-(y - b[0]) * slope / (1.0 - b[1]).max(0.01)).exp()
     }
+
+    /// [`CameraTone::apply`] without slope steps at the knots (process V8): between knots with both values above
+    /// zero, a monotone cubic (Fritsch–Carlson) in log scene against log display luminance, so a smooth sky shows no
+    /// bands at the knots; through every knot as before. Outside them (below the first such knot, past the last) as
+    /// [`CameraTone::apply`].
+    pub fn apply_smooth(&self, y: f32) -> f32 {
+        if !y.is_finite() || y <= 0.0 {
+            return 0.0;
+        }
+        let k: Vec<(f32, f32)> = self.knots.iter().filter(|p| p[0] > 0.0 && p[1] > 0.0).map(|p| (p[0].ln(), p[1].ln())).collect();
+        let (Some(first), Some(last)) = (k.first(), k.last()) else { return self.apply(y) };
+        let x = y.ln();
+        if k.len() < 3 || x <= first.0 || x >= last.0 {
+            return self.apply(y);
+        }
+        let Some(j) = k.windows(2).position(|w| x <= w[1].0) else { return self.apply(y) };
+        let secant = |i: usize| match (k.get(i), k.get(i + 1)) {
+            (Some(a), Some(b)) if b.0 > a.0 => (b.1 - a.1) / (b.0 - a.0),
+            _ => 0.0,
+        };
+        // Fritsch–Carlson tangents: the harmonic mean of the neighbouring secants, zero at a turn
+        let tangent = |i: usize| {
+            let (l, r) = (if i == 0 { secant(0) } else { secant(i - 1) }, if i + 1 >= k.len() { secant(i - 1) } else { secant(i) });
+            // (the harmonic mean is at most twice the smaller secant, which keeps each piece monotone)
+            if l * r <= 0.0 { 0.0 } else { 2.0 * l * r / (l + r) }
+        };
+        let (Some(a), Some(b)) = (k.get(j), k.get(j + 1)) else { return self.apply(y) };
+        let h = b.0 - a.0;
+        if h <= 0.0 {
+            return self.apply(y);
+        }
+        let t = (x - a.0) / h;
+        let (m0, m1) = (tangent(j), tangent(j + 1));
+        let (t2, t3) = (t * t, t * t * t);
+        let v = (2.0 * t3 - 3.0 * t2 + 1.0) * a.1 + (t3 - 2.0 * t2 + t) * h * m0 + (-2.0 * t3 + 3.0 * t2) * b.1 + (t3 - t2) * h * m1;
+        let out = v.exp();
+        if out.is_finite() { out } else { self.apply(y) }
+    }
 }
 
 /// Lightroom Classic's default look over a camera's own JPEG: the gain in EV it renders display luminance with, at
@@ -154,8 +192,15 @@ pub fn lrc_look(y: f32) -> f32 {
     let f = ((y.log2() - LRC_LOOK_FROM) / LRC_LOOK_STEP).max(0.0);
     let i = (f as usize).min(LRC_LOOK.len() - 2);
     let t = (f - i as f32).min(1.0);
-    let (a, b) = (LRC_LOOK.get(i).copied().unwrap_or(0.0), LRC_LOOK.get(i + 1).copied().unwrap_or(0.0));
-    (y * (a + (b - a) * t).exp2()).min(1.0)
+    // a cubic through the knots with Catmull-Rom tangents (ends held): the gain's slope has no step at each knot,
+    // which drew bands half an EV apart across a smooth sky
+    let at = |k: isize| LRC_LOOK.get(k.clamp(0, LRC_LOOK.len() as isize - 1) as usize).copied().unwrap_or(0.0);
+    let i = i as isize;
+    let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+    let (m1, m2) = (0.5 * (p2 - p0), 0.5 * (p3 - p1));
+    let (t2, t3) = (t * t, t * t * t);
+    let g = (2.0 * t3 - 3.0 * t2 + 1.0) * p1 + (t3 - 2.0 * t2 + t) * m1 + (-2.0 * t3 + 3.0 * t2) * p2 + (t3 - t2) * m2;
+    (y * g.exp2()).min(1.0)
 }
 
 /// Display luminance above which [`ToneMap::sdr_rolloff`] compresses an HDR edit's highlights.
@@ -187,9 +232,9 @@ impl ToneMap {
     /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]); any other curve as is.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
         if curve.has_default_curve() {
-            ToneMap::camera_with(curve, |y| lrc_look(curve.apply(y)), contrast, whites, blacks, peak)
+            ToneMap::camera_with(curve, |y| lrc_look(curve.apply_smooth(y)), contrast, whites, blacks, peak)
         } else {
-            ToneMap::camera_hdr(curve, contrast, whites, blacks, peak)
+            ToneMap::camera_with(curve, |y| curve.apply_smooth(y), contrast, whites, blacks, peak)
         }
     }
 
@@ -540,11 +585,14 @@ mod tests {
         let plain = CameraTone::new(knots).unwrap();
         let curve = plain.under_default_curve();
         let (v7, v8) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
-        assert!((v8.apply(0.1) - lrc_look(v7.apply(0.1))).abs() < 1e-4);
+        // (V8 reads the camera curve smoothly between its knots: [`CameraTone::apply_smooth`])
+        let smooth = |c: &CameraTone| ToneMap::camera_with(c, |y| c.apply_smooth(y), 0.0, 0.0, 0.0, 1.0);
+        assert!((v8.apply(0.1) - lrc_look(smooth(&curve).apply(0.1))).abs() < 1e-4);
         assert!(v8.apply(0.1) > v7.apply(0.1) * 1.1);
         // any other curve (a profile's own, a look fitted to the camera JPEG alone) gets no look
         assert!(curve.has_default_curve() && !plain.has_default_curve());
-        assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - v7.apply(0.1)).abs() < 1e-4);
+        assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - smooth(&plain).apply(0.1)).abs() < 1e-4);
+        assert!((smooth(&plain).apply(0.1) - v7.apply(0.1)).abs() < 0.02 * v7.apply(0.1));
         // the mark travels through serialisation (smart previews); older files have none
         let back: CameraTone = serde_json::from_value(serde_json::to_value(curve).unwrap()).unwrap();
         assert_eq!(back, curve);

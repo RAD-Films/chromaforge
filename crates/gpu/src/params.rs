@@ -44,6 +44,18 @@ const FIELDS: &[(&str, usize)] = &[
     ("LIFT_N", 1),
     ("LIFT_LO", 1),
     ("LIFT_STEP", 1),
+    // the table is read at a blend of the small base and the wide, leaky one (`local::ToneBase`): the wide base
+    // follows the small one in `base_p` from word WIDE_OFF; REGION: Highlights' past-white term
+    // (`tone_lift::Regional`: amp, rise, fall, has fall) in `aux` after the table
+    ("WIDE", 1),
+    ("WIDE_OFF", 1),
+    ("WIDE_W", 1),
+    ("REGION", 1),
+    // Shadows reads its table at the brighter, Highlights its own (after Shadows' in `aux`) at the darker of that blend
+    // and the narrow base (`local::NarrowBase`), which follows the wide one in `base_p` from word NARROW_OFF
+    ("NARROW", 1),
+    ("NARROW_OFF", 1),
+    ("NARROW_W", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -219,6 +231,11 @@ pub struct Present {
     pub dark: bool,
     /// The blurred chromaticity follows the mask planes in the `masks` buffer.
     pub chroma: bool,
+    /// The wide tone base follows the small one in `base`: its weight ([`lcc_pipeline::local::ToneBase`]).
+    pub wide: Option<f32>,
+    /// The narrow tone base follows the wide one (or the small one) in `base`: its weight
+    /// ([`lcc_pipeline::local::NarrowBase`]).
+    pub narrow: Option<f32>,
 }
 
 /// The `finish` kernel's parameter block and auxiliary table (tone LUT | chroma curve | sRGB LUT | curve LUTs |
@@ -272,9 +289,16 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     }
     // process V8's Highlights / Shadows table
     let lift_off = aux.len();
-    let lift = fp.lift.as_ref().filter(|l| l.0.len() == lcc_pipeline::tone_lift::LIFT_N);
+    let n_lift = lcc_pipeline::tone_lift::LIFT_N;
+    let lift = fp.lift.as_ref().filter(|l| l.0.len() == n_lift && l.2.len() == n_lift);
     if let Some(l) = lift {
         aux.extend_from_slice(&l.0);
+        aux.extend_from_slice(&l.2);
+    }
+    let region = lift.and_then(|l| l.1.as_ref()).filter(|_| present.wide.is_some());
+    if let Some(r) = region {
+        let (f0, f1, has) = r.fall.map_or((0.0, 0.0, 0.0), |(a, b)| (a, b, 1.0));
+        aux.extend_from_slice(&[r.amp, r.rise.0, r.rise.1, f0, f1, has]);
     }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
@@ -410,6 +434,18 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("LIFT_N", lcc_pipeline::tone_lift::LIFT_N as u32);
         p.f("LIFT_LO", lcc_pipeline::tone_lift::LIFT_LO);
         p.f("LIFT_STEP", lcc_pipeline::tone_lift::LIFT_STEP);
+        if let Some(wt) = present.wide {
+            p.b("WIDE", true);
+            p.u("WIDE_OFF", (fp.w * fp.h) as u32);
+            p.f("WIDE_W", wt);
+            p.b("REGION", region.is_some());
+        }
+        if let Some(wt) = present.narrow {
+            let planes = if present.wide.is_some() { 2 } else { 1 };
+            p.b("NARROW", true);
+            p.u("NARROW_OFF", (planes * fp.w * fp.h) as u32);
+            p.f("NARROW_W", wt);
+        }
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

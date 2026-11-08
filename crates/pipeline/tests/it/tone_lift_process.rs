@@ -39,7 +39,7 @@ fn v8_shadows_follow_the_pictures_own_curve() {
     let got = centre(&src, &settings(Process::V8, 100.0, 0.0));
     // the curve for this picture's tones (a sixth at -4 EV, the rest at +1 EV), at the patch's tone
     let tones = Tones::new((0..W * H).map(|i| if (i % W) / 120 == 1 && (80..160).contains(&(i / W)) { -4.0 } else { 1.0 })).unwrap();
-    let want = srgb8(0.18 * f64::from((-4.0 + Lift::new(&tones, 1.0, 0.0, None).at(-4.0)).exp2()));
+    let want = srgb8(0.18 * f64::from((-4.0 + Lift::new(&tones, 1.0, 0.0, None).at_both(-4.0)).exp2()));
     assert!((got - want).abs() <= 2.0, "V8 Shadows +100 on the dark patch: {got} (the curve says {want:.1})");
 }
 
@@ -102,4 +102,109 @@ fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
     assert!(v8 > flat && v8 - flat < v7 - flat, "a bright raw: V8 lifts {flat} to {v8}, less than V7's {v7}");
     // Whites down and older processes keep the tone map's response
     assert_eq!(raw_centre(&bright, &whites(Process::V8, -100.0)), raw_centre(&bright, &whites(Process::V7, -100.0)));
+}
+
+/// A wall at `dark` EV over grey on the left half, a window at `bright` EV on the right, `w` × `w / 2`.
+fn wall_and_window(w: usize, dark: f32, bright: f32) -> Rgb32f {
+    let lin = |ev: f32| 0.18 * ev.exp2();
+    Rgb32f::from_fn(w, w / 2, |x, _| [lin(if x < w / 2 { dark } else { bright }); 3])
+}
+
+/// The change (EV of linear green) `s` makes against `zero` along the middle row.
+fn row_change(src: &Rgb32f, s: &DevelopSettings, zero: &DevelopSettings) -> Vec<f64> {
+    let (w, h) = (src.width, src.height);
+    let row = |s: &DevelopSettings| {
+        let out = render(src, &SourceInfo::default(), s, &RenderRequest::fit(w, h)).image;
+        (0..w).map(|x| out.data[(h / 2) * w + x][1]).collect::<Vec<_>>()
+    };
+    let lin = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    row(s).iter().zip(row(zero)).map(|(a, b)| ((lin(*a) + 1e-4) / (lin(b) + 1e-4)).log2()).collect()
+}
+
+/// Lightroom's Shadows and Highlights ease off at an edge between their regions and never spread across it (its
+/// change maps at full resolution, round 15, Nov 2026): on a dark wall next to a bright window Shadows +100 lifts the
+/// wall's last 4–8 px (of 6000) about half as much and the window not at all; Highlights −100 leaves the wall alone
+/// and pulls the window's first 4–8 px less. (Read from smaller change maps it looked like a spill over a few percent
+/// of the long edge; at full resolution that was the tone curve, not the edge.)
+#[test]
+fn v8_shadows_and_highlights_ease_off_at_an_edge_like_lightrooms() {
+    let w = 2400;
+    let e = w / 2;
+    let src = wall_and_window(w, -4.0, 1.5);
+    let zero = settings(Process::V8, 0.0, 0.0);
+    // Shadows +100: the wall's last pixels lift less, back to the full lift within a few px; the window gets none
+    let s = row_change(&src, &settings(Process::V8, 100.0, 0.0), &zero);
+    let (near, far) = (s[e - 1], s[e - 60]);
+    assert!(far > near + 0.3, "Shadows lifts the wall's last pixel less: {near:.2} EV there, {far:.2} far away");
+    assert!((s[e - 8] - far).abs() < 0.1, "and is back 8 px from the edge: {:.2} vs {far:.2}", s[e - 8]);
+    assert!(s[e..].iter().all(|v| v.abs() < 0.1), "the window gets no lift: {:.2}", s[e..].iter().fold(0.0f64, |m, v| m.max(v.abs())));
+    // Highlights −100: the wall keeps its change up to the edge; the window's first pixels are pulled less
+    let h = row_change(&src, &settings(Process::V8, 0.0, -100.0), &zero);
+    assert!((h[e - 1] - h[e - 60]).abs() < 0.02, "Highlights doesn't spread onto the wall: {:.2} at the edge, {:.2} far", h[e - 1], h[e - 60]);
+    let (near, far) = (h[e], h[e + 60]);
+    assert!(near > far + 0.5, "Highlights pulls the window's first pixel less: {near:.2} EV there, {far:.2} far away");
+    assert!((h[e + 16] - far).abs() < 0.15, "and is back 16 px from the edge: {:.2} vs {far:.2}", h[e + 16]);
+}
+
+/// A raw radial ramp: `ev0` EV over grey at the centre, falling `per_px` EV per pixel outwards (a sky around a sun).
+fn radial_ramp(w: usize, h: usize, ev0: f32, per_px: f32) -> Rgb32f {
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    Rgb32f::from_fn(w, h, |x, y| [0.18 * (ev0 - per_px * (x as f32 - cx).hypot(y as f32 - cy)).exp2(); 3])
+}
+
+/// The largest step (between neighbouring pixels) in the slope of output against input tone along the ramp's middle
+/// row from the centre outwards, where the input is between `lo` and `hi` EV and the output under `top`: a band
+/// (a kink in the tone response) is a step there; a smooth response changes its slope a little every pixel.
+fn worst_slope_step(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, ev0: f32, per_px: f32, (lo, hi): (f32, f32), top: f32) -> (f32, f32) {
+    let (w, h) = (src.width, src.height);
+    let req = RenderRequest { depth: lcc_pipeline::OutputDepth::F32Linear, ..RenderRequest::fit(w, h) };
+    let out = render(src, info, s, &req);
+    let Some(lcc_pipeline::DeepSamples::F32(px)) = out.deep.map(|d| d.samples) else { panic!("no float render") };
+    let lum = |x: usize| {
+        let i = 3 * ((h / 2) * w + x);
+        0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]
+    };
+    let pts: Vec<(f32, f32)> = (w / 2..w)
+        .map(|x| (ev0 - per_px * (x - w / 2) as f32, lum(x)))
+        .filter(|(e, y)| (lo..=hi).contains(e) && *y > 1e-4 && *y < top)
+        .map(|(e, y)| (e, y.log2()))
+        .collect();
+    let slopes: Vec<f32> = pts.windows(2).map(|p| (p[1].1 - p[0].1) / (p[1].0 - p[0].0)).collect();
+    let mut worst = (0.0f32, 0.0f32);
+    for (i, p) in slopes.windows(2).enumerate() {
+        let d = (p[1] - p[0]).abs();
+        if d > worst.0 {
+            worst = (d, pts[i + 1].0);
+        }
+    }
+    worst
+}
+
+/// No bands: a smooth raw ramp from far past white down into the shadows keeps a smooth tone response through
+/// Highlights and Shadows at both ends of the sliders, under the camera's own curve in Lightroom's default look.
+/// (Before: the camera curve and the default look were read linearly between knots, and the Highlights table was
+/// put in order by a running maximum: each left a slope step that showed as a ring around a sun.)
+#[test]
+fn v8_a_smooth_ramp_shows_no_bands() {
+    let (w, h, ev0, per_px) = (900, 300, 4.0, 1.0 / 40.0);
+    let src = radial_ramp(w, h, ev0, per_px);
+    let tone = lcc_pipeline::tone::CameraTone::default_raw().map(|c| c.under_default_curve());
+    let info = SourceInfo { raw: true, camera_tone: tone, ..SourceInfo::default() };
+    let shoulder = {
+        let zero = settings(Process::V8, 0.0, 0.0);
+        let req = RenderRequest { depth: lcc_pipeline::OutputDepth::F32Linear, ..RenderRequest::fit(w, h) };
+        let Some(lcc_pipeline::DeepSamples::F32(px)) = render(&src, &info, &zero, &req).deep.map(|d| d.samples) else { panic!("no float render") };
+        let x = w / 2 + ((ev0 - 2.5) / per_px) as usize;
+        let i = 3 * ((h / 2) * w + x);
+        0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]
+    };
+    for (sh, hl) in [(0.0, 0.0), (100.0, 0.0), (0.0, -100.0), (100.0, -100.0), (-100.0, 100.0)] {
+        // (shown under where the camera curve's shoulder joins its roll-off, 2.5 EV over grey with the sliders at 0:
+        // that join is the tone map's own work, not this one's)
+        let (step, at) = worst_slope_step(&src, &info, &settings(Process::V8, sh, hl), ev0, per_px, (-6.0, ev0), shoulder);
+        assert!(step < 0.03, "Shadows {sh}, Highlights {hl}: the tone response's slope steps by {step:.3} at {at:+.2} EV");
+    }
 }
