@@ -706,6 +706,12 @@ pub struct ColorData {
     /// as As Shot. Not a DNG tag; the render never applies it.
     #[serde(default)]
     pub balanced_as_shot: Option<[f32; 3]>,
+    /// The colour temperature (K) the camera states for the white balance it shot with (Nikon's
+    /// `ColorTemperatureAuto`), when the file has one: the As Shot reading of a body whose Kelvin scale comes from it
+    /// ([`kelvin_builtin::states_temperature`]). Not a DNG tag; not written while absent, so other files' data keep
+    /// their form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stated_temperature: Option<f32>,
 }
 
 /// A decoded raw image.

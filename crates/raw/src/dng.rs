@@ -141,6 +141,7 @@ pub(crate) fn color_data(ifd0: &Ifd, raw: &Ifd, order: ByteOrder) -> ColorData {
         profile: profile_look(ifd0, raw, order),
         kelvin_presets: None,
         balanced_as_shot: None,
+        stated_temperature: None,
     }
 }
 

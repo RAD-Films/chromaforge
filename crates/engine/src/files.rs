@@ -1723,6 +1723,20 @@ pub(crate) mod tests {
         assert!(none.relative && !none.legacy_relative && none.scale_white.is_none());
         assert_eq!(none.as_shot(d65), (6500.0, 0.0));
         assert!(lcc_catalog::relative_wb_camera("ARW", "HASSELBLAD Lunar"));
+        // a Nikon Z 8 (no matrices, presets or calibration): Kelvin from the temperature its camera states, tint 0,
+        // edits from before marked legacy (they render as they did); without the tag the scale is Kelvin still, the
+        // white the tags' (D65). Before, it was relative: a Lightroom custom Kelvin on it was dropped (round w1).
+        let z8 = |stated| ColorData { stated_temperature: stated, ..Default::default() };
+        let stated = WbScaleOf::new(RawFormat::Nef, &z8(Some(4690.0)), Some([1.7227, 1.0, 1.5332]), &meta("NIKON CORPORATION", "NIKON Z 8"));
+        assert!(!stated.relative && stated.legacy_relative && stated.scale_white.is_some());
+        assert_eq!(stated.as_shot(d65), (4690.0, 0.0));
+        assert!(!lcc_catalog::relative_wb_camera("NEF", "NIKON CORPORATION NIKON Z 8"));
+        let unstated = WbScaleOf::new(RawFormat::Nef, &z8(None), Some([1.7227, 1.0, 1.5332]), &meta("NIKON CORPORATION", "NIKON Z 8"));
+        assert!(!unstated.relative && unstated.scale_white.is_none());
+        // another Nikon without any of them stays relative
+        let z9 = WbScaleOf::new(RawFormat::Nef, &z8(Some(4690.0)), mul, &meta("NIKON CORPORATION", "NIKON Z 9"));
+        assert!(z9.relative && z9.scale_white.is_none());
+        assert!(lcc_catalog::relative_wb_camera("NEF", "NIKON CORPORATION NIKON Z 9"));
         // a camera without matrices whose presets give the scale: Kelvin through them, Sony's daylight preset as
         // 5500 K or so; without presets in the file the scale is Kelvin still, the white the tags' (D65)
         let g = |r: f32, b: f32| [r / 1024.0, 1.0, b / 1024.0];

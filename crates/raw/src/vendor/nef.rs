@@ -21,6 +21,20 @@ use lcc_tiff::tags::{self as t, photometric};
 use lcc_tiff::{ByteOrder, Ifd, Tiff, makernote};
 
 const WB_RB_LEVELS: u16 = 0x000c;
+/// ColorTemperatureAuto: the colour temperature (K) the camera states for the white balance it shot with (tag name
+/// from the ExifTool Nikon tag-name documentation; read on the contributor's own Z 8 and Z6III files, SHORT, e.g.
+/// 4690 for Natural Auto).
+const COLOR_TEMPERATURE_AUTO: u16 = 0x004f;
+
+/// The camera's stated colour temperature, for a body whose Kelvin scale is read from it
+/// ([`crate::kelvin_builtin::states_temperature`]); `None` for others, or outside 1500–15000 K.
+fn stated_temperature(mn: Option<&makernote::MakerNote>, make: &str, model: &str) -> Option<f32> {
+    if !crate::kelvin_builtin::states_temperature(Some(make), model) {
+        return None;
+    }
+    let k = mn?.ifd.u16(COLOR_TEMPERATURE_AUTO)?;
+    (1500..=15000).contains(&k).then_some(f32::from(k))
+}
 /// ColorBalance (named in the ExifTool Nikon tag-name documentation, which gives the channel order per version but
 /// not where the levels sit): a 4-character version, then, in the versions that aren't enciphered, the as-shot
 /// levels as four `u16` in the maker note's byte order: `0102` (D2H) RGGB from byte 10, `0103` (D70, D70s) RGBG
@@ -419,7 +433,11 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         active_area: Rect::new(0, 0, active_w, h),
         crop,
         orientation: Orientation::from_exif(ifd0.u16(t::ORIENTATION).unwrap_or(1)),
-        color: ColorData { kelvin_presets: crate::kelvin_builtin::find(Some(&make), &model), ..Default::default() },
+        color: ColorData {
+            kelvin_presets: crate::kelvin_builtin::find(Some(&make), &model),
+            stated_temperature: stated_temperature(mn.as_ref(), &make, &model),
+            ..Default::default()
+        },
         wb_multipliers: wb,
         linearized: false,
         pixel_aspect,

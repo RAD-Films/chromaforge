@@ -61,6 +61,7 @@ pub fn color_data(color: &FrameColor) -> ColorData {
                 profile: Default::default(),
                 kelvin_presets: None,
                 balanced_as_shot: None,
+                stated_temperature: None,
             }
         }
     }

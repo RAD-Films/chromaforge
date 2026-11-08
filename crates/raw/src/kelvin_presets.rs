@@ -398,10 +398,14 @@ impl KelvinPresets {
     }
 }
 
-/// The as-shot white of a file through its own presets ([`ColorData::kelvin_presets`]); `None` without presets or
-/// usable multipliers.
+/// The as-shot white of a file through its own presets ([`ColorData::kelvin_presets`]), else, for a body whose scale
+/// is the temperature its camera states ([`crate::kelvin_builtin::states_temperature`]), that temperature at tint 0
+/// ([`ColorData::stated_temperature`], 1500–15000 K); `None` without either or without usable multipliers.
 pub fn as_shot_white(color: &ColorData, wb_multipliers: Option<[f32; 3]>) -> Option<Xy> {
-    color.kelvin_presets.as_ref()?.as_shot_white(wb_multipliers)
+    match color.kelvin_presets.as_ref() {
+        Some(p) => p.as_shot_white(wb_multipliers),
+        None => color.stated_temperature.map(f64::from).filter(|k| (1500.0..=15000.0).contains(k)).map(|k| cct::temp_tint_to_xy(k, 0.0)),
+    }
 }
 
 #[cfg(test)]
@@ -606,5 +610,31 @@ mod tests {
         assert!(covers_camera("NIKON CORPORATION NIKON Z5_2"));
         // D850 has no Kelvin presets; still not covered through the joined path
         assert!(!covers_camera("NIKON CORPORATION NIKON D850"));
+    }
+
+    /// The Nikon Z 8 reads Kelvin from the temperature its camera states (round w1: a Lightroom custom Kelvin on
+    /// its photos was dropped, every variant from 3200 K to 7500 K rendered As Shot). As Shot is that temperature
+    /// at tint 0; a file without one, or with a value no light has, gives no white.
+    #[test]
+    fn a_stated_temperature_is_the_as_shot_white_of_a_body_read_that_way() {
+        assert!(covers(Some("NIKON CORPORATION"), "NIKON Z 8") && covers_camera("NIKON CORPORATION NIKON Z 8"));
+        assert!(crate::kelvin_builtin::states_temperature(Some("NIKON CORPORATION"), "NIKON Z 8"));
+        assert!(!crate::kelvin_builtin::states_temperature(Some("NIKON CORPORATION"), "NIKON Z 9"));
+        assert!(!covers_camera("NIKON CORPORATION NIKON Z 9") && !covers(Some("CANON"), "Z 8"));
+        let mul = Some([1.7227, 1.0, 1.5332]);
+        let c = ColorData { stated_temperature: Some(4690.0), ..Default::default() };
+        let (t, tint) = cct::xy_to_temp_tint(as_shot_white(&c, mul).unwrap());
+        assert!((t - 4690.0).abs() < 1.0 && tint.abs() < 0.01, "{t} {tint}");
+        for bad in [None, Some(0.0), Some(800.0), Some(40000.0), Some(f32::NAN)] {
+            assert_eq!(as_shot_white(&ColorData { stated_temperature: bad, ..Default::default() }, mul), None, "{bad:?}");
+        }
+        // presets, when a file has them, stay the reading
+        let p = ColorData { kelvin_presets: Some(a99m2()), stated_temperature: Some(9000.0), ..Default::default() };
+        assert_eq!(
+            as_shot_white(&p, Some([2500.0 / 1024.0, 1.0, 1668.0 / 1024.0])),
+            a99m2().as_shot_white(Some([2500.0 / 1024.0, 1.0, 1668.0 / 1024.0]))
+        );
+        // the field is not written while absent, so other files' colour data keep their form
+        assert!(!serde_json::to_string(&ColorData::default()).unwrap().contains("stated_temperature"));
     }
 }

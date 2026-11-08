@@ -37,21 +37,38 @@ const BUILTINS: &[Builtin] = &[
     },
 ];
 
-fn find_builtin(make: Option<&str>, model: &str) -> Option<&'static Builtin> {
+/// Bodies whose Kelvin scale is the temperature the camera states for each photo (`ColorTemperatureAuto`, kept as
+/// [`crate::ColorData::stated_temperature`]): the As Shot reading is that temperature at tint 0, and a custom Kelvin
+/// adapts the picture from it as for any fitted look (`crate::kelvin_presets`). For bodies without presets, measured
+/// matrices or a calibration, which were edited only relative to their as-shot look (a Lightroom custom Kelvin
+/// without `AsShotTemperature` beside it was dropped). Nikon Z 8: on the contributor's own Natural Auto photos the
+/// camera wrote 4690 K and 4460 K where its picture at As Shot matched Lightroom's at 4494 K and 4515 K (within 9
+/// mired). Make's first word and Exif model without the make, as [`BUILTINS`].
+const STATED: &[(&str, &str)] = &[("NIKON", "Z 8")];
+
+/// Whether `model` (an Exif model, with or without its make in front) of `make` names `want_make`'s `want_model`.
+fn names(make: Option<&str>, model: &str, want_make: &str, want_model: &str) -> bool {
     let model = model.trim();
-    BUILTINS.iter().find(|b| {
-        let n = b.make.len();
-        let bare = match (model.get(..n), model.get(n..)) {
-            (Some(prefix), Some(rest)) if prefix.eq_ignore_ascii_case(b.make) => rest.trim_start(),
-            _ => model,
-        };
-        make.is_none_or(|m| m.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case(b.make))) && bare.eq_ignore_ascii_case(b.model)
-    })
+    let n = want_make.len();
+    let bare = match (model.get(..n), model.get(n..)) {
+        (Some(prefix), Some(rest)) if prefix.eq_ignore_ascii_case(want_make) => rest.trim_start(),
+        _ => model,
+    };
+    make.is_none_or(|m| m.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case(want_make))) && bare.eq_ignore_ascii_case(want_model)
 }
 
-/// Whether this Exif make and model has built-in presets.
+fn find_builtin(make: Option<&str>, model: &str) -> Option<&'static Builtin> {
+    BUILTINS.iter().find(|b| names(make, model, b.make, b.model))
+}
+
+/// Whether this Exif make and model reads Kelvin from the temperature its camera states per photo ([`STATED`]).
+pub fn states_temperature(make: Option<&str>, model: &str) -> bool {
+    STATED.iter().any(|(m, b)| names(make, model, m, b))
+}
+
+/// Whether this Exif make and model has a built-in Kelvin scale: presets, or the temperature the camera states.
 pub fn covers(make: Option<&str>, model: &str) -> bool {
-    find_builtin(make, model).is_some()
+    find_builtin(make, model).is_some() || states_temperature(make, model)
 }
 
 /// The built-in presets of this Exif make and model, if any.
