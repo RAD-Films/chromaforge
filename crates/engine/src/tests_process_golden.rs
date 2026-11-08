@@ -52,12 +52,12 @@ fn variants(base: &DevelopSettings) -> Vec<(&'static str, DevelopSettings, Rende
     (edit.color.vibrance, edit.color.saturation) = (25.0, -10.0);
     (edit.detail.nr_luminance, edit.detail.nr_color, edit.detail.sharpen_amount) = (35.0, 40.0, 50.0);
     (edit.grain.amount, edit.grain.size, edit.grain.seed) = (20.0, 30.0, 7);
-    let deep = RenderRequest { depth: OutputDepth::U16, space: OutputSpace::ProPhoto, ..fit.clone() };
+    let deep = RenderRequest { depth: OutputDepth::U16, space: OutputSpace::ProPhoto, ..fit };
     let mut hdr = edit.clone();
     // every field set: a newer process may start new HDR edits at another headroom
-    hdr.hdr = Hdr { enabled: true, max_ev: 3.0, ..hdr.hdr.clone() };
-    let hdr_req = RenderRequest { depth: OutputDepth::F32Hdr, ..fit.clone() };
-    vec![("default", base.clone(), fit.clone()), ("edit", edit.clone(), fit), ("edit16", edit, deep), ("hdr", hdr, hdr_req)]
+    hdr.hdr = Hdr { enabled: true, max_ev: 3.0, ..hdr.hdr };
+    let hdr_req = RenderRequest { depth: OutputDepth::F32Hdr, ..fit };
+    vec![("default", base.clone(), fit), ("edit", edit.clone(), fit), ("edit16", edit, deep), ("hdr", hdr, hdr_req)]
 }
 
 /// Hash of a render: its 8-bit picture and, when there is one, its deep picture.
