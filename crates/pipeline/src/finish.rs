@@ -499,7 +499,8 @@ pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
 /// the tone on each linear ProPhoto channel keeps LrC's colour where the tone on luminance did not: with the base
 /// curve, chroma within 2 % of LrC's in every tone band of 13 held-out frames (0.58–1.34 before), sunlit grass
 /// C* 32.5 vs LrC 34.1 (28.3 before), and Exposure −1 EV's partly clipped highlights keep LrC's share of colour
-/// (0.22 vs 0.25; 0.40 before). Lightness is unchanged. HDR renders keep the tone on luminance (not measured).
+/// (0.22 vs 0.25; 0.40 before). Lightness is unchanged. HDR renders keep the tone on luminance (not measured). A raw
+/// without a camera tone takes the same base curve ([`ToneMap::lrc_default`]) on luminance: its colour isn't measured.
 fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option<[[[f32; 3]; 3]; 2]> {
     let lrc_base = s.process.process() == Process::V9
         && peak <= 1.0
@@ -524,7 +525,8 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool
         match info.camera_tone.as_ref().filter(|_| raw) {
             // a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
             Some(curve) => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
-            None if raw => ToneMap::rolloff_hdr(l.contrast, whites, l.blacks, peak),
+            // a raw without a camera tone (float or merged DNGs, …): Lightroom Classic's base tone as well
+            None if raw => ToneMap::lrc_default(l.contrast, whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
         }
     };
@@ -1358,7 +1360,10 @@ mod tests {
         assert!(tone_per_channel(&v8, &raw, 1.0).is_none(), "V8 unchanged");
         assert!(tone_per_channel(&v9, &raw, 4.0).is_none(), "HDR keeps the tone on luminance");
         assert!(tone_per_channel(&v9, &SourceInfo { camera_tone: Some(plain), ..raw.clone() }, 1.0).is_none(), "a profile's own curve");
-        assert!(tone_per_channel(&v9, &SourceInfo { camera_tone: None, ..raw.clone() }, 1.0).is_none());
+        assert!(
+            tone_per_channel(&v9, &SourceInfo { camera_tone: None, ..raw.clone() }, 1.0).is_none(),
+            "a raw without a camera tone: base curve on luminance"
+        );
         assert!(tone_per_channel(&v9, &SourceInfo { raw: false, ..raw.clone() }, 1.0).is_none(), "a JPEG");
         // white stays neutral through ProPhoto, so a grey's tone is the luminance tone
         let tone = base_tone(&v9, &raw, 1.0);
@@ -1371,6 +1376,42 @@ mod tests {
         // a saturated colour keeps its hue's order of channels and stays in range
         let d = mul3(&from, mul3(&to, [0.05f32, 0.2, 0.03]).map(|v| tone.apply(v.max(0.0))));
         assert!(d[1] > d[0] && d[0] > d[2] && d.iter().all(|v| v.is_finite() && *v <= 1.0), "{d:?}");
+    }
+
+    /// Process V9 draws a raw without a camera tone (a float or merged DNG, a DNG whose profile has no curve, a body
+    /// without a fitted look) with Lightroom Classic's base tone, as it does a camera tone kept under a profile without
+    /// a curve: mid grey near LrC's display 0.45 (L* ≈ 73, measured on the hdr1 float DNG ramp), not the generic
+    /// roll-off's 0.19. V8 keeps the roll-off, a JPEG keeps its display tone.
+    #[test]
+    fn v9_raw_without_a_camera_tone_takes_lightrooms_base_tone() {
+        let dng = SourceInfo { raw: true, camera_tone: None, ..Default::default() };
+        let v9 = DevelopSettings::default();
+        assert_eq!(v9.process.process(), Process::V9);
+        let g = crate::tone::GREY;
+        let lrc = crate::tone::lrc_base(g);
+        let tone = base_tone(&v9, &dng, 1.0);
+        assert!((tone.apply(g) - lrc).abs() < 2e-3, "V9 grey {} vs base tone {lrc}", tone.apply(g));
+        assert!((0.40..0.50).contains(&tone.apply(g)), "LrC's float DNG grey is about 0.45: {}", tone.apply(g));
+        // the same tone as a camera tone kept under a profile without a curve
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let kept = SourceInfo { camera_tone: Some(crate::tone::CameraTone::new(knots).unwrap().under_default_curve()), ..dng.clone() };
+        let with_sliders = DevelopSettings { light: lcc_develop::Light { contrast: 30.0, blacks: -20.0, ..Default::default() }, ..v9.clone() };
+        for s in [&v9, &with_sliders] {
+            let (a, b) = (base_tone(s, &dng, 1.0), base_tone(s, &kept, 1.0));
+            for y in [0.002f32, 0.05, 0.18, 0.7, 3.0] {
+                assert!((a.apply(y) - b.apply(y)).abs() < 1e-6, "{y}: {} vs {}", a.apply(y), b.apply(y));
+            }
+        }
+        // V8 and a JPEG are unchanged
+        let v8 = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
+        let rolloff = crate::tone::ToneMap::rolloff_hdr(0.0, 0.0, 0.0, 1.0);
+        assert!((base_tone(&v8, &dng, 1.0).apply(g) - rolloff.apply(g)).abs() < 1e-6, "V8 keeps the roll-off");
+        assert!(rolloff.apply(g) < 0.3, "the roll-off's grey is far darker: {}", rolloff.apply(g));
+        let jpeg = SourceInfo { raw: false, ..dng };
+        assert!((base_tone(&v9, &jpeg, 1.0).apply(g) - lrc).abs() > 0.05, "a JPEG keeps its display tone");
     }
 
     #[test]

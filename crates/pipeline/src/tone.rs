@@ -360,12 +360,20 @@ impl ToneMap {
     /// ([`CameraTone::has_default_curve`]), Lightroom Classic's base tone ([`lrc_base`]) in place of the camera JPEG's;
     /// any other curve as V8 draws it.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
-        let adjustment = ToneMap::display_shaped(contrast, whites, blacks, 1.0, true);
         if curve.has_default_curve() {
-            ToneMap::camera_adjusted(lrc_base, NO_CHROMA, adjustment, contrast, whites, blacks, peak)
-        } else {
-            ToneMap::camera_adjusted(|y| curve.apply_rolloff(y), curve.chroma, adjustment, contrast, whites, blacks, peak)
+            return ToneMap::lrc_default(contrast, whites, blacks, peak);
         }
+        let adjustment = ToneMap::display_shaped(contrast, whites, blacks, 1.0, true);
+        ToneMap::camera_adjusted(|y| curve.apply_rolloff(y), curve.chroma, adjustment, contrast, whites, blacks, peak)
+    }
+
+    /// Process V9's tone for a raw Lightroom Classic draws with its default curve: Lightroom Classic's base tone
+    /// ([`lrc_base`]) with the sliders as [`ToneMap::camera_lrc`] applies them. For a camera tone kept under a profile
+    /// without a curve, and for a raw with no camera tone at all (float and merged DNGs, a DNG whose profile has no
+    /// curve, a body without a fitted look), which V8 draws with the generic roll-off ([`ToneMap::rolloff_hdr`]).
+    pub fn lrc_default(contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        let adjustment = ToneMap::display_shaped(contrast, whites, blacks, 1.0, true);
+        ToneMap::camera_adjusted(lrc_base, NO_CHROMA, adjustment, contrast, whites, blacks, peak)
     }
 
     fn camera_with(curve: impl Fn(f32) -> f32, chroma: [f32; CHROMA_N], contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {

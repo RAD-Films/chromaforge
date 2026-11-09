@@ -222,8 +222,10 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
 }
 
 /// V9's HDR tone changes only the HDR render: a raw's SDR edits, and the SDR rendition of its HDR edits, tone as
-/// under V8 at these settings (no slider that V9's Lightroom Classic tone draws differently). Display-referred
-/// sources are left out: V9 draws their SDR tone in Lightroom Classic's display look.
+/// under V8 at these settings (no slider that V9's Lightroom Classic tone draws differently), for a raw with a
+/// camera curve of its own. A raw without a camera tone takes Lightroom Classic's base tone in both
+/// ([`crate::tone::ToneMap::lrc_default`]). Display-referred sources are left out: V9 draws their SDR tone in
+/// Lightroom Classic's display look.
 #[test]
 fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
     use crate::finish::base_tone;
@@ -232,7 +234,14 @@ fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
         for s in [DevelopSettings::default(), hdr_on(3.0)] {
             let sdr = s.sdr_rendition().into_owned();
             let a = base_tone(&with_process(sdr.clone(), Process::V9), &info, 1.0);
-            let b = base_tone(&with_process(sdr, Process::V8), &info, 1.0);
+            let b = if info.camera_tone.is_some() {
+                base_tone(&with_process(sdr, Process::V8), &info, 1.0)
+            } else {
+                // an HDR edit's SDR rendition: the tone at the headroom, rolled off into SDR white
+                let (l, r) = (&sdr.light, sdr.hdr.rolloff_peak());
+                let t = crate::tone::ToneMap::lrc_default(l.contrast, l.whites, l.blacks, r);
+                if r > 1.0 { t.sdr_rolloff(r) } else { t }
+            };
             assert_eq!(a.lut(), b.lut(), "{info:?}");
         }
     }
