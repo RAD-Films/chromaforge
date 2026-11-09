@@ -177,8 +177,9 @@ pub struct LoadOptions {
     /// Demosaic a raw with the AHD that blends its candidates where noise alone would pick one
     /// ([`lcc_raw::Method::AhdBlend`], process V9); false: the outright pick of V1-V8 ([`lcc_raw::Method::Ahd`]).
     pub ahd_blend: bool,
-    /// Rebuild a raw's fully clipped highlights brighter than the sensor's clip (process V9 and above,
-    /// [`crate::files::HIGHLIGHT_HEADROOM`] stops), as Lightroom Classic shows them when Exposure goes down.
+    /// Process V9's highlight rebuild (`crate::files::rebuild_of`): fully clipped highlights
+    /// [`crate::files::HIGHLIGHT_HEADROOM`] stops above the sensor's clip, and partly clipped ones in their rim's hue
+    /// ([`lcc_raw::highlight::Rebuild::rim_hue`]), as Lightroom Classic shows them when Exposure goes down.
     pub highlight_headroom: bool,
     /// The photo's process number (`DevelopSettings::process`): picks a calibrated look's entry for newer processes
     /// when the camera's calibration has one (`lcc_raw::dcp::resolve_at`); the latest process by default.
@@ -332,7 +333,7 @@ impl DecodedSource {
                 && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
                 && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw))
                 && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw))
-                && (crate::files::headroom_of(&self.options) == crate::files::headroom_of(options) || !info.is_some_and(|i| i.raw))
+                && (crate::files::rebuild_of(&self.options) == crate::files::rebuild_of(options) || !info.is_some_and(|i| i.raw))
                 && (self.options.process == options.process || !info.is_some_and(|i| i.raw)))
     }
 
@@ -3184,8 +3185,8 @@ pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync
 mod thumbnail_hash_tests {
     use super::*;
 
-    /// Process V9's decode rebuilds a raw's clipped highlights with headroom, older processes' without; a decoded
-    /// raw serves only the one it was made for, a decoded JPEG either.
+    /// Process V9's decode rebuilds a raw's clipped highlights its own way (headroom, rim hue), older processes'
+    /// don't; a decoded raw serves only the one it was made for, a decoded JPEG either.
     #[test]
     fn a_decoded_raw_serves_only_its_own_highlight_headroom() {
         use lcc_develop::Process;
@@ -3200,9 +3201,9 @@ mod thumbnail_hash_tests {
         let without = LoadOptions { highlight_headroom: false, ..v9.clone() };
         let raw =
             DecodedSource { options: without.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
-        // only a headroom that changes the pixels needs its own decode
+        // V9's rebuild (headroom, rim hue) changes the pixels, so it needs its own decode
         assert!(raw.serves(&without));
-        assert_eq!(raw.serves(&v9), crate::files::HIGHLIGHT_HEADROOM == 0.0);
+        assert!(!raw.serves(&v9));
         let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
         assert!(jpeg.serves(&v7) && jpeg.serves(&v9));
     }

@@ -429,6 +429,13 @@ pub(crate) fn headroom_of(options: &LoadOptions) -> f32 {
     if options.highlight_headroom { HIGHLIGHT_HEADROOM } else { 0.0 }
 }
 
+/// How a decode with `options` rebuilds clipped highlights: process V9's ([`LoadOptions::highlight_headroom`])
+/// with its headroom and partly clipped areas in their rim's hue ([`lcc_raw::highlight::Rebuild::rim_hue`]), as
+/// Lightroom Classic does; V1–V8 as before.
+pub(crate) fn rebuild_of(options: &LoadOptions) -> lcc_raw::highlight::Rebuild {
+    lcc_raw::highlight::Rebuild { headroom: headroom_of(options), rim_hue: options.highlight_headroom }
+}
+
 /// How a raw's camera RGB becomes the linear Rec.2020 the pipeline takes.
 pub(crate) struct CameraColourModel<'a> {
     /// White-balance multipliers (as shot).
@@ -445,15 +452,15 @@ pub(crate) struct CameraColourModel<'a> {
 
 impl CameraColourModel<'_> {
     /// Rebuild sensor-clipped channels; fully clipped highlights become [`clipped_white`] of the matrix, so they
-    /// come out of [`Self::apply`] neutral, `headroom` stops above the clip ([`headroom_of`]).
-    pub fn rebuild_highlights(&self, img: &mut Rgb32f, headroom: f32) {
-        lcc_raw::highlight::reconstruct_brighter(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), headroom);
+    /// come out of [`Self::apply`] neutral, rebuilt as `how` says ([`rebuild_of`]).
+    pub fn rebuild_highlights(&self, img: &mut Rgb32f, how: lcc_raw::highlight::Rebuild) {
+        lcc_raw::highlight::reconstruct_how(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, None);
     }
 
     /// [`Self::rebuild_highlights`] for a binned image whose clipped channels `mask` tells
     /// ([`lcc_raw::RawImage::develop_binned_masked`]).
-    pub fn rebuild_highlights_masked(&self, img: &mut Rgb32f, mask: &[u8], headroom: f32) {
-        lcc_raw::highlight::reconstruct_masked_brighter(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), mask, headroom);
+    pub fn rebuild_highlights_masked(&self, img: &mut Rgb32f, mask: &[u8], how: lcc_raw::highlight::Rebuild) {
+        lcc_raw::highlight::reconstruct_how(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, Some(mask));
     }
 
     /// White balance, matrix, tables and baseline exposure, in place.
@@ -884,8 +891,8 @@ fn load_bytes_now(
             let mut stages = vec![("develop", t0.elapsed())];
             stages.push(("transform", t0.elapsed()));
             match &clip_mask {
-                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask, headroom_of(&options)),
-                None => colour.rebuild_highlights(&mut img, headroom_of(&options)),
+                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask, rebuild_of(&options)),
+                None => colour.rebuild_highlights(&mut img, rebuild_of(&options)),
             }
             stages.push(("highlights", t0.elapsed()));
             colour.apply(&mut img);
@@ -2774,7 +2781,7 @@ pub(crate) mod tests {
             assert!(out.iter().all(|v| (v - out[1]).abs() <= 1e-3 * out[1]), "{w:?} renders {out:?}");
             let colour = CameraColourModel { wb: [2.5, 1.0, 1.6], matrix: model, gain: 1.0, tables: None, hue_sat: None };
             let mut img = Rgb32f::filled(4, 4, [1.0; 3]);
-            colour.rebuild_highlights(&mut img, 0.0);
+            colour.rebuild_highlights(&mut img, Default::default());
             colour.apply(&mut img);
             assert!(img.data.iter().flatten().all(|v| v.is_finite()), "{:?}", img.get(0, 0));
         }
@@ -2800,7 +2807,7 @@ pub(crate) mod tests {
                 [0.3 / wb[0], 0.3, 0.3 / wb[2]]
             }
         });
-        colour.rebuild_highlights(&mut img, 0.0);
+        colour.rebuild_highlights(&mut img, Default::default());
         colour.apply(&mut img);
         let info = SourceInfo { raw: true, ..Default::default() };
         let mut issue = lcc_develop::DevelopSettings::default();
@@ -2831,7 +2838,7 @@ pub(crate) mod tests {
         let y = (rows.start + rows.end) / 2;
         let first = (0..w).find(|&x| sensor.get(x, y)[1] >= HIGHLIGHT_CLIP).unwrap();
         let mut img = sensor.clone();
-        colour.rebuild_highlights(&mut img, 0.0);
+        colour.rebuild_highlights(&mut img, Default::default());
         colour.apply(&mut img);
         let mut s = lcc_develop::DevelopSettings::default();
         s.light.exposure = -2.0;
@@ -2895,7 +2902,7 @@ pub(crate) mod tests {
         let y = top + strip + band / 2;
         let at = (0..w).find(|&x| sensor.get(x, y)[0] >= HIGHLIGHT_CLIP).unwrap();
         let mut img = sensor.clone();
-        colour.rebuild_highlights(&mut img, 0.0);
+        colour.rebuild_highlights(&mut img, Default::default());
         colour.apply(&mut img);
         let mut s = lcc_develop::DevelopSettings::default();
         s.light.exposure = -2.0;
