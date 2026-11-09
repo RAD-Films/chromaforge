@@ -353,7 +353,7 @@ pub struct FinishParams {
     pub local_points: Vec<Vec<crate::colorops::PointK>>,
     /// The masks' local Color Mixers, one per evaluated mask (empty when none has one,
     /// [`crate::colorops::mask_mixer_ks`]); applied before the mask's Point Color.
-    pub local_mixers: Vec<Option<crate::colorops::MixerK>>,
+    pub local_mixers: Vec<Option<crate::colorops::Mixer>>,
     /// Calibration: primaries matrix (row-major, linear Rec.2020) and shadows tint (−1..1).
     pub calib: Option<[[f32; 3]; 3]>,
     pub shadow_tint: f32,
@@ -477,7 +477,7 @@ impl FinishParams {
         FinishParams {
             tone_per_channel: tone_per_channel(s, info, peak),
             peak,
-            calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
+            calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
             tone: base_tone(s, info, peak),
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
@@ -808,7 +808,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     with_tone(&mut terms, &p.mask_tone);
     // (only when it lines up with the evaluated masks, which it does unless a caller mixed settings)
     let local_points: &[Vec<crate::colorops::PointK>] = if fp.local_points.len() == p.masks.len() { &fp.local_points } else { &[] };
-    let local_mixers: &[Option<crate::colorops::MixerK>] = if fp.local_mixers.len() == p.masks.len() { &fp.local_mixers } else { &[] };
+    let local_mixers: &[Option<crate::colorops::Mixer>] = if fp.local_mixers.len() == p.masks.len() { &fp.local_mixers } else { &[] };
     let local_curves: Vec<_> = p.masks.iter().filter_map(|m| Some((m, m.curve.as_ref()?))).collect();
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
@@ -1205,19 +1205,22 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 
 /// The masks' local Color Mixer and Point Color on display-linear Rec.2020 colour `d` of pixel `i`:
 /// each mask's mixer, then its samples, at the mask's opacity there (at most 1). `mixers` and
-/// `local` are each empty or one entry per mask.
+/// `local` are each empty or one entry per mask. A V9 mixer acts on the linear colour (blended by
+/// the opacity), a V1–V8 one in OkLCh like the samples.
 #[inline]
 fn local_point_colors(
     d: [f32; 3],
     i: usize,
     masks: &[crate::masks::Evaluated],
-    mixers: &[Option<crate::colorops::MixerK>],
+    mixers: &[Option<crate::colorops::Mixer>],
     local: &[Vec<crate::colorops::PointK>],
 ) -> [f32; 3] {
+    use crate::colorops::Mixer;
     use lcc_color::perceptual::{lab_to_lch, lch_to_lab, oklab_from_2020, oklab_to_2020};
-    let mut lch: Option<[f32; 3]> = None;
+    // the colour so far: linear (`d`), or in OkLCh once a sample or a V1–V8 mixer has worked on it
+    let (mut d, mut lch): ([f32; 3], Option<[f32; 3]>) = (d, None);
     for (mi, m) in masks.iter().enumerate() {
-        let mixer = mixers.get(mi).copied().flatten();
+        let mixer = mixers.get(mi).and_then(Option::as_ref);
         let points: &[crate::colorops::PointK] = local.get(mi).map_or(&[], Vec::as_slice);
         if points.is_empty() && mixer.is_none() {
             continue;
@@ -1226,8 +1229,17 @@ fn local_point_colors(
         if a <= 0.0 {
             continue;
         }
+        if let Some(Mixer::Measured(t)) = mixer {
+            if let Some(v) = lch.take() {
+                d = oklab_to_2020(lch_to_lab(v));
+            }
+            d = t.apply(d, a);
+            if points.is_empty() {
+                continue;
+            }
+        }
         let mut v = lch.unwrap_or_else(|| lab_to_lch(oklab_from_2020(d)));
-        if let Some(mk) = mixer {
+        if let Some(Mixer::Bands(mk)) = mixer {
             v = mk.apply_scaled(v, a);
         }
         for k in points {

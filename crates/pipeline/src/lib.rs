@@ -41,6 +41,7 @@ pub mod lut;
 pub mod mask_space;
 pub mod mask_tone;
 pub mod masks;
+pub mod mixer_measured;
 pub mod nrc_joint;
 #[cfg(test)]
 mod nrc_joint_reference;

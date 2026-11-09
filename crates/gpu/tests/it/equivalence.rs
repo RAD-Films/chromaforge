@@ -269,6 +269,13 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.mixer.orange.hue = 30.0;
             s.mixer.green.lum = 40.0;
         }),
+        // V1–V8's band mixer (V9 measures Lightroom Classic's: the case above)
+        ("colour mixer (V8)", |s| {
+            s.process = Process::V8.version();
+            s.mixer.blue.sat = -60.0;
+            s.mixer.orange.hue = 30.0;
+            s.mixer.green.lum = 40.0;
+        }),
         ("point color", |s| {
             use lcc_develop::PointColor;
             s.point_colors = vec![
@@ -750,6 +757,11 @@ fn cases() -> Vec<(&'static str, Edit)> {
                     ..Default::default()
                 },
             ];
+        }),
+        ("masks (local color mixer, V8)", |s| {
+            let edit = cases().into_iter().find(|(name, _)| *name == "masks (local color mixer)").map(|c| c.1).expect("the V9 case");
+            edit(s);
+            s.process = Process::V8.version();
         }),
         ("masks (Lightroom brush)", |s| {
             use lcc_develop::BrushStroke;
