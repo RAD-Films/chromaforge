@@ -103,3 +103,32 @@ fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
     // Whites down keeps the tone map's response: V8's, which V9 is built on (its roll-off), not V7's
     assert_eq!(raw_centre(&bright, &whites(Process::V9, -100.0)), raw_centre(&bright, &whites(Process::V8, -100.0)));
 }
+
+/// A raw's sky: a saturated blue patch just below the sensor's white (scene-linear, Rec.2020) in a darker field.
+fn sky() -> Rgb32f {
+    Rgb32f::from_fn(W, H, |x, y| {
+        let inside = (120..240).contains(&x) && (80..160).contains(&y);
+        if inside { [0.42, 0.62, 0.95] } else { [0.03; 3] }
+    })
+}
+
+/// The patch's saturation in the render, (max − min) / max of its 8-bit centre.
+fn saturation(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> f64 {
+    let out = render(src, info, s, &RenderRequest::fit(W, H)).image;
+    let p = out.data[(H / 2) * W + W / 2];
+    let (mx, mn) = (p[..3].iter().copied().max().unwrap_or(0), p[..3].iter().copied().min().unwrap_or(0));
+    if mx == 0 { 0.0 } else { f64::from(mx - mn) / f64::from(mx) }
+}
+
+/// Highlights −100 darkens a bright sky by one factor on all three channels: the sky keeps (or gains) its colour, it
+/// never turns grey, under V9 as under V8.
+#[test]
+fn highlights_down_keep_a_bright_skys_colour() {
+    let src = sky();
+    let info = SourceInfo { raw: true, ..SourceInfo::default() };
+    for p in [Process::V8, Process::V9] {
+        let flat = saturation(&src, &info, &settings(p, 0.0, 0.0));
+        let down = saturation(&src, &info, &settings(p, 0.0, -100.0));
+        assert!(down >= flat - 0.02, "{p:?}: the sky's saturation {flat:.3} at Highlights 0, {down:.3} at -100");
+    }
+}

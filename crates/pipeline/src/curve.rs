@@ -86,7 +86,10 @@ impl ParametricCurve {
         let s2 = if c.split_highlights.is_nan() { 0.75_f64.max(s1) } else { (c.split_highlights / 100.0).clamp(s1, 1.0) };
         let clean_amt = |a: f64| if a.is_nan() { 0.0 } else { a.clamp(-100.0, 100.0) };
         let amounts = [clean_amt(c.shadows), clean_amt(c.darks), clean_amt(c.lights), clean_amt(c.highlights)];
-        let shape = if p >= Process::V9 { Shape::Measured } else { Shape::Bumps };
+        if p < Process::V9 {
+            return ParametricCurve::bumps(c);
+        }
+        let shape = Shape::Measured;
         let mut m = ParametricCurve { lut: [0.0; PARAM_LUT], splits: [s0, s1, s2], amounts, shape };
         let mut prev = 0.0_f32;
         for i in 0..PARAM_LUT {
@@ -100,9 +103,48 @@ impl ParametricCurve {
         m
     }
 
-    /// The splits' knots on the input axis, and where the measured tables have them (the default splits).
-    fn warp_knots(&self) -> ([f64; 5], [f64; 5]) {
-        ([0.0, self.split_x(0), self.split_x(1), self.split_x(2), 1.0], [0.0, 0.25, 0.5, 0.75, 1.0])
+    /// The V1–V8 curve, computed exactly as those processes always have (in `f32`), so their renders never change.
+    fn bumps(c: &ToneCurve) -> ParametricCurve {
+        let s0 = if c.split_shadows.is_nan() { 0.25 } else { (c.split_shadows / 100.0).clamp(0.0, 1.0) as f32 };
+        let s1 = if c.split_mid.is_nan() { 0.50_f32.max(s0) } else { (c.split_mid / 100.0).clamp(s0 as f64, 1.0) as f32 };
+        let s2 = if c.split_highlights.is_nan() { 0.75_f32.max(s1) } else { (c.split_highlights / 100.0).clamp(s1 as f64, 1.0) as f32 };
+        let clean_amt = |a: f64| if a.is_nan() { 0.0 } else { a.clamp(-100.0, 100.0) };
+        let (a0, a1, a2, a3) = (clean_amt(c.shadows), clean_amt(c.darks), clean_amt(c.lights), clean_amt(c.highlights));
+        let splits = [s0 as f64, s1 as f64, s2 as f64];
+        let amounts = [a0, a1, a2, a3];
+        let regions = [(0.0, s0, a0), (s0, s1, a1), (s1, s2, a2), (s2, 1.0, a3)];
+        let mut lut = [0.0_f32; PARAM_LUT];
+        let mut prev = 0.0_f32;
+        for (i, entry) in lut.iter_mut().enumerate() {
+            let x = i as f32 / (PARAM_LUT - 1) as f32;
+            let mut d = 0.0_f32;
+            for (a, b, amt) in regions {
+                if amt == 0.0 {
+                    continue;
+                }
+                let (ctr, half) = ((a + b) / 2.0, (b - a) * 0.75 + 0.05);
+                if half <= f32::EPSILON {
+                    continue;
+                }
+                let t = ((x - ctr) / half).clamp(-1.0, 1.0);
+                d += (amt / 100.0) as f32 * 0.22 * (0.5 + 0.5 * (t * std::f32::consts::PI).cos());
+            }
+            let y = (x + d * 4.0 * x * (1.0 - x)).clamp(0.0, 1.0);
+            prev = prev.max(y);
+            *entry = prev;
+        }
+        ParametricCurve { lut, splits, amounts, shape: Shape::Bumps }
+    }
+
+    /// How the Highlights region reads its table: the input axis with the highlight split taken to where the
+    /// table has it (75), and the other splits left at theirs. Lightroom Classic's Shadows, Darks and Lights bells
+    /// barely move with the splits, and its Highlights bell follows only the highlight split (round 13: Darks +21
+    /// at splits 10 / 56 / 90 lifts a grey chart within 0.3 L* of the default splits' lift; Highlights −60 at split
+    /// 90 pulls +1.6 EV down 2.2 L*, at 75 about 6). The split is held to 65..90 (90 is the furthest measured),
+    /// so a split dragged to either end never squeezes the bell into a step.
+    fn highlight_knots(&self) -> ([f64; 5], [f64; 5]) {
+        let s2 = self.split_x(2).clamp(0.65, 0.9);
+        ([0.0, 0.25, 0.5, s2, 1.0], [0.0, 0.25, 0.5, 0.75, 1.0])
     }
 
     /// Piecewise-straight map taking knots `from` to knots `to` (a segment of no width is skipped).
@@ -135,17 +177,19 @@ impl ParametricCurve {
                 }
                 x + d * 4.0 * x * (1.0 - x)
             }
+            // each region's shift is added to the input itself: no unwarp of the output, which put a step
+            // in the curve wherever moved splits squeezed a segment
             Shape::Measured => {
-                let (user, table) = self.warp_knots();
-                let w = Self::warp(x, &user, &table);
-                let mut y = w;
+                let (user, table) = self.highlight_knots();
+                let mut y = x;
                 for i in 0..4 {
                     let amt = amount(i);
                     if amt != 0.0 {
+                        let w = if i == 3 { Self::warp(x, &user, &table) } else { x };
                         y += measured_shift(i, amt, w);
                     }
                 }
-                Self::warp(y.clamp(0.0, 1.0), &table, &user)
+                y
             }
         }
     }
@@ -461,23 +505,105 @@ mod tests {
         }
     }
 
-    /// Moved splits move the regions: the tables are read with the splits taken to where they were
-    /// measured (25/50/75), so a Darks bend centred between 15 and 50 peaks lower than at the defaults.
+    /// CIE L* of a linear luminance.
+    fn lstar(y: f64) -> f64 {
+        let f = if y > 216.0 / 24389.0 { y.cbrt() } else { (24389.0 / 27.0 * y + 16.0) / 116.0 };
+        116.0 * f - 16.0
+    }
+
+    fn srgb_encode(l: f64) -> f64 {
+        if l <= 0.0031308 { 12.92 * l } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
+    }
+
+    fn srgb_decode(v: f64) -> f64 {
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+
+    /// Splits barely move Lightroom Classic's region bells. Darks +21 with the splits at 10 / 56 / 90 (a sunset
+    /// edit's) lifts a grey chart as at the default splits, not twice as much with a step at the first split
+    /// (round 13: LrC exports of our own chart, 18 greys from −8 to +2.2 EV, ProPhoto exports converted by their
+    /// ICC profile; L* change from the unadjusted chart).
     #[test]
-    fn v8_splits_move_the_regions() {
-        let wide = ParametricCurve::for_process(
-            &ToneCurve { darks: 50.0, split_shadows: 15.0, split_mid: 50.0, split_highlights: 85.0, ..Default::default() },
-            Process::V9,
-        );
-        let plain = ParametricCurve::for_process(&ToneCurve { darks: 50.0, ..Default::default() }, Process::V9);
-        assert!(
-            (wide.at(0.25) - 0.25) > (plain.at(0.25) - 0.25) + 0.005,
-            "lower first split lifts 0.25 more: {} vs {}",
-            wide.at(0.25),
-            plain.at(0.25)
-        );
+    fn v9_moved_splits_keep_lightrooms_darks_bell() {
+        const LRC: [f64; 18] = [0.2, 0.3, 0.4, 0.7, 1.2, 1.7, 2.2, 2.6, 2.9, 3.6, 4.0, 4.0, 4.2, 3.9, 3.5, 2.4, 1.0, 0.2];
+        let c = ToneCurve { darks: 21.0, split_shadows: 10.0, split_mid: 56.0, split_highlights: 90.0, ..Default::default() };
+        let m = ParametricCurve::for_process(&c, Process::V9);
+        for (i, want) in LRC.into_iter().enumerate() {
+            let ev = -8.0 + 0.6 * i as f64;
+            let x = srgb_encode(0.18 * 2.0_f64.powf(ev));
+            let got = lstar(srgb_decode(m.at(x))) - lstar(srgb_decode(x));
+            assert!((got - want).abs() < 1.0, "{ev:+.1} EV: L* {got:+.2} vs Lightroom {want:+.1}");
+        }
+    }
+
+    /// The largest change of slope between neighbouring steps of a 256-step ramp, inside the open range (where the
+    /// curve is pinned at black or white its slope drops to 0, which is no step). A jump in slope is a band in a
+    /// smooth sky.
+    fn worst_kink(m: &ParametricCurve) -> f64 {
+        let n = 255;
+        let y: Vec<f64> = (0..=n).map(|i| m.at(i as f64 / n as f64)).collect();
+        let slope: Vec<f64> = y.windows(2).map(|w| (w[1] - w[0]) * n as f64).collect();
+        let mut worst = 0.0_f64;
+        for (i, s) in slope.windows(2).enumerate() {
+            let at = y[i + 1];
+            if at > 0.002 && at < 0.998 {
+                worst = worst.max((s[1] - s[0]).abs());
+            }
+        }
+        worst
+    }
+
+    /// Moved splits never put a step in a smooth ramp. At the default splits the slope changes by at most 0.67
+    /// between neighbouring steps (every region at +100); the warp V9 had before jumped 2.7 for Darks +21 alone
+    /// at splits 10 / 56 / 90. Any split, any setting, stays under 1.2.
+    #[test]
+    fn v9_moved_splits_put_no_step_in_a_ramp() {
+        let settings = [
+            [0.0, 21.0, 0.0, 0.0],
+            [-5.0, 21.0, 5.0, -60.0],
+            [100.0, 100.0, 100.0, 100.0],
+            [-100.0, -100.0, -100.0, -100.0],
+            [100.0, -100.0, 100.0, -100.0],
+            [-100.0, 100.0, -100.0, 100.0],
+            [0.0, 0.0, 0.0, 100.0],
+            [0.0, 0.0, 0.0, -100.0],
+        ];
+        let splits = [
+            (25.0, 50.0, 75.0),
+            (10.0, 56.0, 90.0),
+            (5.0, 50.0, 98.0),
+            (40.0, 60.0, 60.0),
+            (20.0, 30.0, 55.0),
+            (25.0, 50.0, 99.0),
+            (25.0, 50.0, 51.0),
+        ];
+        for [shadows, darks, lights, highlights] in settings {
+            for (s0, s1, s2) in splits {
+                let c =
+                    ToneCurve { shadows, darks, lights, highlights, split_shadows: s0, split_mid: s1, split_highlights: s2, ..Default::default() };
+                let k = worst_kink(&ParametricCurve::for_process(&c, Process::V9));
+                assert!(k < 1.2, "{shadows}/{darks}/{lights}/{highlights} at {s0}/{s1}/{s2}: slope jumps {k:.2}");
+            }
+        }
+    }
+
+    /// Of the three splits only the highlight one moves a region, and only its own: Highlights −50 with the split
+    /// at 90 pulls a light grey down less than at 75 (Lightroom: −2.2 L* vs our −4.2 before, at +1.6 EV), while
+    /// Darks ignores where its splits sit.
+    #[test]
+    fn v9_only_the_highlight_split_moves_its_region() {
+        let at = |c: ToneCurve| ParametricCurve::for_process(&c, Process::V9);
+        let plain = at(ToneCurve { darks: 50.0, ..Default::default() });
+        let wide = at(ToneCurve { darks: 50.0, split_shadows: 15.0, split_mid: 40.0, split_highlights: 75.0, ..Default::default() });
+        for i in 0..=20 {
+            let x = i as f64 / 20.0;
+            assert!((wide.at(x) - plain.at(x)).abs() < 0.002, "Darks at {x}: {} vs {}", wide.at(x), plain.at(x));
+        }
+        let hl = at(ToneCurve { highlights: -50.0, ..Default::default() });
+        let hl90 = at(ToneCurve { highlights: -50.0, split_highlights: 90.0, ..Default::default() });
+        assert!(hl.at(0.8) < hl90.at(0.8) - 0.005, "split 90 pulls 0.8 down less: {} vs {}", hl90.at(0.8), hl.at(0.8));
         for x in [0.0, 1.0] {
-            assert!((wide.at(x) - plain.at(x)).abs() < 0.01, "black and white stay put at {x}");
+            assert!((hl90.at(x) - hl.at(x)).abs() < 0.01, "black and white stay put at {x}");
         }
     }
 

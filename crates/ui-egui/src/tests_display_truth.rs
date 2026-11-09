@@ -184,8 +184,9 @@ fn an_edited_raw_never_rendered_shows_a_draft_of_its_edit_at_once() {
     // (at once on the processor; a first GPU render can take its device set-up time)
     assert!(frames(&mut h, T, &mut seen, edit_shown), "{seen:?}");
     assert!(!seen.iter().any(|(_, s)| *s == "embedded"), "the camera JPEG: {seen:?}");
-    // the filmstrip cells too: drafts, no camera JPEG
-    let film = frames(&mut h, Duration::from_secs(2), &mut seen, |h| (1..=6).all(|id| h.app.renderer.thumb(PhotoId(id)).is_some()));
+    // the filmstrip cells too: drafts, no camera JPEG (as long as the loupe's wait: on a cold test binary the cells
+    // come after the device set-up and the import's thumbnail work, which a busy machine stretches)
+    let film = frames(&mut h, T, &mut seen, |h| (1..=6).all(|id| h.app.renderer.thumb(PhotoId(id)).is_some()));
     assert!(film, "filmstrip cells empty");
     for id in 1..=6 {
         if let Some(t) = h.app.renderer.thumb(PhotoId(id)) {

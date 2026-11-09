@@ -60,7 +60,56 @@ use lcc_raw::{
 /// 25: fitted tone curves no steeper than a log-log slope of 4 between knots (upstream #1904 / #2656).
 /// 26: a Sony "12-bit uncompressed" ARW takes the 14-bit scale from its word layout, not its brightest sample, so a
 /// dark frame is no longer fitted on the wrong black and white levels (upstream #3429).
+///
+/// 23 to 26 are process V9's: a photo on V1 to V8 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
 pub const LOOK_VERSION: u32 = 26;
+
+/// The fit of [`LOOK_VERSION`] 22, the last one processes V1 to V8 had.
+pub const LOOK_VERSION_V8: u32 = 22;
+
+/// Which camera-look fit a decode makes: the one of its photo's process. Processes V1 to V8 keep the fit of
+/// [`LOOK_VERSION_V8`] (the tone curve smoothed by its slope alone, no bound on its steepness), so an edit saved under
+/// them looks as it did; V9 takes every later fit change (23 to 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FitGen {
+    V8,
+    Current,
+}
+
+impl FitGen {
+    /// The fit of process number `process` (`LoadOptions::process`).
+    pub(crate) fn of_process(process: u32) -> FitGen {
+        if process >= lcc_develop::Process::V9.version().0 { FitGen::Current } else { FitGen::V8 }
+    }
+
+    /// The [`LOOK_VERSION`] this fit writes into a smart preview.
+    pub(crate) fn look_version(self) -> u32 {
+        match self {
+            FitGen::V8 => LOOK_VERSION_V8,
+            FitGen::Current => LOOK_VERSION,
+        }
+    }
+}
+
+thread_local! {
+    static FIT_GEN: std::cell::Cell<FitGen> = const { std::cell::Cell::new(FitGen::Current) };
+}
+
+/// Run `f` (a decode's camera-look fit, on this thread) with fit `fit`; everything else fits with the current one.
+pub(crate) fn with_fit_gen<R>(fit: FitGen, f: impl FnOnce() -> R) -> R {
+    struct Restore(FitGen);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIT_GEN.with(|g| g.set(self.0));
+        }
+    }
+    let _restore = Restore(FIT_GEN.with(|g| g.replace(fit)));
+    f()
+}
+
+fn fit_gen() -> FitGen {
+    FIT_GEN.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CameraLook {
@@ -840,12 +889,30 @@ fn with_smooth_tone(look: CameraLook) -> CameraLook {
     let ln = |y: f32| f64::from(y).max(1e-6).ln();
     let values: Vec<f64> = grid.xs.iter().map(|&x| ln(look.tone.apply(x))).collect();
     let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return look };
-    if !(values.iter().all(|v| v.is_finite()) && last > first) {
-        return look;
-    }
-    let sigma = TONE_SMOOTHING / grid.step;
-    let blurred = blur_point_reflected(&values, sigma);
-    let curve = hold_level(&grid, &values, blurred);
+    let curve = if fit_gen() == FitGen::V8 {
+        // (the fit of processes V1 to V8: the slope blurred and integrated back, both ends kept)
+        let slope: Vec<f64> = values.windows(2).map(|w| (w[1] - w[0]) / grid.step).collect();
+        let smooth = blur_mirrored(&slope, TONE_SMOOTHING / grid.step);
+        let total = smooth.iter().sum::<f64>() * grid.step;
+        if !(total.is_finite() && total > 0.0 && last > first) {
+            return look;
+        }
+        let mut curve = Vec::with_capacity(TONE_GRID);
+        let mut y = first;
+        curve.push(y);
+        for s in &smooth {
+            y += s * grid.step * (last - first) / total;
+            curve.push(y);
+        }
+        curve
+    } else {
+        if !(values.iter().all(|v| v.is_finite()) && last > first) {
+            return look;
+        }
+        let sigma = TONE_SMOOTHING / grid.step;
+        let blurred = blur_point_reflected(&values, sigma);
+        hold_level(&grid, &values, blurred)
+    };
     let [.., [_, own_end]] = own;
     let mut knots = grid.knots(&curve, own_end, |_| 1.0);
     ease_shoulder(&mut knots, &own, |_| 1.0);
@@ -2789,7 +2856,15 @@ fn fit_tone(pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
     if knots[31][0] < knots[0][0] * MIN_TONE_RANGE {
         return None;
     }
-    CameraTone::new(limit_elasticity(knots, &pairs)?)
+    CameraTone::new(bounded(knots, &pairs)?)
+}
+
+/// `knots` under [`MAX_TONE_ELASTICITY`] ([`limit_elasticity`]); the fit of processes V1 to V8 has no bound.
+fn bounded(knots: [[f32; 2]; 32], pairs: &[(f64, f64)]) -> Option<[[f32; 2]; 32]> {
+    match fit_gen() {
+        FitGen::V8 => Some(knots),
+        FitGen::Current => limit_elasticity(knots, pairs),
+    }
 }
 
 /// Largest log-log slope (elasticity, d ln y / d ln x with [`ELASTICITY_BLACK`] added to y) a fitted tone curve may
@@ -2937,7 +3012,7 @@ fn fit_tone_conditional(mut pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
         }
         i += n;
     }
-    CameraTone::new(limit_elasticity(knots, &pairs)?)
+    CameraTone::new(bounded(knots, &pairs)?)
 }
 
 #[cfg(test)]
@@ -4478,6 +4553,48 @@ mod tests {
         for x in [0.6, 0.8, 1.2, 2.0, 4.0] {
             assert!(smooth.tone.apply(x) <= fitted.tone.apply(x) + 1e-5, "shoulder at {x}: {} > {}", smooth.tone.apply(x), fitted.tone.apply(x));
         }
+    }
+
+    /// Processes V1 to V8 keep the camera-look fit they had (LOOK 22): the two-population step of #1904 is not
+    /// bounded and the smoothed curve is not held at the fitted level, both only for V9's fit; the fit is chosen per
+    /// decode and put back after it.
+    #[test]
+    fn processes_v1_to_v8_keep_the_fit_of_look_22() {
+        let mut pairs = Vec::new();
+        for i in 0..620 {
+            let x = 0.040 + 0.012 * f64::from(i) / 620.0;
+            pairs.push((x, 1.7 * x));
+        }
+        for i in 0..380 {
+            let x = 0.02 * (10.0f64).powf(f64::from(i) / 380.0);
+            pairs.push((x, 2.64 * x));
+        }
+        let steepest = |k: &[[f32; 2]; 32]| {
+            k.windows(2)
+                .map(|w| {
+                    ((f64::from(w[1][1]) + ELASTICITY_BLACK) / (f64::from(w[0][1]) + ELASTICITY_BLACK)).ln()
+                        / (f64::from(w[1][0]) / f64::from(w[0][0])).ln()
+                })
+                .fold(0.0, f64::max)
+        };
+        let v8 = with_fit_gen(FitGen::V8, || fit_tone(pairs.clone())).unwrap();
+        let v9 = fit_tone(pairs.clone()).unwrap();
+        assert!(steepest(v8.knots()) > 10.0, "V8: the step is kept ({})", steepest(v8.knots()));
+        assert!(steepest(v9.knots()) <= MAX_TONE_ELASTICITY + 1e-3);
+        assert_eq!(fit_gen(), FitGen::Current, "the fit is put back after the decode");
+        // the smoothing: V8's blurs the slope alone, so a bending curve comes out lower around grey
+        let xs: [f32; 32] = std::array::from_fn(|i| 0.002 * (0.6f32 / 0.002).powf(i as f32 / 31.0));
+        let f = |x: f32| {
+            let l = (x / 0.18).ln();
+            0.46 * (0.9 * l - 0.25 * l * l).exp()
+        };
+        let fitted = dro_test_look(&xs, &f);
+        let old = with_fit_gen(FitGen::V8, || with_smooth_tone(fitted.clone()));
+        let new = with_smooth_tone(fitted.clone());
+        let d = |l: &CameraLook| (l.tone.apply(0.18) / fitted.tone.apply(0.18)).ln();
+        assert!(d(&old) < -0.02 && d(&new).abs() < 0.01, "V8 {:+.4}, V9 {:+.4} in log at grey", d(&old), d(&new));
+        assert_eq!((FitGen::of_process(8), FitGen::of_process(9), FitGen::of_process(1)), (FitGen::V8, FitGen::Current, FitGen::V8));
+        assert_eq!((FitGen::V8.look_version(), FitGen::Current.look_version()), (LOOK_VERSION_V8, LOOK_VERSION));
     }
 
     /// Smoothing keeps a fitted curve's level: a smooth camera curve that bends down in log-log all

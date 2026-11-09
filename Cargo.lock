@@ -5224,6 +5224,7 @@ dependencies = [
  "lcc-raster",
  "lcc-raw",
  "lcc-scenes",
+ "lcc-testkit",
  "proptest",
  "rayon",
  "serde",
