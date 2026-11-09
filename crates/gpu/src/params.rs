@@ -87,6 +87,11 @@ const FIELDS: &[(&str, usize)] = &[
     ("WHEELS", 12),
     ("BLENDING", 1),
     ("BALANCE", 1),
+    ("SPLIT", 1),
+    ("SPLIT_K", lcc_pipeline::split_v9::SPLIT_WORDS),
+    ("SPLIT_ZSH", 61),
+    ("SPLIT_ZHL", 61),
+    ("SPLIT_ZMIX", 61),
     ("SKIN", 1),
     ("BANDH", 8),
     // the colourist primaries (`PrimariesK`): the Color wheels then the Log wheels (rgb + master
@@ -165,6 +170,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("TONE_PC_FROM", 9),
     ("SHADOW_TINT", 1),
     ("OUT_M", 9),
+    ("OUT_INV", 9),
     ("OUT_Y", 3),
     ("OUT_TRC", 1),
     ("OUT_GAMMA", 1),
@@ -455,6 +461,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.b("HSL", true);
         p.fs("HSL_LUT", &hsl.words());
     }
+    if let Some(k) = &ops.split {
+        p.b("SPLIT", true);
+        p.fs("SPLIT_K", &k.words());
+        p.fs("SPLIT_ZSH", &lcc_pipeline::split_v9::SPLIT_ZONE_SH);
+        p.fs("SPLIT_ZHL", &lcc_pipeline::split_v9::SPLIT_ZONE_HL);
+        p.fs("SPLIT_ZMIX", &lcc_pipeline::split_v9::SPLIT_MIX);
+    }
     p.f("SKIN", ops.skin);
     p.fs("BANDH", lcc_pipeline::colorops::band_hues());
 
@@ -488,6 +501,11 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     }
     p.f("SHADOW_TINT", fp.shadow_tint);
     p.fs("OUT_M", fp.to_out.as_flattened());
+    match lcc_pipeline::finish::inv3(&fp.to_out) {
+        Some(m) => p.fs("OUT_INV", m.as_flattened()),
+        // singular output matrix (never in practice): no split, as the CPU
+        None => p.b("SPLIT", false),
+    }
     p.fs("OUT_Y", &fp.out_luma);
     let (trc, gamma) = fp.out_trc.code();
     p.u("OUT_TRC", trc);

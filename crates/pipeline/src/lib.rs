@@ -54,6 +54,7 @@ pub mod retouch;
 pub mod scene_model;
 pub mod skin;
 pub mod source_stage;
+pub mod split_v9;
 pub mod spots;
 pub mod tone;
 pub mod tone_lift;

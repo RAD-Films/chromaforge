@@ -125,6 +125,14 @@ fn lin_to_srgb(v: f32) -> f32 {
     return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 
+fn srgb_dec_odd(v: f32) -> f32 {
+    return sign(v) * srgb_to_lin(abs(v));
+}
+
+fn srgb_enc_odd(v: f32) -> f32 {
+    return sign(v) * lin_to_srgb(abs(v));
+}
+
 fn srgb_to_lin(v: f32) -> f32 {
     if (v <= 0.04045) {
         return v / 12.92;
@@ -483,6 +491,30 @@ fn color_ops(rgb0: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
         }
     }
     return oklab_inv(lab);
+}
+
+// `split_v9::zone`: a profile (`SPLIT_N` floats from parameter `at`) read at lightness `x`.
+fn split_zone(at: u32, x: f32) -> f32 {
+    let f = clamp((x - SPLIT_L0) / SPLIT_DL, 0.0, f32(SPLIT_N - 1u));
+    let i = min(u32(f), SPLIT_N - 2u);
+    let u = f - f32(i);
+    let a = pf(at + i);
+    return a + (pf(at + i + 1u) - a) * u;
+}
+
+// `split_v9::SplitK::offset`: process V9's shadows and highlights wheels as an OkLab offset (L, a, b).
+fn split_offset(l: f32) -> vec3<f32> {
+    let k = F_SPLIT_K;
+    let ws = split_zone(F_SPLIT_ZSH, SPLIT_CENTRE + (l - pf(k + 6u) - SPLIT_CENTRE) / pf(k + 8u));
+    let wh = split_zone(F_SPLIT_ZHL, SPLIT_CENTRE + (l - pf(k + 7u) - SPLIT_CENTRE) / pf(k + 8u));
+    var o = ws * vec3<f32>(pf(k), pf(k + 1u), pf(k + 2u)) + wh * vec3<f32>(pf(k + 3u), pf(k + 4u), pf(k + 5u));
+    if (pf(k + 9u) > 0.0) {
+        let a = split_zone(F_SPLIT_ZMIX, l);
+        let t = clamp((l - pf(k + 16u)) / max(pf(k + 17u), 1e-3), -60.0, 60.0);
+        let s = 1.0 / (1.0 + exp(-t));
+        o += a * ((1.0 - s) * vec3<f32>(pf(k + 10u), pf(k + 11u), pf(k + 12u)) + s * vec3<f32>(pf(k + 13u), pf(k + 14u), pf(k + 15u)));
+    }
+    return o;
 }
 
 // `colorops::calibrate`: primaries matrix, then the shadows tint (luminance kept).
@@ -1278,6 +1310,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rs = pf(F_REFINE_SAT);
         if (rs < 1.0) {
             e = refine_saturation(e0, e, rs);
+        }
+    }
+    // --- process V9 Split Toning on the curved display colour (`finish::split_display`)
+    if (pu(F_SPLIT) != 0u) {
+        let lin = vec3<f32>(srgb_dec_odd(e.x), srgb_dec_odd(e.y), srgb_dec_odd(e.z));
+        let lab = oklab(mul3(mat_at(F_OUT_INV), lin));
+        let q = mul3(mat_at(F_OUT_M), oklab_inv(lab + split_offset(lab.x)));
+        let s = vec3<f32>(srgb_enc_odd(q.x), srgb_enc_odd(q.y), srgb_enc_odd(q.z));
+        if (all(s == s) && all(abs(s) < vec3<f32>(1e30))) {
+            e = s;
         }
     }
     // --- the masks' local Curves, in mask order, each weighted by its mask (`finish::local_curve_luts`)
