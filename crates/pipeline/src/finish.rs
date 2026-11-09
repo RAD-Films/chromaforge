@@ -380,6 +380,8 @@ pub struct FinishParams {
     /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
     /// render's plan.
     pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
+    /// Process V9's extra Highlights pull next to clipped areas ([`crate::hl_edge`]), added to the table's shift.
+    pub edge_pull: Option<std::sync::Arc<crate::hl_edge::EdgePull>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -495,6 +497,7 @@ impl FinishParams {
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
             lift: None,
+            edge_pull: None,
             clar,
             tex,
             dehaze,
@@ -699,6 +702,7 @@ pub(crate) fn finish(
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
     fp.lift = p.tone_lift.clone();
+    fp.edge_pull = p.edge_pull.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -734,6 +738,7 @@ pub(crate) fn finish_deep(
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
     fp.lift = p.tone_lift.clone();
+    fp.edge_pull = p.edge_pull.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -934,7 +939,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let mut delta = 0.0f32;
             // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
             let (hh, ss) = if let Some(lf) = lift {
-                delta += lf.at(base);
+                delta += lf.at(base) + fp.edge_pull.as_deref().map_or(0.0, |e| e.at(x, y));
                 (l_hl, l_sh)
             } else {
                 (hl + l_hl, sh + l_sh)

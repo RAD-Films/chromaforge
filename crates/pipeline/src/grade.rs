@@ -163,6 +163,7 @@ impl GradeLut {
             masks: Vec::new(),
             mask_tone: Vec::new(),
             tone_lift: None,
+            edge_pull: None,
             px_per_long: plan.px_per_long,
         };
         // (a grading LUT for video: no plug-in filters)

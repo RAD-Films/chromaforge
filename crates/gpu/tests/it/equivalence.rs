@@ -1043,6 +1043,37 @@ fn clipped_highlights_stay_neutral_on_both() {
     }
 }
 
+/// Process V9's extra Highlights pull next to clipped areas (`lcc_pipeline::hl_edge`): the GPU reads the same plane
+/// as the CPU, on the whole frame and on a zoomed window of it, at Highlights −100 and −50.
+#[test]
+fn v9_highlights_pull_next_to_clipped_areas_matches() {
+    if !gpu() {
+        return;
+    }
+    // a dark ground under a bright sky whose middle clips, with a cloud edge running through it
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        if y > 460 {
+            return [0.02, 0.025, 0.018];
+        }
+        let d = ((x as f32 - 480.0) / 300.0).powi(2) + ((y as f32 - 200.0) / 160.0).powi(2);
+        let cloud = if x + y / 2 > 520 { 1.0 } else { 0.55 };
+        let v = (2.6 - 2.0 * d).max(0.2) * cloud;
+        [0.9 * v, 0.95 * v, 1.1 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 300, y: 80, w: 320, h: 240 };
+    for hl in [-100.0, -50.0] {
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        s.light.highlights = hl;
+        let req = RenderRequest::fit(w, h);
+        let plan = lcc_pipeline::plan(&src, &info, &s, &req);
+        assert!(plan.edge_pull.is_some(), "Highlights {hl}: the pull is on");
+        check(&format!("V9 edge pull {hl}"), &src, &info, &s, &req);
+        check(&format!("V9 edge pull {hl} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+    }
+}
+
 /// Black pixels have no hue. The GPU's `atan2(0, 0)` is undefined (NaN on some GPUs), which made
 /// every exactly black pixel NaN once a colour tool ran, and a lightening vignette then showed it:
 /// the CPU lifted the black corners, the GPU left them black.

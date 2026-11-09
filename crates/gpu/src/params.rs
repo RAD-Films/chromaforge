@@ -50,6 +50,17 @@ const FIELDS: &[(&str, usize)] = &[
     ("LIFT_N", 1),
     ("LIFT_LO", 1),
     ("LIFT_STEP", 1),
+    // process V9's extra Highlights pull next to clipped areas (`FinishParams::edge_pull`): its plane in `aux` at
+    // EDGE_OFF, EDGE_W × EDGE_H, read at (origin + pixel + 0.5) · scale − 0.5 and scaled by EDGE_GAIN
+    ("EDGE_PULL", 1),
+    ("EDGE_OFF", 1),
+    ("EDGE_W", 1),
+    ("EDGE_H", 1),
+    ("EDGE_GAIN", 1),
+    ("EDGE_SX", 1),
+    ("EDGE_SY", 1),
+    ("EDGE_OX", 1),
+    ("EDGE_OY", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -325,6 +336,15 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some(l) = lift {
         aux.extend_from_slice(&l.0);
     }
+    // process V9's extra Highlights pull (only with the table it adds to, as on the CPU)
+    let edge_off = aux.len();
+    let edge = fp
+        .edge_pull
+        .as_ref()
+        .filter(|e| lift.is_some() && e.plane.width > 0 && e.plane.height > 0 && e.plane.data.len() == e.plane.width * e.plane.height);
+    if let Some(e) = edge {
+        aux.extend_from_slice(&e.plane.data);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -533,6 +553,17 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("LIFT_N", lcc_pipeline::tone_lift::LIFT_N as u32);
         p.f("LIFT_LO", lcc_pipeline::tone_lift::LIFT_LO);
         p.f("LIFT_STEP", lcc_pipeline::tone_lift::LIFT_STEP);
+    }
+    if let Some(e) = edge {
+        p.b("EDGE_PULL", true);
+        p.u("EDGE_OFF", edge_off as u32);
+        p.u("EDGE_W", e.plane.width as u32);
+        p.u("EDGE_H", e.plane.height as u32);
+        p.f("EDGE_GAIN", e.gain);
+        p.f("EDGE_SX", e.scale.0);
+        p.f("EDGE_SY", e.scale.1);
+        p.u("EDGE_OX", u32::try_from(e.origin.0).unwrap_or(u32::MAX));
+        p.u("EDGE_OY", u32::try_from(e.origin.1).unwrap_or(u32::MAX));
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

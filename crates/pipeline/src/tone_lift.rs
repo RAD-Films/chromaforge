@@ -36,6 +36,7 @@ use crate::geometry::Frame;
 use crate::local::{frame_proxy, log_lum, white_balance};
 use crate::tone::{GREY, ToneMap};
 
+mod highlights;
 mod raw;
 mod tables;
 mod whites;
@@ -263,14 +264,17 @@ impl Lift {
         }
         // Shadows +100 never darkens much and Highlights −100 never brightens much (a fit's tail can say otherwise)
         let cw = whites::WHITES_UP_RAW.curve(td);
-        let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + gh * ch.at(d).min(SIGN_SLACK) + gw * cw.at(d);
+        // a raw's Highlights −: Lightroom's pull of the scene tone ([`highlights`]) in place of the displayed-tone curve
+        let pull = (display.is_some() && gh > 0.0).then(|| highlights::Pull::of(t));
+        let hl = |d: f32| if pull.is_some() { 0.0 } else { gh * ch.at(d).min(SIGN_SLACK) };
+        let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + hl(d) + gw * cw.at(d);
         let v = (0..LIFT_N)
             .map(|i| {
                 let e = LIFT_LO + LIFT_STEP * i as f32;
                 // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
                 let s = match display {
                     None => shift(e),
-                    Some(d) => scene_shift(d, e, shift(d(e))),
+                    Some(d) => scene_shift(d, e, shift(d(e))) + pull.map_or(0.0, |p| gh * p.at(e)),
                 };
                 if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
             })
@@ -377,6 +381,13 @@ fn finite(v: f32) -> f32 {
 /// Whether `s` renders its global Highlights / Shadows with this module's curve.
 pub fn active(s: &DevelopSettings) -> bool {
     s.process.process() >= Process::V9 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
+}
+
+/// The share of Lightroom's −100 pull a negative Highlights in `s` gives under process V9 ([`active`]), `None` when
+/// Highlights isn't below 0 there.
+pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
+    let h = (s.light.highlights / 100.0) as f32;
+    (active(s) && h < 0.0).then(|| highlights_gain(finite(h)))
 }
 
 /// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V9 and above, Whites up
@@ -536,8 +547,10 @@ mod tests {
         // a camera curve that clips 2 EV over grey: every scene tone above shows as white
         let d = |e: f32| e.min(2.0);
         let l = Lift::new(&picture(), 0.0, -1.0, Some(&d));
+        // (Lightroom's pull of a raw compresses tones past white, [`highlights`], but never reverses them)
         let (a, b) = (3.0 + l.at(3.0), 5.0 + l.at(5.0));
-        assert!(b - a > 1.9, "tones past white stay apart: {a} and {b}");
+        assert!(b - a > 0.5, "tones past white stay apart: {a} and {b}");
+        assert!(l.0.iter().enumerate().all(|(i, v)| i == 0 || LIFT_STEP + v >= l.0[i - 1] - 1e-5), "monotone");
     }
 
     #[test]
@@ -559,9 +572,11 @@ mod tests {
         let d = |e: f32| e;
         let s = Lift::new(&picture(), 1.0, 0.0, Some(&d));
         let h = Lift::new(&picture(), 0.0, -1.0, Some(&d));
-        for (e, want_s, want_h) in GOLDEN_RAW {
+        // (a raw's Highlights − is Lightroom's pull of the scene tone instead, [`highlights`])
+        let pull = highlights::Pull::of(&picture());
+        for (e, want_s, _) in GOLDEN_RAW {
             assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
-            assert!((h.at(e) - want_h).abs() < 3e-3, "highlights at {e}: {} vs {want_h}", h.at(e));
+            assert!((h.at(e) - pull.at(e)).abs() < 3e-3, "highlights at {e}: {} vs {}", h.at(e), pull.at(e));
         }
         // and a display-referred picture doesn't get it
         let tiff = Lift::new(&picture(), 1.0, 0.0, None);

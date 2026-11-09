@@ -35,6 +35,7 @@ pub mod genpatch;
 pub mod geometry;
 pub mod grade;
 pub mod grain;
+pub mod hl_edge;
 pub mod local;
 pub mod local_tone;
 pub mod lut;
@@ -382,6 +383,8 @@ pub(crate) struct Prepared {
     pub mask_tone: Vec<[f32; 4]>,
     /// The global Highlights / Shadows table of process V9 ([`Plan::tone_lift`]).
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
+    /// Process V9's extra Highlights pull next to clipped areas ([`Plan::edge_pull`]).
+    pub edge_pull: Option<Arc<hl_edge::EdgePull>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
 }
@@ -584,6 +587,9 @@ pub struct Plan<'a> {
     /// Process V9's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
     /// the whole frame so previews, zoomed windows and exports agree; `None` before V9 or with both at 0.
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
+    /// Process V9's extra pull of a raw's Highlights − next to clipped areas ([`hl_edge`]), over the whole output
+    /// frame; `None` without it.
+    pub edge_pull: Option<Arc<hl_edge::EdgePull>>,
     /// A windowed render works on a larger window when spots reach into it (see
     /// [`spots::window_for_reads`]); this is the requested window inside the rendered one, which
     /// the result is cut to.
@@ -737,8 +743,9 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         info.mattes.clone()
     };
     let mask_tone = mask_tone::ranges(aux(), info, s, &whole_frame, mattes.as_deref());
-    let tone_lift =
-        if tone_lift::active(s) { tone_lift::for_frame(aux(), info, s, &whole_frame, finish::shown_tone(s, info).as_ref()) } else { None };
+    let shown = finish::shown_tone(s, info);
+    let tone_lift = if tone_lift::active(s) { tone_lift::for_frame(aux(), info, s, &whole_frame, shown.as_ref()) } else { None };
+    let edge_pull = hl_edge::for_frame(aux(), info, s, &whole_frame, (full_w, full_h), origin, shown.as_ref());
     Plan {
         settings,
         frame,
@@ -757,6 +764,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         fixed_air,
         mask_tone,
         tone_lift,
+        edge_pull,
         keep,
         mattes,
         source_filters,
@@ -1062,6 +1070,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     }
     prep.mask_tone = plan.mask_tone.clone();
     prep.tone_lift = plan.tone_lift.clone();
+    prep.edge_pull = plan.edge_pull.clone();
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
         c.put(CacheEntry { src: a.clone(), geo, sampled, filtered, lin: Some((lin_key, lin)), nr: nr.map(|n| (nr_key, n)), colour_noise, planes });

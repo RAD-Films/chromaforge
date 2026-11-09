@@ -1146,6 +1146,7 @@ pub(crate) fn prepare(
         masks,
         mask_tone: Vec::new(),
         tone_lift: None,
+        edge_pull: None,
         px_per_long,
     }
 }

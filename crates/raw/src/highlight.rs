@@ -82,6 +82,15 @@ const AGREE: (f32, f32) = (0.15, 0.4);
 /// shows it.
 const PALE: (f32, f32) = (0.2, 0.4);
 
+/// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
+/// `OWN_HUE.0` to `OWN_HUE.1` stops (a small coloured object inside a pale clipped area, such as orange roof caps
+/// against a pale sky) keeps up to [`OWN_HUE_MAX`] of its own colour, its clipped channels at their clip. Taking the
+/// rim's colour alone turned such roof caps lemon yellow (hue 90°, chroma 37, Lightroom Classic 74.5° and 28); with
+/// this, 70° and 29. Keeping all of the own colour turned them salmon, and starting below 0.3 stops tinted pale cloud.
+const OWN_HUE: (f32, f32) = (0.3, 0.8);
+/// The largest share of its own colour a partly clipped pixel keeps ([`OWN_HUE`]).
+const OWN_HUE_MAX: f32 = 0.5;
+
 #[inline]
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -536,6 +545,14 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k)
             };
             let local = (trust > 0.0).then(|| rebuild(p, q, cl, borrowed, clip, max_level)).flatten().map(past_rim);
+            // a small coloured object in a pale clipped area keeps part of its own colour ([`OWN_HUE`])
+            let local = match (local, rim_colour) {
+                (Some(a), Some(rc)) => {
+                    let o = OWN_HUE_MAX * smoothstep(OWN_HUE.0, OWN_HUE.1, contradiction(p, q, cl, rc, clip));
+                    Some(std::array::from_fn(|c| a[c] + (q[c] - a[c]) * o))
+                }
+                (l, _) => l,
+            };
             let plain = (trust < 1.0).then(|| rebuild(p, q, cl, neutral, clip, max_level)).flatten().map(past_rim);
             let mut out = match (local, plain) {
                 (Some(a), Some(b)) => std::array::from_fn(|c| b[c] + (a[c] - b[c]) * trust),
@@ -925,6 +942,46 @@ mod tests {
         assert!(step <= 0.004, "chroma steps by {step}");
         let (before, _) = sky_swing(false);
         assert!(before > 5.0, "V1-V8 swings {before}° (the cyan blob), rim hue {hue}°");
+    }
+
+    /// The 6642 roof caps: small orange objects (red and green clipped, blue not) inside a pale sky that clips too.
+    /// Rebuilt in the sky rim's colour alone, they lost their orange; with [`OWN_HUE`] they keep part of it. Returns
+    /// the caps' mean hue distance (degrees) from their own orange, and their mean chroma against the orange's.
+    fn cap_hue(rim_hue: bool) -> (f32, f32) {
+        let sky = [1.0, 1.1, 1.3];
+        let orange = [2.8, 1.7, 0.7];
+        let (w, h) = (128usize, 128usize);
+        let cap = |x: usize, y: usize| (x as f32 - 64.0).hypot(y as f32 - 64.0) < 6.0;
+        let img0 = Rgb32f::from_fn(w, h, |x, y| {
+            if cap(x, y) {
+                return sensor(orange);
+            }
+            let d = ((x as f32 - 64.0) / 50.0).powi(2) + ((y as f32 - 64.0) / 50.0).powi(2);
+            sensor(sky.map(|v| v * (1.3 - 0.6 * d).max(0.5)))
+        });
+        let mut img = img0.clone();
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue }, None);
+        let (own, own_c) = hue_chroma(orange);
+        let (mut dh, mut c, mut n) = (0f32, 0f32, 0f32);
+        for y in 0..h {
+            for x in 0..w {
+                if cap(x, y) {
+                    let (hh, cc) = hue_chroma(balanced(img.get(x, y)));
+                    dh += ((hh - own + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    c += cc;
+                    n += 1.0;
+                }
+            }
+        }
+        (dh / n.max(1.0), c / n.max(1.0) / own_c)
+    }
+
+    #[test]
+    fn with_rim_hue_a_small_orange_object_in_a_pale_clipped_sky_stays_orange() {
+        // (rim's colour alone: 21° off, the caps' blue unclipped channel ignored)
+        let (dh, c) = cap_hue(true);
+        assert!(dh < 5.0, "caps {dh}° off their orange");
+        assert!((0.7..1.1).contains(&c), "caps at {c} of their orange's chroma");
     }
 
     /// Without [`Rebuild::rim_hue`] (V1–V8) the rebuild is exactly [`reconstruct_brighter`]'s, masked or not.
