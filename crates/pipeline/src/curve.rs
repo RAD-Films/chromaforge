@@ -86,7 +86,10 @@ impl ParametricCurve {
         let s2 = if c.split_highlights.is_nan() { 0.75_f64.max(s1) } else { (c.split_highlights / 100.0).clamp(s1, 1.0) };
         let clean_amt = |a: f64| if a.is_nan() { 0.0 } else { a.clamp(-100.0, 100.0) };
         let amounts = [clean_amt(c.shadows), clean_amt(c.darks), clean_amt(c.lights), clean_amt(c.highlights)];
-        let shape = if p >= Process::V9 { Shape::Measured } else { Shape::Bumps };
+        if p < Process::V9 {
+            return ParametricCurve::bumps(c);
+        }
+        let shape = Shape::Measured;
         let mut m = ParametricCurve { lut: [0.0; PARAM_LUT], splits: [s0, s1, s2], amounts, shape };
         let mut prev = 0.0_f32;
         for i in 0..PARAM_LUT {
@@ -98,6 +101,39 @@ impl ParametricCurve {
             }
         }
         m
+    }
+
+    /// The V1–V8 curve, computed exactly as those processes always have (in `f32`), so their renders never change.
+    fn bumps(c: &ToneCurve) -> ParametricCurve {
+        let s0 = if c.split_shadows.is_nan() { 0.25 } else { (c.split_shadows / 100.0).clamp(0.0, 1.0) as f32 };
+        let s1 = if c.split_mid.is_nan() { 0.50_f32.max(s0) } else { (c.split_mid / 100.0).clamp(s0 as f64, 1.0) as f32 };
+        let s2 = if c.split_highlights.is_nan() { 0.75_f32.max(s1) } else { (c.split_highlights / 100.0).clamp(s1 as f64, 1.0) as f32 };
+        let clean_amt = |a: f64| if a.is_nan() { 0.0 } else { a.clamp(-100.0, 100.0) };
+        let (a0, a1, a2, a3) = (clean_amt(c.shadows), clean_amt(c.darks), clean_amt(c.lights), clean_amt(c.highlights));
+        let splits = [s0 as f64, s1 as f64, s2 as f64];
+        let amounts = [a0, a1, a2, a3];
+        let regions = [(0.0, s0, a0), (s0, s1, a1), (s1, s2, a2), (s2, 1.0, a3)];
+        let mut lut = [0.0_f32; PARAM_LUT];
+        let mut prev = 0.0_f32;
+        for (i, entry) in lut.iter_mut().enumerate() {
+            let x = i as f32 / (PARAM_LUT - 1) as f32;
+            let mut d = 0.0_f32;
+            for (a, b, amt) in regions {
+                if amt == 0.0 {
+                    continue;
+                }
+                let (ctr, half) = ((a + b) / 2.0, (b - a) * 0.75 + 0.05);
+                if half <= f32::EPSILON {
+                    continue;
+                }
+                let t = ((x - ctr) / half).clamp(-1.0, 1.0);
+                d += (amt / 100.0) as f32 * 0.22 * (0.5 + 0.5 * (t * std::f32::consts::PI).cos());
+            }
+            let y = (x + d * 4.0 * x * (1.0 - x)).clamp(0.0, 1.0);
+            prev = prev.max(y);
+            *entry = prev;
+        }
+        ParametricCurve { lut, splits, amounts, shape: Shape::Bumps }
     }
 
     /// How the Highlights region reads its table: the input axis with the highlight split taken to where the
