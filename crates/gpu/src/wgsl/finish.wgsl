@@ -63,6 +63,34 @@ fn lift_at(ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// Process V9's extra Highlights pull at pixel (x, y) (`hl_edge::EdgePull::at`).
+fn edge_at(x: u32, y: u32) -> f32 {
+    let o = pu(F_EDGE_OFF);
+    let pw = pu(F_EDGE_W);
+    let ph = pu(F_EDGE_H);
+    if (pw == 0u || ph == 0u) {
+        return 0.0;
+    }
+    var fx = clamp((f32(pu(F_EDGE_OX) + x) + 0.5) * pf(F_EDGE_SX) - 0.5, 0.0, f32(pw - 1u));
+    var fy = clamp((f32(pu(F_EDGE_OY) + y) + 0.5) * pf(F_EDGE_SY) - 0.5, 0.0, f32(ph - 1u));
+    if (!(fx == fx)) {
+        fx = 0.0;
+    }
+    if (!(fy == fy)) {
+        fy = 0.0;
+    }
+    let x0 = u32(fx);
+    let y0 = u32(fy);
+    let x1 = min(x0 + 1u, pw - 1u);
+    let y1 = min(y0 + 1u, ph - 1u);
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let top = aux[o + y0 * pw + x0] + (aux[o + y0 * pw + x1] - aux[o + y0 * pw + x0]) * tx;
+    let bottom = aux[o + y1 * pw + x0] + (aux[o + y1 * pw + x1] - aux[o + y1 * pw + x0]) * tx;
+    let v = pf(F_EDGE_GAIN) * (top + (bottom - top) * ty);
+    return select(0.0, v, v == v);
+}
+
 // `finish::eval_curves` on one channel: for HDR renders (`hdr`) a value above SDR white continues
 // with slope 1 from the curve's end point.
 fn lut_hdr(o: u32, x: f32, hdr: bool) -> f32 {
@@ -835,6 +863,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
     if (pu(F_LIFT) != 0u) {
         delta += lift_at(base);
+        if (pu(F_EDGE_PULL) != 0u) {
+            delta += edge_at(x, y);
+        }
         hh = lt[4];
         ss = lt[5];
     }
