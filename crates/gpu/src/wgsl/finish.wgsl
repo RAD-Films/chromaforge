@@ -76,6 +76,47 @@ fn curve(ch: u32, x: f32, hdr: bool) -> f32 {
     return lut_hdr(pu(F_CURVE_OFF) + ch * CURVE_N, x, hdr);
 }
 
+// `finish::curves_in_prophoto`: process V9's Tone Curve on linear Rec.2020 `d`, before the output transform. To
+// ProPhoto and sRGB-encoded, the master table (0) keeping hue (largest and smallest channel through it, the middle
+// one keeping its place between them), each channel's table (1-3), Refine Saturation, and back.
+fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
+    let o = pu(F_PPCURVE_OFF);
+    let q = mul3(mat_at(F_PP_M), d);
+    var e0: vec3<f32>;
+    if (hdr) {
+        let c = max(q, vec3<f32>(0.0));
+        e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
+    } else {
+        let c = clamp(q, vec3<f32>(0.0), vec3<f32>(1.0));
+        e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
+    }
+    let hi = max(e0.x, max(e0.y, e0.z));
+    let lo = min(e0.x, min(e0.y, e0.z));
+    let fhi = lut_hdr(o, hi, hdr);
+    let flo = lut_hdr(o, lo, hdr);
+    var k: vec3<f32>;
+    if (hi - lo <= 1e-7) {
+        k = vec3<f32>(fhi);
+    } else {
+        k = vec3<f32>(flo) + (e0 - vec3<f32>(lo)) * ((fhi - flo) / (hi - lo));
+    }
+    var e = vec3<f32>(lut_hdr(o + CURVE_N, k.x, hdr), lut_hdr(o + 2u * CURVE_N, k.y, hdr), lut_hdr(o + 3u * CURVE_N, k.z, hdr));
+    let rs = pf(F_REFINE_SAT);
+    if (rs < 1.0) {
+        e = refine_saturation(e0, e, rs);
+    }
+    var l: vec3<f32>;
+    for (var c = 0u; c < 3u; c++) {
+        let v = e[c];
+        if (v > 1.0) {
+            l[c] = pow((v + 0.055) / 1.055, 2.4);
+        } else {
+            l[c] = srgb_to_lin(max(v, 0.0));
+        }
+    }
+    return mul3(mat_at(F_PP_INV), l);
+}
+
 // The exact sRGB curve (`lcc_color::transfer`), unbounded above 1 as HDR renders encode.
 fn lin_to_srgb(v: f32) -> f32 {
     if (v <= 0.0031308) {
@@ -1077,6 +1118,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 d = d + (1.0 - d) * amount * t * 0.85;
             }
         }
+    }
+
+    // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+    if (pu(F_PPCURVES) != 0u) {
+        d = curves_in_prophoto(d, hdr);
     }
 
     // --- gamut map to the output space (desaturate towards luminance until in range);

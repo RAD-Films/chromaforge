@@ -1,7 +1,7 @@
 //! The per-pixel stage: everything after the spatial planes are ready, in one parallel pass.
 
 use lcc_color::luminance_2020;
-use lcc_color::spline::{Lut1, MonotoneCurve};
+use lcc_color::spline::{Lut1, MonotoneCurve, NaturalCurve};
 use lcc_color::transfer::linear_to_srgb;
 use lcc_develop::{DevelopSettings, LocalAdjustments, PointCurves, Process, ToneCurve, VignetteStyle};
 use lcc_geom::Point;
@@ -104,6 +104,78 @@ fn curve_luts(c: &ToneCurve, process: Process) -> Option<[Lut1; 3]> {
             base.clone()
         }
     }))
+}
+
+/// Whether `process` runs the Tone Curve before the output transform, in ProPhoto ([`curves_in_prophoto`]): V9 on.
+pub fn curves_before_output(process: Process) -> bool {
+    process >= Process::V9
+}
+
+/// Process V9's Tone Curve tables: `[parametric ∘ master, red, green, blue]` (identity tables for curves left
+/// linear), or `None` while every curve is linear. Point curves are natural cubic splines, as Lightroom
+/// Classic's measure (round 18 charts); the parametric regions are V9's own table.
+pub fn curve_luts_pp(c: &ToneCurve, process: Process) -> Option<[Lut1; 4]> {
+    let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
+    let master = !ToneCurve::point_curve_is_identity(&c.master);
+    let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
+    if !parametric && !master && !chans.iter().any(|b| *b) {
+        return None;
+    }
+    const N: usize = CURVE_LUT_N;
+    let natural = |p: &[Point]| NaturalCurve::new(&p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()).to_lut(N);
+    let mut base = crate::curve::ParametricCurve::for_process(c, process).to_lut();
+    if master {
+        base = natural(&c.master).compose(&base);
+    }
+    let per = [&c.red, &c.green, &c.blue];
+    let chan = |i: usize| match per.get(i) {
+        Some(p) if chans.get(i).copied().unwrap_or(false) => natural(p),
+        _ => Lut1::identity(N),
+    };
+    Some([base, chan(0), chan(1), chan(2)])
+}
+
+/// Linear Rec.2020 (the working space) → linear ProPhoto RGB, and back.
+pub fn prophoto_matrices() -> &'static ([[f32; 3]; 3], [[f32; 3]; 3]) {
+    static M: std::sync::OnceLock<([[f32; 3]; 3], [[f32; 3]; 3])> = std::sync::OnceLock::new();
+    M.get_or_init(|| (lcc_color::REC2020.to_space(&lcc_color::PROPHOTO).to_f32(), lcc_color::PROPHOTO.to_space(&lcc_color::REC2020).to_f32()))
+}
+
+/// `l` on `v` with the HDR extension of [`eval_curves`] (slope 1 above SDR white).
+#[inline]
+fn lut_hdr(l: &Lut1, v: f32, hdr: bool) -> f32 {
+    if hdr && v > 1.0 { l.eval(1.0) + (v - 1.0) } else { l.eval(v) }
+}
+
+/// The master curve on encoded `e`, keeping its hue: the largest and smallest channels go through `l` and the middle
+/// one keeps its place between them (Lightroom Classic's RGB curve: hue shift 0.17° on the round 18 colour chart,
+/// against 1.09° when each channel takes the curve, and ΔE76 0.14 instead of 0.74).
+fn hue_keeping(l: &Lut1, e: [f32; 3], hdr: bool) -> [f32; 3] {
+    let [a, b, c] = e;
+    let (hi, lo) = (a.max(b).max(c), a.min(b).min(c));
+    let (fhi, flo) = (lut_hdr(l, hi, hdr), lut_hdr(l, lo, hdr));
+    if hi - lo <= 1e-7 {
+        return [fhi; 3];
+    }
+    let k = (fhi - flo) / (hi - lo);
+    e.map(|v| flo + (v - lo) * k)
+}
+
+/// Process V9's Tone Curve on linear Rec.2020 `d` ([`curve_luts_pp`]): to ProPhoto, sRGB-encode, the master curve
+/// keeping hue, each channel's curve, Refine Saturation, and back. Lightroom Classic's curves measure in this space
+/// (round 18: ΔE76 ≤ 0.07 on one-channel curves, against 0.8–2.4 in ProPhoto's own gamma 1.8).
+pub fn curves_in_prophoto(l: &[Lut1; 4], d: [f32; 3], hdr: bool, refine_sat: f32) -> [f32; 3] {
+    let (to_pp, from_pp) = prophoto_matrices();
+    let enc = |v: f32| if hdr && v > 1.0 { linear_to_srgb(v) } else { linear_to_srgb(v.clamp(0.0, 1.0)) };
+    let e0 = mul3(to_pp, d).map(enc);
+    let [m, r, g, b] = l;
+    let k = hue_keeping(m, e0, hdr);
+    let mut e = [lut_hdr(r, k[0], hdr), lut_hdr(g, k[1], hdr), lut_hdr(b, k[2], hdr)];
+    if refine_sat < 1.0 {
+        e = refine_saturation(e0, e, refine_sat);
+    }
+    let dec = |v: f32| if v > 1.0 { ((v + 0.055) / 1.055).powf(2.4) } else { lcc_color::transfer::srgb_to_linear(v.max(0.0)) };
+    mul3(from_pp, e.map(dec))
 }
 
 /// Vignette (post-crop) parameters.
@@ -285,8 +357,13 @@ pub struct FinishParams {
     /// Calibration: primaries matrix (row-major, linear Rec.2020) and shadows tint (−1..1).
     pub calib: Option<[[f32; 3]; 3]>,
     pub shadow_tint: f32,
-    /// Tone curves (parametric ∘ point, per channel) on encoded values, 1024 entries each.
+    /// Tone curves (parametric ∘ point, per channel) on encoded values, 1024 entries each. Before
+    /// process V9 only: they run on the output space's sRGB-encoded values, after the output transform.
     pub curves: Option<[Lut1; 3]>,
+    /// Process V9's tone curves ([`curve_luts_pp`]): `[parametric ∘ master, red, green, blue]`, run before the
+    /// output transform on sRGB-encoded ProPhoto values, so every export space gets the same picture
+    /// ([`curves_in_prophoto`]).
+    pub curves_pp: Option<[Lut1; 4]>,
     /// Refine Saturation as 0..1 (1 = the curves' own saturation).
     pub refine_sat: f32,
     pub vig: Option<Vig>,
@@ -407,7 +484,8 @@ impl FinishParams {
             ops: ColorOps::new(s),
             local_points: crate::colorops::mask_point_ks(s),
             local_mixers: crate::colorops::mask_mixer_ks(s),
-            curves: curve_luts(&s.curve, s.process.process()),
+            curves: if curves_before_output(s.process.process()) { None } else { curve_luts(&s.curve, s.process.process()) },
+            curves_pp: if curves_before_output(s.process.process()) { curve_luts_pp(&s.curve, s.process.process()) } else { None },
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),
@@ -697,6 +775,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         tone,
         ops,
         curves,
+        curves_pp,
         vig,
         to_out,
         out_luma,
@@ -1001,6 +1080,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                         d = d.map(|c| c + (1.0 - c) * v.amount * t * 0.85);
                     }
                 }
+            }
+
+            // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+            if let Some(l) = curves_pp {
+                d = curves_in_prophoto(l, d, hdr, fp.refine_sat);
             }
 
             // --- gamut map to the output space (desaturate towards luminance until in range);
