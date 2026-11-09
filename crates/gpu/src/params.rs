@@ -38,6 +38,12 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR_PRE", 1),
     ("HL", 1),
     ("SH", 1),
+    // process V9's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
+    ("LIFT", 1),
+    ("LIFT_OFF", 1),
+    ("LIFT_N", 1),
+    ("LIFT_LO", 1),
+    ("LIFT_STEP", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -282,6 +288,12 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some((l, _)) = lut {
         aux.extend(l.data.iter().flatten());
     }
+    // process V9's Highlights / Shadows table
+    let lift_off = aux.len();
+    let lift = fp.lift.as_ref().filter(|l| l.0.len() == lcc_pipeline::tone_lift::LIFT_N);
+    if let Some(l) = lift {
+        aux.extend_from_slice(&l.0);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -432,6 +444,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.f("LUT_AMT", *amount);
         p.fs("LUT_MIN", &l.domain_min);
         p.fs("LUT_MAX", &l.domain_max);
+    }
+    if lift.is_some() {
+        p.b("LIFT", true);
+        p.u("LIFT_OFF", lift_off as u32);
+        p.u("LIFT_N", lcc_pipeline::tone_lift::LIFT_N as u32);
+        p.f("LIFT_LO", lcc_pipeline::tone_lift::LIFT_LO);
+        p.f("LIFT_STEP", lcc_pipeline::tone_lift::LIFT_STEP);
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

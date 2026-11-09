@@ -55,7 +55,61 @@ use lcc_raw::{
 /// #3402).
 /// 22: a camera profile without a tone curve of its own keeps the tone the photo has without it (its DNG tone curve,
 /// else the tone fitted to its camera JPEG) instead of the default tone (OneSlips).
-pub const LOOK_VERSION: u32 = 22;
+/// 23: smoothed tone curves keep the fitted level through the midtones (`with_smooth_tone`).
+/// 24: ... and through the shadows: the level is held along the whole curve (`hold_level`).
+/// 25: fitted tone curves no steeper than a log-log slope of 4 between knots (upstream #1904 / #2656).
+/// 26: a Sony "12-bit uncompressed" ARW takes the 14-bit scale from its word layout, not its brightest sample, so a
+/// dark frame is no longer fitted on the wrong black and white levels (upstream #3429).
+///
+/// 23 to 26 are process V9's: a photo on V1 to V8 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
+pub const LOOK_VERSION: u32 = 26;
+
+/// The fit of [`LOOK_VERSION`] 22, the last one processes V1 to V8 had.
+pub const LOOK_VERSION_V8: u32 = 22;
+
+/// Which camera-look fit a decode makes: the one of its photo's process. Processes V1 to V8 keep the fit of
+/// [`LOOK_VERSION_V8`] (the tone curve smoothed by its slope alone, no bound on its steepness), so an edit saved under
+/// them looks as it did; V9 takes every later fit change (23 to 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FitGen {
+    V8,
+    Current,
+}
+
+impl FitGen {
+    /// The fit of process number `process` (`LoadOptions::process`).
+    pub(crate) fn of_process(process: u32) -> FitGen {
+        if process >= lcc_develop::Process::V9.version().0 { FitGen::Current } else { FitGen::V8 }
+    }
+
+    /// The [`LOOK_VERSION`] this fit writes into a smart preview.
+    pub(crate) fn look_version(self) -> u32 {
+        match self {
+            FitGen::V8 => LOOK_VERSION_V8,
+            FitGen::Current => LOOK_VERSION,
+        }
+    }
+}
+
+thread_local! {
+    static FIT_GEN: std::cell::Cell<FitGen> = const { std::cell::Cell::new(FitGen::Current) };
+}
+
+/// Run `f` (a decode's camera-look fit, on this thread) with fit `fit`; everything else fits with the current one.
+pub(crate) fn with_fit_gen<R>(fit: FitGen, f: impl FnOnce() -> R) -> R {
+    struct Restore(FitGen);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIT_GEN.with(|g| g.set(self.0));
+        }
+    }
+    let _restore = Restore(FIT_GEN.with(|g| g.replace(fit)));
+    f()
+}
+
+fn fit_gen() -> FitGen {
+    FIT_GEN.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CameraLook {
@@ -815,7 +869,7 @@ fn sony_dro_off_tone() -> Option<CameraTone> {
 
 /// `look` with its fitted tone curve smoothed: its log-log slope blurred over [`TONE_SMOOTHING`]
 /// along log scene luminance, put back on knots spaced evenly in log scene luminance, both ends and
-/// the shoulder past the last knot kept.
+/// the shoulder past the last knot kept, and the curve's level kept through the midtones.
 ///
 /// The fitted knots follow the photo's pixels: a dark scene in front of a clipped screen puts most
 /// of them in the shadows and leaves a few segments over the brighter stops, and quantile matching
@@ -823,26 +877,42 @@ fn sony_dro_off_tone() -> Option<CameraTone> {
 /// curve bends. A segment much flatter or steeper than its neighbours squeezes or stretches every
 /// gradient across its range: skin and satin in ILCE-7CM2 portraits rendered as flat patches with
 /// hard edges, as if posterized, where the camera JPEG is smooth.
+///
+/// A Gaussian moves a curved line by about σ²/2 times its curvature, and camera curves bend down in
+/// log-log all along: blurred alone, the curve came out lower through the midtones, by about 0.07 in
+/// log at grey (0.1 EV, 4–6 8-bit levels) on Canon EOS R5 C portraits, darker than the camera JPEG
+/// the curve was fitted to, and further down the shadows. So the blurred curve is moved back to the
+/// fitted curve's level along its length ([`hold_level`]).
 fn with_smooth_tone(look: CameraLook) -> CameraLook {
     let own = *look.tone.knots();
     let Some(grid) = LogGrid::over(&own) else { return look };
     let ln = |y: f32| f64::from(y).max(1e-6).ln();
     let values: Vec<f64> = grid.xs.iter().map(|&x| ln(look.tone.apply(x))).collect();
     let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return look };
-    let slope: Vec<f64> = values.windows(2).map(|w| (w[1] - w[0]) / grid.step).collect();
-    let smooth = blur_mirrored(&slope, TONE_SMOOTHING / grid.step);
-    // Integrated back, scaled so that both ends stay where the fitted curve has them.
-    let total = smooth.iter().sum::<f64>() * grid.step;
-    if !(total.is_finite() && total > 0.0 && last > first) {
-        return look;
-    }
-    let mut curve = Vec::with_capacity(TONE_GRID);
-    let mut y = first;
-    curve.push(y);
-    for s in &smooth {
-        y += s * grid.step * (last - first) / total;
+    let curve = if fit_gen() == FitGen::V8 {
+        // (the fit of processes V1 to V8: the slope blurred and integrated back, both ends kept)
+        let slope: Vec<f64> = values.windows(2).map(|w| (w[1] - w[0]) / grid.step).collect();
+        let smooth = blur_mirrored(&slope, TONE_SMOOTHING / grid.step);
+        let total = smooth.iter().sum::<f64>() * grid.step;
+        if !(total.is_finite() && total > 0.0 && last > first) {
+            return look;
+        }
+        let mut curve = Vec::with_capacity(TONE_GRID);
+        let mut y = first;
         curve.push(y);
-    }
+        for s in &smooth {
+            y += s * grid.step * (last - first) / total;
+            curve.push(y);
+        }
+        curve
+    } else {
+        if !(values.iter().all(|v| v.is_finite()) && last > first) {
+            return look;
+        }
+        let sigma = TONE_SMOOTHING / grid.step;
+        let blurred = blur_point_reflected(&values, sigma);
+        hold_level(&grid, &values, blurred)
+    };
     let [.., [_, own_end]] = own;
     let mut knots = grid.knots(&curve, own_end, |_| 1.0);
     ease_shoulder(&mut knots, &own, |_| 1.0);
@@ -971,6 +1041,85 @@ fn ease_shoulder(knots: &mut [[f32; 2]; 32], own: &[[f32; 2]; 32], cap: impl Fn(
         knot[1] = knot[1].max(previous);
         previous = knot[1];
     }
+}
+
+/// Width in stops (standard deviation) of the Gaussian over which [`hold_level`] averages how far
+/// smoothing moved the curve: 1.04 in natural log, about twice [`TONE_SMOOTHING`], so a kink's
+/// distance is spread thinner than the kink was and the averaging bends smoothly. (A window with
+/// edges brought kinks back where it ended; a stop wide, the dent of
+/// `a_fitted_curve_is_smoothed_without_flat_segments` came back.)
+const LEVEL_HOLD_EV: f64 = 1.5;
+
+/// `smooth` (log display luminance on `grid`, smoothed from `fitted`) moved back by its distance to
+/// `fitted` averaged over [`LEVEL_HOLD_EV`] around each point. The smoothing's bias follows the
+/// curve's bend, which varies slowly, so the average brings back the level while a kink, narrower
+/// than that, stays smoothed. All of it from a stop
+/// above the first knot up to grey; eased (smoothstep in log scene luminance) to none at the first
+/// knot, and above grey to none at the last, spread over the whole span there, so both ends stay
+/// where they are and a curve whose last knot is close above grey keeps its shoulder.
+fn hold_level(grid: &LogGrid, fitted: &[f64], smooth: Vec<f64>) -> Vec<f64> {
+    let grey = f64::from(lcc_pipeline::tone::GREY).ln();
+    let hold = LEVEL_HOLD_EV * std::f64::consts::LN_2;
+    let lx: Vec<f64> = grid.xs.iter().map(|&x| f64::from(x).ln()).collect();
+    let (Some(&lo), Some(&hi)) = (lx.first(), lx.last()) else { return smooth };
+    if !(lo < grey && grey < hi) || fitted.len() != smooth.len() || lx.len() != smooth.len() {
+        return smooth;
+    }
+    let distance: Vec<f64> = fitted.iter().zip(&smooth).map(|(f, s)| f - s).collect();
+    let shifts = blur_mirrored(&distance, hold / grid.step);
+    let ease = |t: f64| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    smooth
+        .iter()
+        .zip(&lx)
+        .zip(&shifts)
+        .map(|((s, &x), shift)| {
+            let w = if x < grey { ease((x - lo) / hold.min(grey - lo)) } else { ease((hi - x) / (hi - grey)) };
+            s + shift * w
+        })
+        .collect()
+}
+
+/// [`blur_mirrored`] with the ends point-reflected (`2·v₀ − v₋ₖ`), so a line stays a line and the result
+/// keeps both end values exactly.
+fn blur_point_reflected(values: &[f64], sigma: f64) -> Vec<f64> {
+    let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return Vec::new() };
+    let n = values.len();
+    if !(sigma.is_finite() && sigma > 0.0) {
+        return values.to_vec();
+    }
+    let radius = ((3.0 * sigma).ceil() as usize).min(n.saturating_sub(1)) as isize;
+    let kernel: Vec<f64> = (0..=radius).map(|k| (-0.5 * (k as f64 / sigma).powi(2)).exp()).collect();
+    let n = n as isize;
+    let at = |i: isize| {
+        let v = |j: isize| values.get(j.clamp(0, n - 1) as usize).copied().unwrap_or(0.0);
+        if i < 0 {
+            2.0 * first - v(-i)
+        } else if i >= n {
+            2.0 * last - v(2 * (n - 1) - i)
+        } else {
+            v(i)
+        }
+    };
+    (0..n)
+        .map(|i| {
+            let mut sum = 0.0;
+            let mut weight = 0.0;
+            for (k, w) in kernel.iter().enumerate() {
+                let k = k as isize;
+                if k == 0 {
+                    sum += w * at(i);
+                    weight += w;
+                } else {
+                    sum += w * (at(i - k) + at(i + k));
+                    weight += 2.0 * w;
+                }
+            }
+            sum / weight
+        })
+        .collect()
 }
 
 /// `values` blurred with a Gaussian of standard deviation `sigma` (in samples), mirrored at both
@@ -2707,7 +2856,114 @@ fn fit_tone(pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
     if knots[31][0] < knots[0][0] * MIN_TONE_RANGE {
         return None;
     }
-    CameraTone::new(knots)
+    CameraTone::new(bounded(knots, &pairs)?)
+}
+
+/// `knots` under [`MAX_TONE_ELASTICITY`] ([`limit_elasticity`]); the fit of processes V1 to V8 has no bound.
+fn bounded(knots: [[f32; 2]; 32], pairs: &[(f64, f64)]) -> Option<[[f32; 2]; 32]> {
+    match fit_gen() {
+        FitGen::V8 => Some(knots),
+        FitGen::Current => limit_elasticity(knots, pairs),
+    }
+}
+
+/// Largest log-log slope (elasticity, d ln y / d ln x with [`ELASTICITY_BLACK`] added to y) a fitted tone curve may
+/// have between two knots. A much steeper segment is not a camera curve but two pixel populations the camera renders at
+/// different brightness for the same scene luminance (by hue): quantile matching puts all of one population's scene
+/// range below the other's JPEG range and joins them with a near-vertical step, which amplifies the luminance noise of
+/// every pixel on it and renders as contours and blotches. On a dark ISO 1100 D3400 frame of saturated blue and red
+/// (issue #1904; reds 1.55x brighter in the JPEG than blues of the same scene luminance) the step had elasticity 12-28,
+/// and the render's fine luminance noise in the blue area was 1.46x that of Adobe's DNG of the same frame; with the
+/// bound it is 0.99x. Of 514 fitted looks on the user samples the median curve's steepest segment is 2.1 and the 95th
+/// percentile 3.6. The smoothed window ends where its end-to-end slope is first under the bound, so a looser bound
+/// (5 or 6) only spreads the D3400 step over a few knots and leaves the noise as it was.
+const MAX_TONE_ELASTICITY: f64 = 4.0;
+/// Log-log slope of a curve end left free by [`limit_elasticity`]: about the median steepest segment of fitted looks
+/// (2.1), so the knots past the step follow an ordinary camera curve. At the bound itself (4) the D3400 frame's fine
+/// luminance noise stays 1.2x Adobe's; at 2 it is 0.99x.
+const TONE_REPAIR_ELASTICITY: f64 = 2.0;
+/// Display level added to both ends of a segment's elasticity, so a toe rising from black is not counted as infinitely
+/// steep.
+const ELASTICITY_BLACK: f64 = 0.002;
+
+/// `knots` with every segment steeper than [`MAX_TONE_ELASTICITY`] smoothed. The knots inside the smallest window
+/// around the segment (widened a knot on each side at a time) whose end-to-end elasticity is under the bound move onto
+/// the straight log-log line between the window's ends, so the step is spread over the scene range of the populations it
+/// joined. A window that reaches an end of the curve is pinned there, which can drag most of the curve onto one line
+/// (a step at the top of a Coolpix P340 curve pulled knots 3-29 up, held-out error +4 dE00), so it is weighed against
+/// leaving that end free: the knots past the segment on that side move onto [`TONE_REPAIR_ELASTICITY`] from the
+/// segment's other knot instead. Of the two the one closer to `pairs` (absolute error) is kept. The curve outside the
+/// window and its monotonicity are kept. `None` when nothing brings the curve under the bound. Knots within the bound are returned as
+/// they are.
+fn limit_elasticity(mut knots: [[f32; 2]; 32], pairs: &[(f64, f64)]) -> Option<[[f32; 2]; 32]> {
+    let (bound, repair) = (MAX_TONE_ELASTICITY, TONE_REPAIR_ELASTICITY);
+    let at = |k: &[[f32; 2]; 32], i: usize| (f64::from(k[i][0]).ln(), (f64::from(k[i][1]) + ELASTICITY_BLACK).ln());
+    let slope = |k: &[[f32; 2]; 32], a: usize, b: usize| {
+        let ((ua, va), (ub, vb)) = (at(k, a), at(k, b));
+        (vb - va) / (ub - ua)
+    };
+    let level = |v: f64| (v.exp() - ELASTICITY_BLACK).max(0.0) as f32;
+    let error = |k: &[[f32; 2]; 32]| {
+        let tone = CameraTone::new(*k)?;
+        Some(pairs.iter().map(|&(x, y)| (f64::from(tone.apply(x as f32)) - y).abs()).sum::<f64>())
+    };
+    for _ in 0..64 {
+        let Some(i) = (0..31).find(|&i| slope(&knots, i, i + 1) > bound) else { return Some(knots) };
+        let (mut lo, mut hi) = (i, i + 1);
+        while slope(&knots, lo, hi) > bound && !(lo == 0 && hi == 31) {
+            lo = lo.saturating_sub(1);
+            hi = (hi + 1).min(31);
+        }
+        let mut pinned = knots;
+        let pinned_ok = slope(&knots, lo, hi) <= bound;
+        if pinned_ok {
+            let ((ua, va), (ub, vb)) = (at(&knots, lo), at(&knots, hi));
+            for k in lo + 1..hi {
+                pinned[k][1] = level(va + (vb - va) * (f64::from(knots[k][0]).ln() - ua) / (ub - ua));
+            }
+        }
+        // A window that reaches an end of the curve can leave that end free instead: the knots below the segment rise
+        // onto the repair slope down from knot i + 1, or the knots above it drop onto it up from knot i.
+        let mut free = None;
+        if lo == 0 || hi == 31 {
+            let mut k2 = knots;
+            if lo == 0 {
+                let (ub, vb) = at(&knots, i + 1);
+                for k in 0..=i {
+                    let (u, v) = at(&knots, k);
+                    k2[k][1] = level(v.max(vb - repair * (ub - u)));
+                }
+            } else {
+                let (ua, va) = at(&knots, i);
+                for k in i + 1..32 {
+                    let (u, v) = at(&knots, k);
+                    k2[k][1] = level(v.min(va + repair * (u - ua)));
+                }
+            }
+            free = Some(k2);
+        }
+        let next = match (pinned_ok, free) {
+            (true, Some(free)) => {
+                if error(&free).unwrap_or(f64::INFINITY) < error(&pinned).unwrap_or(f64::INFINITY) {
+                    free
+                } else {
+                    pinned
+                }
+            }
+            (true, None) => pinned,
+            (false, Some(free)) => free,
+            (false, None) => return None,
+        };
+        if lcc_pipeline::profiling() {
+            let moved: Vec<usize> = (0..32).filter(|&k| next[k][1] != knots[k][1]).collect();
+            eprintln!("[profile] camera tone: elasticity {:.1} at scene {:.4}, knots {moved:?} moved", slope(&knots, i, i + 1), knots[i][0]);
+        }
+        if next == knots {
+            return None;
+        }
+        knots = next;
+    }
+    None
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -2756,7 +3012,7 @@ fn fit_tone_conditional(mut pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
         }
         i += n;
     }
-    CameraTone::new(knots)
+    CameraTone::new(bounded(knots, &pairs)?)
 }
 
 #[cfg(test)]
@@ -2785,6 +3041,74 @@ mod tests {
     }
 
     use super::*;
+
+    /// Issue #1904: two populations the camera renders at different brightness for the same scene luminance (saturated
+    /// blue at 1.7x, red at 2.64x) made quantile matching join them with a near-vertical step.
+    #[test]
+    fn tone_fit_does_not_step_between_two_pixel_populations() {
+        let mut pairs = Vec::new();
+        for i in 0..620 {
+            let x = 0.040 + 0.012 * f64::from(i) / 620.0;
+            pairs.push((x, 1.7 * x));
+        }
+        for i in 0..380 {
+            let x = 0.02 * (10.0f64).powf(f64::from(i) / 380.0);
+            pairs.push((x, 2.64 * x));
+        }
+        let elasticity = |k: &[[f32; 2]; 32]| {
+            k.windows(2)
+                .map(|w| {
+                    ((f64::from(w[1][1]) + ELASTICITY_BLACK) / (f64::from(w[0][1]) + ELASTICITY_BLACK)).ln()
+                        / (f64::from(w[1][0]) / f64::from(w[0][0])).ln()
+                })
+                .fold(0.0, f64::max)
+        };
+        let mut xs: Vec<f64> = pairs.iter().map(|p| p.0).collect();
+        let mut ys: Vec<f64> = pairs.iter().map(|p| p.1).collect();
+        xs.sort_by(f64::total_cmp);
+        ys.sort_by(f64::total_cmp);
+        let raw: [[f32; 2]; 32] = std::array::from_fn(|i| {
+            let mid = (i * xs.len() / 32 + (i + 1) * xs.len() / 32) / 2;
+            [xs[mid] as f32, ys[mid] as f32]
+        });
+        assert!(elasticity(&raw) > 10.0, "the synthetic scene must reproduce the step: {}", elasticity(&raw));
+        let tone = fit_tone(pairs).unwrap();
+        let knots = tone.knots();
+        assert!(elasticity(knots) <= MAX_TONE_ELASTICITY + 1e-3, "{}", elasticity(knots));
+        assert!(knots.iter().zip(&raw).all(|(a, b)| a[0] == b[0]), "only the outputs move");
+        for w in knots.windows(2) {
+            assert!(w[1][1] >= w[0][1]);
+        }
+        // A curve within the bound is left alone.
+        let smooth: [[f32; 2]; 32] = std::array::from_fn(|i| {
+            let x = 0.01 * 1.15f32.powi(i as i32);
+            [x, 0.9 * (x / (x + 0.18))]
+        });
+        assert_eq!(limit_elasticity(smooth, &[]), Some(smooth));
+    }
+
+    /// A step at the top of the curve reaches its end: the pinned window and the free end are both under the bound, and
+    /// the pixel pairs choose between them.
+    #[test]
+    fn a_step_at_the_curves_end_is_repaired_from_the_side_the_pixels_support() {
+        let x = |i: usize| 0.01 * 1.15f64.powi(i as i32);
+        let stepped: [[f32; 2]; 32] = std::array::from_fn(|i| [x(i) as f32, (0.3 * x(i) * if i >= 30 { 3.0 } else { 1.0 }) as f32]);
+        let pairs = |gain: f64| -> Vec<(f64, f64)> {
+            (0..4000).map(|j| x(0) * (x(31) / x(0)).powf(f64::from(j) / 3999.0)).map(|x| (x, 0.3 * x * if x >= 0.62 { gain } else { 1.0 })).collect()
+        };
+        // The pixels follow the curve below the step: the end is left free and the top knots drop to the repair slope.
+        let free = limit_elasticity(stepped, &pairs(1.0)).unwrap();
+        assert_eq!(free[..30], stepped[..30], "the curve up to the step is kept");
+        let (u29, v29) = (x(29).ln(), (f64::from(stepped[29][1]) + ELASTICITY_BLACK).ln());
+        for k in 30..32 {
+            let limit = (v29 + TONE_REPAIR_ELASTICITY * (x(k).ln() - u29)).exp() - ELASTICITY_BLACK;
+            assert!(f64::from(free[k][1]) <= limit + 1e-6, "knot {k}: {} over {limit}", free[k][1]);
+        }
+        // The pixels do sit above the step: the window stays pinned to the top knot.
+        let pinned = limit_elasticity(stepped, &pairs(3.0)).unwrap();
+        assert_eq!(pinned[31], stepped[31], "the end the pixels support is kept");
+        assert!(pinned[29][1] > stepped[29][1] && pinned[30][1] < stepped[30][1], "the step is spread over the window");
+    }
 
     fn steep_toe_scene() -> (Rgb32f, Rgb32f) {
         let mut sensor = Rgb32f::new(96, 64);
@@ -4228,6 +4552,68 @@ mod tests {
         }
         for x in [0.6, 0.8, 1.2, 2.0, 4.0] {
             assert!(smooth.tone.apply(x) <= fitted.tone.apply(x) + 1e-5, "shoulder at {x}: {} > {}", smooth.tone.apply(x), fitted.tone.apply(x));
+        }
+    }
+
+    /// Processes V1 to V8 keep the camera-look fit they had (LOOK 22): the two-population step of #1904 is not
+    /// bounded and the smoothed curve is not held at the fitted level, both only for V9's fit; the fit is chosen per
+    /// decode and put back after it.
+    #[test]
+    fn processes_v1_to_v8_keep_the_fit_of_look_22() {
+        let mut pairs = Vec::new();
+        for i in 0..620 {
+            let x = 0.040 + 0.012 * f64::from(i) / 620.0;
+            pairs.push((x, 1.7 * x));
+        }
+        for i in 0..380 {
+            let x = 0.02 * (10.0f64).powf(f64::from(i) / 380.0);
+            pairs.push((x, 2.64 * x));
+        }
+        let steepest = |k: &[[f32; 2]; 32]| {
+            k.windows(2)
+                .map(|w| {
+                    ((f64::from(w[1][1]) + ELASTICITY_BLACK) / (f64::from(w[0][1]) + ELASTICITY_BLACK)).ln()
+                        / (f64::from(w[1][0]) / f64::from(w[0][0])).ln()
+                })
+                .fold(0.0, f64::max)
+        };
+        let v8 = with_fit_gen(FitGen::V8, || fit_tone(pairs.clone())).unwrap();
+        let v9 = fit_tone(pairs.clone()).unwrap();
+        assert!(steepest(v8.knots()) > 10.0, "V8: the step is kept ({})", steepest(v8.knots()));
+        assert!(steepest(v9.knots()) <= MAX_TONE_ELASTICITY + 1e-3);
+        assert_eq!(fit_gen(), FitGen::Current, "the fit is put back after the decode");
+        // the smoothing: V8's blurs the slope alone, so a bending curve comes out lower around grey
+        let xs: [f32; 32] = std::array::from_fn(|i| 0.002 * (0.6f32 / 0.002).powf(i as f32 / 31.0));
+        let f = |x: f32| {
+            let l = (x / 0.18).ln();
+            0.46 * (0.9 * l - 0.25 * l * l).exp()
+        };
+        let fitted = dro_test_look(&xs, &f);
+        let old = with_fit_gen(FitGen::V8, || with_smooth_tone(fitted.clone()));
+        let new = with_smooth_tone(fitted.clone());
+        let d = |l: &CameraLook| (l.tone.apply(0.18) / fitted.tone.apply(0.18)).ln();
+        assert!(d(&old) < -0.02 && d(&new).abs() < 0.01, "V8 {:+.4}, V9 {:+.4} in log at grey", d(&old), d(&new));
+        assert_eq!((FitGen::of_process(8), FitGen::of_process(9), FitGen::of_process(1)), (FitGen::V8, FitGen::Current, FitGen::V8));
+        assert_eq!((FitGen::V8.look_version(), FitGen::Current.look_version()), (LOOK_VERSION_V8, LOOK_VERSION));
+    }
+
+    /// Smoothing keeps a fitted curve's level: a smooth camera curve that bends down in log-log all
+    /// along (as camera curves do) comes back where it was around grey (−1 to +½ EV). The
+    /// blur alone lowered it by σ²/2 times its curvature, about 0.06 in log here (0.07 at grey on
+    /// Canon EOS R5 C portraits, 4–6 8-bit levels).
+    #[test]
+    fn smoothing_keeps_a_bending_curves_level() {
+        let xs: [f32; 32] = std::array::from_fn(|i| 0.002 * (0.6f32 / 0.002).powf(i as f32 / 31.0));
+        let f = |x: f32| {
+            let l = (x / 0.18).ln();
+            0.46 * (0.9 * l - 0.25 * l * l).exp()
+        };
+        let fitted = dro_test_look(&xs, &f);
+        let smooth = with_smooth_tone(fitted.clone());
+        for ev in [-4.0f32, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5] {
+            let x = 0.18 * ev.exp2();
+            let d = (smooth.tone.apply(x) / fitted.tone.apply(x)).ln();
+            assert!(d.abs() < 0.01, "at {ev:+} EV the smoothed curve is {d:+.4} off in log");
         }
     }
 

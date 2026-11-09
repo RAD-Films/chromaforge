@@ -411,6 +411,24 @@ pub(crate) fn preview_reason(bytes: &[u8], e: lcc_raw::RawError) -> Result<Strin
 /// Sensor clip level (normalised) for highlight reconstruction.
 const HIGHLIGHT_CLIP: f32 = 0.99;
 
+/// How many stops above the sensor's clip a decode with [`LoadOptions::highlight_headroom`] rebuilds fully clipped
+/// highlights ([`lcc_raw::highlight::reconstruct_brighter`]).
+pub(crate) const HIGHLIGHT_HEADROOM: f32 = 0.0;
+
+/// The headroom (stops) a decode with `options` rebuilds clipped highlights with.
+/// A raw file decoded as process number `process` reads it: V1 to V8 keep the levels they read a Sony 12-bit
+/// uncompressed file with ([`lcc_raw::decode_v8_levels`]), V9 takes upstream #3429's.
+pub(crate) fn decode_raw_at(bytes: &[u8], process: u32) -> lcc_raw::Result<lcc_raw::RawImage> {
+    match crate::camera_preview::FitGen::of_process(process) {
+        crate::camera_preview::FitGen::V8 => lcc_raw::decode_v8_levels(bytes),
+        crate::camera_preview::FitGen::Current => lcc_raw::decode(bytes),
+    }
+}
+
+pub(crate) fn headroom_of(options: &LoadOptions) -> f32 {
+    if options.highlight_headroom { HIGHLIGHT_HEADROOM } else { 0.0 }
+}
+
 /// How a raw's camera RGB becomes the linear Rec.2020 the pipeline takes.
 pub(crate) struct CameraColourModel<'a> {
     /// White-balance multipliers (as shot).
@@ -427,15 +445,15 @@ pub(crate) struct CameraColourModel<'a> {
 
 impl CameraColourModel<'_> {
     /// Rebuild sensor-clipped channels; fully clipped highlights become [`clipped_white`] of the matrix, so they
-    /// come out of [`Self::apply`] neutral.
-    pub fn rebuild_highlights(&self, img: &mut Rgb32f) {
-        lcc_raw::highlight::reconstruct_with(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix));
+    /// come out of [`Self::apply`] neutral, `headroom` stops above the clip ([`headroom_of`]).
+    pub fn rebuild_highlights(&self, img: &mut Rgb32f, headroom: f32) {
+        lcc_raw::highlight::reconstruct_brighter(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), headroom);
     }
 
     /// [`Self::rebuild_highlights`] for a binned image whose clipped channels `mask` tells
     /// ([`lcc_raw::RawImage::develop_binned_masked`]).
-    pub fn rebuild_highlights_masked(&self, img: &mut Rgb32f, mask: &[u8]) {
-        lcc_raw::highlight::reconstruct_masked(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), mask);
+    pub fn rebuild_highlights_masked(&self, img: &mut Rgb32f, mask: &[u8], headroom: f32) {
+        lcc_raw::highlight::reconstruct_masked_brighter(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), mask, headroom);
     }
 
     /// White balance, matrix, tables and baseline exposure, in place.
@@ -734,7 +752,7 @@ fn load_bytes_now(
         let used_reduced = reduced.is_some();
         let decoded = match reduced {
             Some(r) => Ok(r),
-            None => lcc_raw::decode(&bytes),
+            None => decode_raw_at(&bytes, options.process),
         };
         let mut raw = match decoded.map_err(|e| preview_reason(&bytes, e)) {
             Ok(r) => r,
@@ -760,10 +778,11 @@ fn load_bytes_now(
         // (its own look, tone curve and look table, only "As profile": under one of the app's looks its calibration only).
         // A profile without a tone curve of its own (most chart-made ones) keeps the tone the photo has without it,
         // fitted below with the file's own colour (`own_colour`), whichever look sits on top.
-        let own_colour = crate::camera_profiles::profile_for(&raw.color, &raw.metadata, &options.camera)
+        let own_colour = crate::camera_profiles::profile_for_at(&raw.color, &raw.metadata, &options.camera, options.process)
             .filter(|d| crate::camera_preview::keeps_photo_tone(d))
             .map(|_| raw.color.clone());
-        let dcp = crate::camera_profiles::apply_choice_with(&mut raw.color, &raw.metadata, &options.camera, options.camera_look).is_some();
+        let dcp =
+            crate::camera_profiles::apply_choice_with(&mut raw.color, &raw.metadata, &options.camera, options.camera_look, options.process).is_some();
         // Embedded lens corrections are applied by the pipeline ("Enable Profile Corrections"), not baked in
         // (removed before the camera look's binned sensor proxy too, which needs an empty `OpcodeList3`).
         let info = raw.info();
@@ -786,19 +805,30 @@ fn load_bytes_now(
         let colorimetric = crate::camera_preview::colorimetric_camera(&raw).is_some();
         // the source's segmentation mattes (DNG semantic masks), read while the starting colour is fitted
         let (((xy, t, camera_look), kept_tone), mattes) = rayon::join(
+            // (the fit of the photo's process: V1 to V8 keep theirs, `camera_preview::FitGen`)
             || {
-                let removed = dng_lens_ops.map(|ops| std::mem::replace(&mut raw.opcodes.list3, ops));
-                // With the opcodes restored, the proxy already includes vignetting; do not apply it twice.
-                let embedded = if removed.is_some() { None } else { lens.as_ref() };
-                let kept_tone = own_colour.and_then(|own| {
-                    let mut trace = crate::camera_preview::StartTrace::default();
-                    crate::camera_preview::tone_without_profile(&mut raw, own, &bytes, lens_geometry.as_ref(), embedded, options.colour, &mut trace)
-                });
-                let colour = crate::camera_preview::starting_colour(&mut raw, &bytes, lens_geometry.as_ref(), embedded, options.colour, dcp);
-                if let Some(ops) = removed {
-                    raw.opcodes.list3 = ops;
-                }
-                (colour, kept_tone)
+                crate::camera_preview::with_fit_gen(crate::camera_preview::FitGen::of_process(options.process), || {
+                    let removed = dng_lens_ops.map(|ops| std::mem::replace(&mut raw.opcodes.list3, ops));
+                    // With the opcodes restored, the proxy already includes vignetting; do not apply it twice.
+                    let embedded = if removed.is_some() { None } else { lens.as_ref() };
+                    let kept_tone = own_colour.and_then(|own| {
+                        let mut trace = crate::camera_preview::StartTrace::default();
+                        crate::camera_preview::tone_without_profile(
+                            &mut raw,
+                            own,
+                            &bytes,
+                            lens_geometry.as_ref(),
+                            embedded,
+                            options.colour,
+                            &mut trace,
+                        )
+                    });
+                    let colour = crate::camera_preview::starting_colour(&mut raw, &bytes, lens_geometry.as_ref(), embedded, options.colour, dcp);
+                    if let Some(ops) = removed {
+                        raw.opcodes.list3 = ops;
+                    }
+                    (colour, kept_tone)
+                })
             },
             || dng_mattes(&bytes, &info),
         );
@@ -816,7 +846,11 @@ fn load_bytes_now(
         let (img, clip_mask) = match binned {
             Some((img, mask)) => (img, Some(mask)),
             None => {
-                let method = if max_edge <= 600 { lcc_raw::Method::Bilinear } else { lcc_raw::Method::Ahd };
+                let method = match (max_edge <= 600, options.ahd_blend) {
+                    (true, _) => lcc_raw::Method::Bilinear,
+                    (false, true) => lcc_raw::Method::AhdBlend,
+                    (false, false) => lcc_raw::Method::Ahd,
+                };
                 (raw.develop(method).map_err(|e| e.to_string())?, None)
             }
         };
@@ -827,11 +861,21 @@ fn load_bytes_now(
         let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
         // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
         let tables = lcc_raw::profile::ProfileTables::new(&raw.color.profile, lcc_raw::color::illuminant_weight(&raw.color, xy));
+        // White balance re-evaluates the file's own colour model (when it has one and no file-local look matrix sits
+        // on top of it). A model's measured matrices never do: they only give the Kelvin scale its numbers, and the
+        // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
+        // existed render exactly as they did, `lcc_pipeline::local::legacy_white`).
+        let own_model = scale.own_matrix && !t.matrix_is_fallback && (camera_look.is_none() || raw.format == lcc_raw::RawFormat::Dng || dcp);
+        // Process V9: the tables wait for the white balance (DNG spec ch. 6 order), which the pipeline applies after
+        // re-balancing to the chosen white; only with the camera's own model (the white balance re-develops through
+        // it) and no fitted look's hue/saturation step after them
+        let defer = options.defer_tables && own_model && tables.is_some() && hue_sat.is_none();
+        let gain = 2f32.powf(t.baseline_exposure as f32);
         let colour = CameraColourModel {
             wb: t.wb,
             matrix: camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix),
-            gain: 2f32.powf(t.baseline_exposure as f32),
-            tables: tables.as_ref(),
+            gain,
+            tables: if defer { None } else { tables.as_ref() },
             hue_sat: hue_sat.as_ref(),
         };
         // camera RGB → what the pipeline takes: clipped highlights rebuilt, white balance and the colour model applied,
@@ -840,8 +884,8 @@ fn load_bytes_now(
             let mut stages = vec![("develop", t0.elapsed())];
             stages.push(("transform", t0.elapsed()));
             match &clip_mask {
-                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask),
-                None => colour.rebuild_highlights(&mut img),
+                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask, headroom_of(&options)),
+                None => colour.rebuild_highlights(&mut img, headroom_of(&options)),
             }
             stages.push(("highlights", t0.elapsed()));
             colour.apply(&mut img);
@@ -867,18 +911,40 @@ fn load_bytes_now(
             eprintln!("[profile] raw source {}×{} (max {max_edge}, ms after decode): {}", img.width, img.height, parts.join(", "));
         }
         let twin = twin.map(|picture| finish(picture).0);
-        // White balance re-evaluates the file's own colour model (when it has one and no file-local look matrix sits
-        // on top of it). A model's measured matrices never do: they only give the Kelvin scale its numbers, and the
-        // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
-        // existed render exactly as they did, `lcc_pipeline::local::legacy_white`).
-        let camera_color = (scale.own_matrix && !t.matrix_is_fallback && (camera_look.is_none() || raw.format == lcc_raw::RawFormat::Dng || dcp))
-            .then(|| {
-                let tags = lcc_raw::ColorData { profile: Default::default(), ..raw.color.clone() };
-                Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy })
-            });
+        let camera_color = own_model.then(|| {
+            // the tags without their profile look (applied while decoding), or with its tables when they wait for the
+            // white balance (the tone curve and gain table map have stages of their own: `camera_tone`, `local_tone`)
+            let profile = if defer {
+                lcc_raw::profile::ProfileLook {
+                    hue_sat_map: raw.color.profile.hue_sat_map.clone(),
+                    look_table: raw.color.profile.look_table.clone(),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            };
+            let tags = lcc_raw::ColorData { profile, ..raw.color.clone() };
+            Arc::new(lcc_pipeline::CameraColor { tags, developed_for: xy, deferred_tables_gain: defer.then_some(gain) })
+        });
         // a fitted look's tone, else the tone a profile without a curve of its own keeps, else the file's (or profile's) curve
-        let camera_tone =
-            camera_look.as_ref().map(|p| p.tone).or(kept_tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
+        // (the tone kept under a profile without a curve is marked: process 9 draws it in Lightroom's default look)
+        let camera_tone = camera_look
+            .as_ref()
+            .map(|p| p.tone)
+            .or(kept_tone.map(lcc_pipeline::tone::CameraTone::under_default_curve))
+            .or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
+        if lcc_pipeline::profiling() {
+            let from = if camera_look.is_some() {
+                "fitted look"
+            } else if kept_tone.is_some() {
+                "kept photo tone"
+            } else if camera_tone.is_some() {
+                "profile curve"
+            } else {
+                "none"
+            };
+            eprintln!("[profile] camera tone: {from}");
+        }
         let local_tone = local_tone(&raw);
         let (temp, tint) = scale.as_shot(xy);
         return Ok((
@@ -2708,7 +2774,7 @@ pub(crate) mod tests {
             assert!(out.iter().all(|v| (v - out[1]).abs() <= 1e-3 * out[1]), "{w:?} renders {out:?}");
             let colour = CameraColourModel { wb: [2.5, 1.0, 1.6], matrix: model, gain: 1.0, tables: None, hue_sat: None };
             let mut img = Rgb32f::filled(4, 4, [1.0; 3]);
-            colour.rebuild_highlights(&mut img);
+            colour.rebuild_highlights(&mut img, 0.0);
             colour.apply(&mut img);
             assert!(img.data.iter().flatten().all(|v| v.is_finite()), "{:?}", img.get(0, 0));
         }
@@ -2734,7 +2800,7 @@ pub(crate) mod tests {
                 [0.3 / wb[0], 0.3, 0.3 / wb[2]]
             }
         });
-        colour.rebuild_highlights(&mut img);
+        colour.rebuild_highlights(&mut img, 0.0);
         colour.apply(&mut img);
         let info = SourceInfo { raw: true, ..Default::default() };
         let mut issue = lcc_develop::DevelopSettings::default();
@@ -2765,7 +2831,7 @@ pub(crate) mod tests {
         let y = (rows.start + rows.end) / 2;
         let first = (0..w).find(|&x| sensor.get(x, y)[1] >= HIGHLIGHT_CLIP).unwrap();
         let mut img = sensor.clone();
-        colour.rebuild_highlights(&mut img);
+        colour.rebuild_highlights(&mut img, 0.0);
         colour.apply(&mut img);
         let mut s = lcc_develop::DevelopSettings::default();
         s.light.exposure = -2.0;
@@ -2829,7 +2895,7 @@ pub(crate) mod tests {
         let y = top + strip + band / 2;
         let at = (0..w).find(|&x| sensor.get(x, y)[0] >= HIGHLIGHT_CLIP).unwrap();
         let mut img = sensor.clone();
-        colour.rebuild_highlights(&mut img);
+        colour.rebuild_highlights(&mut img, 0.0);
         colour.apply(&mut img);
         let mut s = lcc_develop::DevelopSettings::default();
         s.light.exposure = -2.0;

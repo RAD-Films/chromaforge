@@ -1555,10 +1555,10 @@ pub(crate) struct StackedCurve {
 }
 
 impl StackedCurve {
-    pub(crate) fn new(c: &ToneCurve) -> StackedCurve {
+    pub(crate) fn new(c: &ToneCurve, process: lcc_develop::Process) -> StackedCurve {
         let master = (!ToneCurve::point_curve_is_identity(&c.master))
             .then(|| lcc_color::spline::MonotoneCurve::new(&c.master.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()));
-        StackedCurve { param: ParametricCurve::new(c), master }
+        StackedCurve { param: ParametricCurve::for_process(c, process), master }
     }
 
     /// The master point curve at a level.
@@ -1624,7 +1624,7 @@ fn param_drag(app: &mut LccApp, ui: &mut egui::Ui, r: Rect, resp: &egui::Respons
         return;
     }
     let t = Tokens::get(ui.ctx());
-    let stacked = StackedCurve::new(&d.curve);
+    let stacked = StackedCurve::new(&d.curve, d.process.process());
     let model = &stacked.param;
     let to_screen = |x: f64, y: f64| pos2(r.left() + x as f32 * r.width(), r.bottom() - y as f32 * r.height());
     let from_screen_x = |q: Pos2| ((q.x - r.left()) / r.width()).clamp(0.0, 1.0) as f64;
@@ -1671,9 +1671,7 @@ fn param_drag(app: &mut LccApp, ui: &mut egui::Ui, r: Rect, resp: &egui::Respons
         // line, so the motion is measured in region-curve levels: what the master curve takes to it.
         let level_of = |y: f32| ((r.bottom() - y) / r.height()).clamp(0.0, 1.0) as f64;
         let delta_level = stacked.param_level(level_of(cursor.y)) - stacked.param_level(level_of(start_y));
-        let per_unit = model.level_per_unit(region, x);
-        let new_amount =
-            if per_unit.abs() > f64::EPSILON { (initial_amount + delta_level / per_unit).clamp(-100.0, 100.0).round() } else { initial_amount };
+        let new_amount = model.amount_after_drag(region, initial_amount, delta_level, x);
         if let Some(&id) = PARAM_AMOUNTS.get(region) {
             set = Some((id, new_amount));
         }
@@ -1864,7 +1862,7 @@ pub(crate) fn curve_editor(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, d: 
         // of its own, so a slider moved by hand, a preset, a Reset or an Undo redraws it from the
         // settings in the same frame it changes.
         let c = &d.curve;
-        let model = StackedCurve::new(c);
+        let model = StackedCurve::new(c, d.process.process());
         let pts: Vec<Pos2> =
             (0..=CURVE_SAMPLES).map(|i| to_screen(i as f64 / CURVE_SAMPLES as f64, model.at(i as f64 / CURVE_SAMPLES as f64))).collect();
         p.add(egui::Shape::line(pts, Stroke::new(2.0, Color32::from_gray(220))));

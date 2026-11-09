@@ -302,6 +302,7 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
     }
     // SHORT or LONG only (DNG 1.7): a RATIONAL here is ignored by libtiff and stricter readers
     let white: Vec<u32> = (0..cpp).map(|s| raw.white_at(s).round().clamp(0.0, u32::MAX as f32) as u32).collect();
+    let max_white = white.iter().copied().max().unwrap_or(0);
     ifd.set(t::WHITE_LEVEL, Value::Long(white));
     let a = raw.active_area;
     ifd.set(t::ACTIVE_AREA, Value::Long(vec![a.y as u32, a.x as u32, (a.y + a.height) as u32, (a.x + a.width) as u32]));
@@ -463,8 +464,9 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
             ifd.set_image(ImageData::Tiles { tile_width: tile as u32, tile_height: tile as u32, tiles });
         }
         (RawData::U16(v), _) => {
-            let maxv = v.iter().copied().max().unwrap_or(0);
-            let bits = (16 - maxv.leading_zeros()).max(raw.bits.min(16)).max(2) as u8;
+            // a dark frame may never reach the sensor's white level, which must still fit (upstream #3429)
+            let maxv = u32::from(v.iter().copied().max().unwrap_or(0)).max(max_white);
+            let bits = (32 - maxv.leading_zeros()).max(raw.bits).clamp(2, 16) as u8;
             ifd.set(
                 t::BITS_PER_SAMPLE,
                 Value::Short(vec![if matches!(opts.compression, DngCompression::Uncompressed) { 16 } else { bits as u16 }; cpp]),

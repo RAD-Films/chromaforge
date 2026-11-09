@@ -502,8 +502,10 @@ fn export_dcp(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad(C, "needs `path` (the .dcp to write)"))?.to_string();
     let (id, bytes) = one_photo(s, p, C)?;
     let choice = s.develop_of(id).map(|d| d.profile.camera.clone()).unwrap_or_default();
-    let dcp =
-        crate::colour_export::photo_dcp(&bytes, &choice, str_param(p, "name").unwrap_or_default(), str_param(p, "camera")).map_err(|e| bad(C, e))?;
+    // (the colour of the photo's process: V1 to V8 keep their camera-look fit)
+    let process = s.develop_of(id).map_or(lcc_develop::Process::LATEST, |d| d.process.process()).version().0;
+    let dcp = crate::colour_export::photo_dcp_at(&bytes, &choice, str_param(p, "name").unwrap_or_default(), str_param(p, "camera"), process)
+        .map_err(|e| bad(C, e))?;
     let parsed = lcc_raw::dcp::parse(&dcp).map_err(|e| bad(C, format!("the profile written doesn't read back: {e}")))?;
     write_out(s, C, &path, &dcp)?;
     Ok(json!({"path": path, "model": parsed.model, "name": parsed.name}))

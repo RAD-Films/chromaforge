@@ -149,6 +149,26 @@ Every example below writes `{{cli_binary}}`: put the path or prefix you used her
    or an issue on the project's repository. `--contributor`
    is optional; leave it out to stay anonymous.
 
+## Adding a look to a camera that already has a calibration
+
+When the camera already has a calibration (`calibrate-lightroom list`), export your photos with the profile it lacks
+(say Adobe Color) and fit only that look on top of the existing file:
+
+```
+{{cli_binary}} calibrate-lightroom fit --base crates/camdb/data/calibrations/NIKON_NIKON_Z6_3.json \
+  --raws RAWS --exports EXPORTS -o out --hold-out DSC_0012,DSC_0040
+```
+
+The camera model (colour and forward matrices, hue/saturation map) and the file's looks are kept exactly, so photos
+developed with them render as before; the new look is added after them with its own tone curve and look table, and
+its held-out evidence. Exports of a look the file already has are refused unless you pass `--replace-looks`, which
+refits that look in its place on the same camera model. `--hold-out NAME,…` (also without `--base`) holds out the
+raws whose file names contain one of the names, instead of a share picked by order.
+
+To refit a look the file already has without changing photos developed with it, add `--since-process N`: the fitted
+look is stored as a second entry of that name for process N and newer (`since_process` in the file), and photos on
+older processes keep the file's own entry.
+
 ## Other editors: Capture One, darktable, RawTherapee, DxO PhotoLab
 
 The same fit works against another editor's exports, so people moving from it can open their raws in its look:

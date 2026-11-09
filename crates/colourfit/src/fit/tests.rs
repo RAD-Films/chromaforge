@@ -107,3 +107,73 @@ fn fit_hostile_inputs_are_errors() {
     mixed[1].model = "Other".into();
     assert!(fit(&mixed, &FitOptions::default()).is_err());
 }
+
+/// The synthetic photos of `model`, rendered through another (brighter, flatter) tone curve and named `look`.
+fn other_look(model: &Model, look: &str) -> Vec<PhotoSamples> {
+    let tone: Vec<[f32; 2]> = std::iter::once([0.0, 0.0])
+        .chain((0..32).map(|i| {
+            let x = 2f32.powf(-12.0 + 12.0 * i as f32 / 31.0);
+            [x, (x.powf(0.42) / (x.powf(0.42) + 0.22) * 1.2).min(0.999)]
+        }))
+        .collect();
+    let lut = lut_for(&tone).unwrap();
+    let mut photos = synthetic(model, &lut);
+    for p in &mut photos {
+        p.look = look.into();
+    }
+    photos
+}
+
+#[test]
+fn fit_on_base_adds_a_look_and_keeps_the_camera_model_and_existing_looks() {
+    let (model, tone) = truth();
+    let base = fit(&synthetic(&model, &lut_for(&tone).unwrap()), &FitOptions { rounds: 2, ..Default::default() }).unwrap();
+    let cal = fit_on_base(&other_look(&model, "Adobe Color"), &base, false, &FitOptions { rounds: 2, ..Default::default() }).unwrap();
+    cal.validate().unwrap();
+    assert_eq!(cal.camera, base.camera, "the camera model is the base file's, untouched");
+    assert_eq!(cal.looks.first(), base.looks.first(), "the base's looks stay as they were, and its default stays first");
+    assert_eq!(cal.looks.len(), base.looks.len() + 1);
+    let added = cal.looks.last().unwrap();
+    assert_eq!(added.name, "Adobe Color", "the look keeps Lightroom's profile name, which photos are matched by");
+    let ev = cal.evidence.looks.iter().find(|e| e.name == "Adobe Color").unwrap();
+    assert!(ev.photos > 0 && ev.held_out > 0, "{ev:?}");
+    assert!(ev.after.median < ev.before.median, "{ev:?}");
+    assert_eq!(cal.evidence.photos, base.evidence.photos, "the camera model's evidence is the base's");
+    assert!(cal.evidence.looks.iter().any(|e| e.name == "Adobe Standard"));
+}
+
+#[test]
+fn fit_on_base_refuses_a_look_it_has_unless_replacing_and_another_camera() {
+    let (model, tone) = truth();
+    let lut = lut_for(&tone).unwrap();
+    let base = fit(&synthetic(&model, &lut), &FitOptions { rounds: 1, ..Default::default() }).unwrap();
+    let again = other_look(&model, "Adobe Standard");
+    let err = fit_on_base(&again, &base, false, &FitOptions::default()).unwrap_err();
+    assert!(err.0.contains("--replace-looks"), "{err}");
+    let replaced = fit_on_base(&again, &base, true, &FitOptions { rounds: 1, ..Default::default() }).unwrap();
+    assert_eq!(replaced.camera, base.camera);
+    assert_eq!(replaced.looks.len(), base.looks.len(), "the look is refitted in its place");
+    assert_ne!(replaced.looks[0].tone_curve, base.looks[0].tone_curve);
+    let mut foreign = other_look(&model, "Adobe Color");
+    for p in &mut foreign {
+        p.model = "Other 2".into();
+    }
+    assert!(fit_on_base(&foreign, &base, false, &FitOptions::default()).is_err());
+    assert!(fit_on_base(&[], &base, false, &FitOptions::default()).is_err());
+}
+
+#[test]
+fn fit_on_base_with_a_process_adds_an_entry_and_keeps_the_look_for_older_processes() {
+    let (model, tone) = truth();
+    let base = fit(&synthetic(&model, &lut_for(&tone).unwrap()), &FitOptions { rounds: 1, ..Default::default() }).unwrap();
+    let opts = FitOptions { rounds: 1, since_process: Some(8), ..Default::default() };
+    let cal = fit_on_base(&other_look(&model, "Adobe Standard"), &base, false, &opts).unwrap();
+    assert_eq!(cal.camera, base.camera);
+    assert_eq!(cal.looks.len(), base.looks.len() + 1);
+    let id = lcc_camdb::calibration::look_id("Adobe Standard");
+    assert_eq!(cal.look(&id), base.look(&id), "older processes keep the base file's look");
+    assert_eq!(cal.look_at(&id, 8).and_then(|l| l.since_process), Some(8));
+    assert!(cal.evidence.looks.iter().any(|e| e.since_process == Some(8) && e.held_out > 0));
+    let again = fit_on_base(&other_look(&model, "Adobe Standard"), &cal, false, &opts).unwrap_err();
+    assert!(again.0.contains("--replace-looks"), "{again}");
+}

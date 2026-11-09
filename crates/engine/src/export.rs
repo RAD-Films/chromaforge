@@ -2211,6 +2211,8 @@ enum Work {
         size: (usize, usize),
         /// The photo's camera-profile choice (`profile.camera`): a DNG carries the colour the photo renders with.
         camera: String,
+        /// The photo's process number: V1 to V8 keep their camera-look fit and raw levels in a DNG too.
+        process: u32,
     },
 }
 
@@ -2314,6 +2316,7 @@ fn prepare_guarded(
         let weight = (p.file_size as usize).saturating_add(if dng.is_some() { full_px.saturating_mul(6) } else { 0 });
         let work = Work::File {
             camera: p.develop.profile.camera.clone(),
+            process: p.develop.process.process().version().0,
             path: path.clone(),
             read: session.media.file_bytes.clone(),
             packet: crate::sidecar::sidecar_packet_with(p, &session.catalog, removes_location(p, &session.catalog, o)),
@@ -2521,7 +2524,7 @@ impl PreparedExport {
                 })
             }
 
-            Work::File { path, read, packet, dng, quality, lossy_edge, label, size, remove_location, camera } => {
+            Work::File { path, read, packet, dng, quality, lossy_edge, label, size, remove_location, camera, process } => {
                 let bytes = match &read {
                     Some(r) => r(&path)?,
                     None => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
@@ -2574,9 +2577,9 @@ impl PreparedExport {
                 if lcc_raw::probe(&bytes).is_none() {
                     return Err(format!("{label}: DNG export needs a raw photo"));
                 }
-                let mut raw = lcc_raw::decode(&bytes).map_err(|e| format!("{label}: {e}"))?;
+                let mut raw = crate::files::decode_raw_at(&bytes, process).map_err(|e| format!("{label}: {e}"))?;
                 // the colour the photo renders with: its chosen .dcp or calibration look, else the starting colour
-                crate::colour_export::with_photo_colour(&mut raw, &bytes, &camera);
+                crate::colour_export::with_photo_colour_at(&mut raw, &bytes, &camera, process);
                 drop(bytes);
                 let compression = match dng {
                     DngCompression::Lossless => lcc_raw::DngCompression::Lj92 { tile: 256 },

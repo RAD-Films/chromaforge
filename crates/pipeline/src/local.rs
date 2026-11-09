@@ -12,14 +12,29 @@ use lcc_raster::{Plane, Rgb32f, par_join};
 use crate::geometry::Frame;
 use crate::{Prepared, Quality, SourceInfo, for_rows, masks, timed};
 
-/// White balance (relative to the source's as-shot white) and exposure, in place.
+/// White balance (relative to the source's as-shot white) and exposure, in place. Process V9: the camera profile's
+/// tables between the two ([`wb_gain`]).
 pub fn scene_linear_pre(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings) {
     wb_gain(img, info, s, 2f32.powf(s.light.exposure as f32));
 }
 
-/// White balance only (exposure is applied by the per-pixel stage, see [`crate::Prepared`]).
+/// White balance only (exposure is applied by the per-pixel stage, see [`crate::Prepared`]); process V9: then the
+/// camera profile's tables ([`wb_gain`]).
 pub fn white_balance(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings) {
     wb_gain(img, info, s, 1.0);
+}
+
+/// Everything [`white_balance`] reads besides the pixels, for the key of a cache of its result: the matrix it
+/// applies ([`wb_matrix_for`]: the white, the raw flag, the camera's colour model) and the camera profile's deferred
+/// tables ([`deferred_tables`]: which profile, its gain, the white it was developed for).
+pub(crate) fn white_balance_key(info: &SourceInfo, s: &DevelopSettings) -> impl std::hash::Hash {
+    let m = wb_matrix_for(info, s).map(|m| m.map(|r| r.map(f32::to_bits)));
+    let tables = info
+        .camera_color
+        .as_ref()
+        .filter(|c| c.deferred_tables_gain.is_some())
+        .map(|c| (Arc::as_ptr(c) as usize, c.deferred_tables_gain.map(f32::to_bits), [c.developed_for.x.to_bits(), c.developed_for.y.to_bits()]));
+    (m, tables)
 }
 
 /// The white-balance matrix (linear Rec.2020) for the settings, or `None` when the as-shot white
@@ -46,8 +61,28 @@ pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]
     Some(m.mul(&lcc_color::Mat3::diag(1.0 / y, 1.0 / y, 1.0 / y)).to_f32())
 }
 
+/// The camera-profile tables of a source whose tables wait for the white balance, resolved for the white the settings
+/// choose (the dual-illuminant hue/saturation maps blended for it, as for the matrices), with the baseline-exposure
+/// gain the source pixels already carry. `None` when the source has no deferred tables.
+pub fn deferred_tables(info: &SourceInfo, s: &DevelopSettings) -> Option<(lcc_raw::profile::ProfileTables, f32)> {
+    let cc = info.camera_color.as_deref()?;
+    let gain = cc.deferred_tables_gain.filter(|g| g.is_finite() && *g > 0.0)?;
+    let (t, tint) = effective_wb(info, s);
+    // at the as-shot white: the white the source was developed for, as the decode used to resolve them
+    let as_shot = (t - info.as_shot_temp).abs() < 1e-6 && (tint - info.as_shot_tint).abs() < 1e-6;
+    let white = if as_shot { cc.developed_for } else { temp_tint_to_xy(t, tint) };
+    let tables = lcc_raw::profile::ProfileTables::new(&cc.tags.profile, lcc_raw::color::illuminant_weight(&cc.tags, white))?;
+    Some((tables, gain))
+}
+
+/// The white balance, then (process V9, [`deferred_tables`]) the camera profile's tables (hue/saturation map,
+/// baseline exposure, look table) in the order of the DNG specification (chapter 6), then `gain`, in place. The
+/// pixels carry the baseline-exposure gain already, so the map sees them without it, as it would in that order.
+/// Channels are clamped at zero only after the tables: a V1–V7 decode applied them to the unclamped colour, and at
+/// the as-shot white V9 gives what it gave.
 fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) {
     let m = wb_matrix_for(info, s);
+    let tables = deferred_tables(info, s);
     let w = img.width;
     for_rows(&mut img.data, w, |_, row| {
         for p in row.iter_mut() {
@@ -58,6 +93,9 @@ fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) 
                     m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2],
                     m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
                 ];
+            }
+            if let Some((tables, baseline)) = &tables {
+                c = tables.apply(c.map(|v| v / baseline), *baseline).map(|v| if v.is_finite() { v } else { 0.0 });
             }
             *p = [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)];
         }
@@ -381,7 +419,7 @@ pub const DEHAZE_PATCH_MAX: usize = 64;
 pub fn dehaze_patch_radius(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 | Process::V2 => 0,
-        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => {
+        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 => {
             ((DEHAZE_PATCH * px_per_long).round().max(1.0) as usize).min(DEHAZE_PATCH_MAX)
         }
     }
@@ -440,7 +478,9 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 => base_detail_radius(px_per_long),
+        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 => {
+            base_detail_radius(px_per_long)
+        }
     }
 }
 
@@ -1093,7 +1133,21 @@ pub(crate) fn prepare(
             e
         }
     };
-    Prepared { img, log_l, base, clarity_blur, texture_blur, sharpen_blur, dark, chroma_blur, air, masks, mask_tone: Vec::new(), px_per_long }
+    Prepared {
+        img,
+        log_l,
+        base,
+        clarity_blur,
+        texture_blur,
+        sharpen_blur,
+        dark,
+        chroma_blur,
+        air,
+        masks,
+        mask_tone: Vec::new(),
+        tone_lift: None,
+        px_per_long,
+    }
 }
 
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):

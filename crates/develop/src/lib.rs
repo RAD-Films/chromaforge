@@ -512,6 +512,23 @@ mod tests {
         assert_eq!(DevelopSettings::from_json(&on.to_json()).unwrap(), on);
     }
 
+    /// New HDR edits start at Lightroom Classic's default headroom (+2.30 stops, as LrC writes on a photo
+    /// whose HDR is switched on), on the settings and on the Headroom slider's reset value; an edit saved with
+    /// HDR on keeps its own headroom; SDR Blend at 3 stops keeps the strength it had. Failed while the default was 3.
+    #[test]
+    fn new_hdr_edits_start_at_lightroom_headroom() {
+        assert_eq!(Hdr::default().max_ev, 2.3);
+        assert_eq!(crate::controls::find("hdr.maxEv").expect("the Headroom control").default, 2.3);
+        let on = DevelopSettings::from_json(&serde_json::json!({"hdr": {"enabled": true}})).unwrap();
+        assert_eq!(on.hdr.max_ev, 2.3, "a file that turns HDR on without a headroom");
+        let mut saved = DevelopSettings::default();
+        saved.hdr.enabled = true;
+        saved.hdr.max_ev = 3.0;
+        assert_eq!(DevelopSettings::from_json(&saved.to_json()).unwrap().hdr.max_ev, 3.0, "a saved edit keeps 3");
+        saved.hdr.sdr_blend = 50.0;
+        assert_eq!(saved.sdr_rendition().light.highlights, -30.0, "blend at 3 stops: nominal strength");
+    }
+
     #[test]
     fn hdr_peak_is_finite_for_a_non_finite_headroom() {
         let mut h = Hdr { enabled: true, max_ev: f64::NAN, ..Hdr::default() };

@@ -391,6 +391,16 @@ pub fn decode(bytes: &[u8]) -> Result<RawImage> {
     decode_with(bytes, Mode::Full)
 }
 
+/// [`decode`] as processes V1 to V8 read a file: a Sony "12-bit uncompressed" ARW takes its black and white levels
+/// from its brightest sample (upstream #3429 reads them from the word layout, process V9), so a photo edited under
+/// those processes keeps its pixels. Every other file decodes as [`decode`] does.
+pub fn decode_v8_levels(bytes: &[u8]) -> Result<RawImage> {
+    match probe(bytes).ok_or(RawError::NotRaw)? {
+        RawFormat::Arw => vendor::arw::decode_levels(bytes, Mode::Full, true),
+        _ => decode(bytes),
+    }
+}
+
 /// [`decode`] at a smaller size, for a picture whose default crop needs a long edge of only `min_long` px: a DNG
 /// that keeps reduced-resolution copies of its LinearRaw image (Lightroom's HDR and panorama merges keep 256 to 2048
 /// px ones) decodes the smallest that covers it. The image has the full one's levels, colour and metadata; its

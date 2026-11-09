@@ -8,7 +8,7 @@
 //! Sources: own design (reuses [`crate::render`]).
 
 use crate::{Quality, RenderRequest, SourceInfo};
-use lcc_develop::DevelopSettings;
+use lcc_develop::{DevelopSettings, Process};
 use lcc_raster::{Rgb32f, Rgba8};
 
 /// The widest frame a draft (playback) grade renders.
@@ -20,10 +20,13 @@ pub const DRAFT_MAX_WIDTH: usize = 960;
 /// Section on/off toggles are kept. Dropped: effects (texture, clarity, dehaze), vignette, grain,
 /// detail (sharpening, noise reduction), optics, geometry, crop, orientation, masks, spots, red
 /// eye, lens blur, enhance, point colour, calibration and HDR.
+/// Video stays at most at process V8: V9's Highlights / Shadows curve follows each picture's own histogram, which
+/// would flicker from frame to frame, and its measured Exposure response is not a linear gain.
 pub fn video_settings(s: &DevelopSettings) -> DevelopSettings {
+    let process = if s.process.process() >= Process::V9 { Process::V8.version() } else { s.process };
     DevelopSettings {
         version: s.version,
-        process: s.process,
+        process,
         profile: s.profile.clone(),
         treatment: s.treatment,
         wb: s.wb,
@@ -159,6 +162,7 @@ impl GradeLut {
             air: 1.0,
             masks: Vec::new(),
             mask_tone: Vec::new(),
+            tone_lift: None,
             px_per_long: plan.px_per_long,
         };
         // (a grading LUT for video: no plug-in filters)
@@ -274,7 +278,10 @@ mod tests {
     fn graded_frame_matches_photo_pipeline() {
         let img = frame();
         let s = allowed();
-        let photo = crate::render(&img, &SourceInfo::default(), &s, &RenderRequest::fit(320, 180)).image;
+        // a photo under the process video is held to (V8)
+        let mut p = s.clone();
+        p.process = Process::V8.version();
+        let photo = crate::render(&img, &SourceInfo::default(), &p, &RenderRequest::fit(320, 180)).image;
         assert_eq!(grade_frame(&img, &s, Quality::Full), photo);
     }
 
@@ -347,5 +354,22 @@ mod tests {
         for c in [[f32::NAN; 3], [f32::INFINITY, -1.0, 1e30], [-0.0, 0.0, 2.0]] {
             assert!(lut.lookup(c).iter().all(|v| v.is_finite()));
         }
+    }
+
+    /// A clip edited under V9 grades as under V8: the same frame, the same pixels.
+    #[test]
+    fn video_grades_with_v7s_tone() {
+        let img = frame();
+        let mut s = DevelopSettings::default();
+        s.light.exposure = 1.0;
+        s.light.shadows = 100.0;
+        s.light.highlights = -100.0;
+        s.light.whites = 40.0;
+        s.curve.darks = -100.0;
+        s.process = Process::V9.version();
+        let new = grade_frame(&img, &s, Quality::Draft);
+        s.process = Process::V8.version();
+        let old = grade_frame(&img, &s, Quality::Draft);
+        assert_eq!(new.data, old.data);
     }
 }

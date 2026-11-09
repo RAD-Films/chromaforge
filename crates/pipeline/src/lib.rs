@@ -55,6 +55,7 @@ pub mod skin;
 pub mod source_stage;
 pub mod spots;
 pub mod tone;
+pub mod tone_lift;
 pub mod transform;
 pub mod upright;
 pub mod visualize;
@@ -77,10 +78,17 @@ pub use tone::ToneMap;
 /// spec ch. 6) instead of adapting the as-shot rendering ([`local::wb_matrix_for`]).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CameraColor {
-    /// The file's colour tags (its profile look left out: it is applied at load).
+    /// The file's colour tags. Their profile look is left out (applied at load), except for its hue/saturation map
+    /// and look table when [`Self::deferred_tables_gain`] says they wait for the white balance.
     pub tags: lcc_raw::ColorData,
     /// The white the source pixels were developed for.
     pub developed_for: lcc_color::Xy,
+    /// Process V9 (`LoadOptions::defer_tables`): the source pixels are white-balanced, matrixed and scaled by this
+    /// baseline-exposure gain, but the tags' hue/saturation map and look table are not in them yet; the scene-linear
+    /// stage applies them after the white balance, at the chosen white ([`local::white_balance`]). `None`: any
+    /// tables were applied while decoding, at the as-shot white.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_tables_gain: Option<f32>,
 }
 
 /// Facts about the source the settings are interpreted against.
@@ -370,6 +378,8 @@ pub(crate) struct Prepared {
     pub masks: Vec<masks::Evaluated>,
     /// The masks' own Whites / Blacks tone ranges ([`Plan::mask_tone`]).
     pub mask_tone: Vec<[f32; 4]>,
+    /// The global Highlights / Shadows table of process V9 ([`Plan::tone_lift`]).
+    pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
 }
@@ -569,6 +579,9 @@ pub struct Plan<'a> {
     /// render of the whole frame ([`mask_tone`]), so previews, zoomed windows and exports agree; empty when no mask
     /// has Whites or Blacks (the masks then use [`finish::DEFAULT_MASK_TONE`]).
     pub mask_tone: Vec<[f32; 4]>,
+    /// Process V9's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
+    /// the whole frame so previews, zoomed windows and exports agree; `None` before V9 or with both at 0.
+    pub tone_lift: Option<Arc<tone_lift::Lift>>,
     /// A windowed render works on a larger window when spots reach into it (see
     /// [`spots::window_for_reads`]); this is the requested window inside the rendered one, which
     /// the result is cut to.
@@ -722,6 +735,8 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         info.mattes.clone()
     };
     let mask_tone = mask_tone::ranges(aux(), info, s, &whole_frame, mattes.as_deref());
+    let tone_lift =
+        if tone_lift::active(s) { tone_lift::for_frame(aux(), info, s, &whole_frame, finish::shown_tone(s, info).as_ref()) } else { None };
     Plan {
         settings,
         frame,
@@ -739,6 +754,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         eyes,
         fixed_air,
         mask_tone,
+        tone_lift,
         keep,
         mattes,
         source_filters,
@@ -847,6 +863,7 @@ pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     }
     // (before the white balance: the gain's input is the as-shot development, as in the file)
     local_tone::apply(img, info, p);
+    // (process V9: the camera profile's tables with it, after the white balance, DNG spec ch. 6)
     local::white_balance(img, info, s);
     optics::defringe(img, s, p.px_per_long / optics::DEFRINGE_REF_LONG);
     // a Generative spot changes nothing until its patch is there (not generated yet, moved since,
@@ -1042,6 +1059,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         prep.air = a;
     }
     prep.mask_tone = plan.mask_tone.clone();
+    prep.tone_lift = plan.tone_lift.clone();
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
         c.put(CacheEntry { src: a.clone(), geo, sampled, filtered, lin: Some((lin_key, lin)), nr: nr.map(|n| (nr_key, n)), colour_noise, planes });
@@ -1300,6 +1318,8 @@ mod tests_nr_scale;
 mod tests_pixel_scale;
 #[cfg(test)]
 mod tests_plugin_filters;
+#[cfg(test)]
+mod tests_profile_tables;
 #[cfg(test)]
 mod tests_retouch;
 #[cfg(test)]

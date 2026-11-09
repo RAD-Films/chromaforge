@@ -2701,6 +2701,8 @@ mod tests_print;
 #[cfg(test)]
 mod tests_process;
 #[cfg(test)]
+mod tests_process_golden;
+#[cfg(test)]
 mod tests_profile_manager;
 #[cfg(test)]
 mod tests_recheck;
