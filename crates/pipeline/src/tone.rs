@@ -223,6 +223,19 @@ const LRC_LOOK: [f32; 23] = [
 const LRC_LOOK_FROM: f32 = -11.0;
 const LRC_LOOK_STEP: f32 = 0.5;
 
+/// Lightroom Classic's Contrast on a display value `p` (linear luminance to the power 1/2.2), `c` = Contrast / 100
+/// (process V9): `p + c·A·(p − m)·(1 − |2p − 1|)`, a tent-windowed S-curve anchored at black, white and its pivot
+/// `m`, which sits a third of a stop over grey (0.18 · 2^0.34). Fitted on LrC 15.5 exports of a grey chart of
+/// our own at Contrast +45 and +63 (round 13, 8 Nov 2026; 0.12 / 0.09 L* rms, 0.22 L* worst): `A` = 0.734,
+/// `m` = 0.5112. V1–V8's curve pivots at grey with a narrower window and so darkens the deep tones about a third
+/// less. Contrast below 0 mirrors it (not measured). Rises everywhere for |c| ≤ 1 (slope ≥ 0.25).
+pub fn lrc_contrast(p: f32, c: f32) -> f32 {
+    const A: f32 = 0.734;
+    const PIVOT: f32 = 0.5112;
+    let c = if c.is_finite() { c.clamp(-1.0, 1.0) } else { 0.0 };
+    p + c * A * (p - PIVOT) * (1.0 - (2.0 * p - 1.0).abs()).max(0.0)
+}
+
 /// Display luminance `y` with [`LRC_LOOK`]: monotone, 0 stays 0 and 1 stays 1 (and above it, unchanged).
 pub fn lrc_look(y: f32) -> f32 {
     if !(y.is_finite() && y > 0.0) {
@@ -300,16 +313,29 @@ impl ToneMap {
     /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]), over V8's roll-off; any
     /// other curve as V8 draws it.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        let adjustment = ToneMap::display_shaped(contrast, whites, blacks, 1.0, true);
         if curve.has_default_curve() {
-            ToneMap::camera_with(|y| lrc_look(curve.apply_rolloff(y)), curve.chroma, contrast, whites, blacks, peak)
+            ToneMap::camera_adjusted(|y| lrc_look(curve.apply_rolloff(y)), curve.chroma, adjustment, contrast, whites, blacks, peak)
         } else {
-            ToneMap::camera_rolloff_hdr(curve, contrast, whites, blacks, peak)
+            ToneMap::camera_adjusted(|y| curve.apply_rolloff(y), curve.chroma, adjustment, contrast, whites, blacks, peak)
         }
     }
 
     fn camera_with(curve: impl Fn(f32) -> f32, chroma: [f32; CHROMA_N], contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        ToneMap::camera_adjusted(curve, chroma, Self::display(contrast, whites, blacks), contrast, whites, blacks, peak)
+    }
+
+    /// [`ToneMap::camera_with`] with the sliders' display-referred `adjustment` given.
+    fn camera_adjusted(
+        curve: impl Fn(f32) -> f32,
+        chroma: [f32; CHROMA_N],
+        adjustment: ToneMap,
+        contrast: f64,
+        whites: f64,
+        blacks: f64,
+        peak: f32,
+    ) -> ToneMap {
         let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
-        let adjustment = Self::display(contrast, whites, blacks);
         let neutral = contrast == 0.0 && whites == 0.0 && blacks == 0.0;
         let top = (2.9 - 1.6 * (whites as f32 / 100.0) + peak.log2() + 1.0).max(HDR_FROM_EV + 0.5);
         let lut = (0..LUT_N)
@@ -396,6 +422,11 @@ impl ToneMap {
     /// source, e.g. a decoded gain-map image) pass through and roll off softly towards `peak`
     /// instead of clipping at 1; SDR sources (≤ 1) render as with [`ToneMap::display`].
     pub fn display_hdr(contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
+        ToneMap::display_shaped(contrast, whites, blacks, peak, false)
+    }
+
+    /// [`ToneMap::display_hdr`], with Lightroom Classic's Contrast ([`lrc_contrast`], process V9) when `lrc`.
+    fn display_shaped(contrast: f64, whites: f64, blacks: f64, peak: f32, lrc: bool) -> ToneMap {
         let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
         let c = (contrast / 100.0) as f32;
         let w = (whites / 100.0) as f32;
@@ -410,8 +441,8 @@ impl ToneMap {
                 let y = GREY * 2f32.powf(ev);
                 let mut p = y.powf(1.0 / 2.2);
                 if p <= 1.0 {
-                    // S-curve anchored at 0, grey and 1
-                    p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
+                    // S-curve anchored at 0, grey and 1 (V9: Lightroom's, pivoting a third of a stop higher)
+                    p = if lrc { lrc_contrast(p, c) } else { p + c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2)) };
                     // whites and blacks: broad tonal responses fitted to Lightroom's
                     p += w_b_shift(p, w, b);
                 } else {
@@ -435,7 +466,7 @@ impl ToneMap {
 
     /// Process V9's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
     /// follow Lightroom Classic's responses measured on a grey wedge of our own ([`lrc_tables`]); Contrast is
-    /// [`ToneMap::display`]'s. `exposure` (EV) is the gain already in the luminance this table is read at, so a
+    /// Lightroom's too ([`lrc_contrast`]). `exposure` (EV) is the gain already in the luminance this table is read at, so a
     /// brighter Exposure rolls the highlights off as Lightroom does instead of clipping them. Exposure down stays a
     /// plain gain (not measured). Identity at neutral settings.
     pub fn display_lrc(contrast: f64, whites: f64, blacks: f64, exposure: f64) -> ToneMap {
@@ -444,7 +475,6 @@ impl ToneMap {
         let (w, b) = (if w.is_nan() { 0.0 } else { w }, if b.is_nan() { 0.0 } else { b });
         let e = if exposure.is_finite() { exposure.clamp(-10.0, 10.0) as f32 } else { 0.0 };
         let gain = e.exp2();
-        let m = GREY.powf(1.0 / 2.2);
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
@@ -454,7 +484,7 @@ impl ToneMap {
                 let shown = if e > 0.0 && x <= 1.0 { lrc_exposure(e, x) } else { y };
                 let mut p = shown.max(0.0).powf(1.0 / 2.2);
                 if p <= 1.0 {
-                    p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
+                    p = lrc_contrast(p, c);
                 }
                 p = lrc_w_b(p.clamp(0.0, 1.0), w, b);
                 p.clamp(0.0, 1.0).powf(2.2)
@@ -1020,6 +1050,57 @@ mod tests {
                     assert!((got - want).abs() < 0.004, "{name} {amount} at {x}: {got} vs Lightroom {want}");
                 }
             }
+        }
+    }
+
+    fn lstar(y: f32) -> f32 {
+        let f = if y > 216.0 / 24389.0 { y.cbrt() } else { (24389.0 / 27.0 * y + 16.0) / 116.0 };
+        116.0 * f - 16.0
+    }
+
+    /// Lightroom Classic's Contrast +45 and +63 on a grey chart of our own (round 13: 18 greys from −8 to +2.2 EV,
+    /// ProPhoto exports converted by their ICC profile; L* change from the unadjusted chart). It pivots about a
+    /// third of a stop over grey and darkens the deep tones more than V9's old S-curve did (+45 at −3.2 EV: −5.6 L*,
+    /// the old curve −3.6).
+    #[test]
+    fn display_lrc_contrast_follows_lightroom() {
+        const LRC: [(f64, [f32; 18]); 2] = [
+            (45.0, [-0.4, -0.6, -0.7, -1.1, -1.8, -2.4, -3.8, -4.8, -5.6, -5.6, -5.3, -5.0, -4.3, -2.5, 0.1, 2.8, 3.7, 2.1]),
+            (63.0, [-0.5, -0.7, -1.0, -1.5, -2.2, -3.3, -4.9, -6.6, -7.6, -7.8, -7.6, -7.2, -5.8, -3.5, 0.2, 4.0, 5.1, 2.8]),
+        ];
+        for (contrast, want) in LRC {
+            let map = ToneMap::display_lrc(contrast, 0.0, 0.0, 0.0);
+            for (i, want) in want.into_iter().enumerate() {
+                let y = GREY * 2f32.powf(-8.0 + 0.6 * i as f32);
+                let got = lstar(map.apply(y)) - lstar(y);
+                assert!((got - want).abs() < 0.5, "Contrast +{contrast} at {:+.1} EV: L* {got:+.2} vs Lightroom {want:+.1}", -8.0 + 0.6 * i as f32);
+            }
+        }
+    }
+
+    /// A raw under V9 takes the same Contrast as a JPEG, on top of its camera curve; V8 keeps its own.
+    #[test]
+    fn v9_raw_contrast_is_lightrooms() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        for curve in [CameraTone::new(knots).unwrap(), CameraTone::new(knots).unwrap().under_default_curve()] {
+            let flat = ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0);
+            let both = ToneMap::camera_lrc(&curve, 45.0, 0.0, 0.0, 1.0);
+            let jpeg = ToneMap::display_lrc(45.0, 0.0, 0.0, 0.0);
+            for ev in [-6.0f32, -4.0, -2.0, -1.0, 0.0, 0.5] {
+                let y = GREY * 2f32.powf(ev);
+                let (got, want) = (both.apply(y), jpeg.apply(flat.apply(y)));
+                assert!((got - want).abs() < 0.003, "{ev:+} EV: {got} vs {want}");
+            }
+            let v8 = ToneMap::camera_rolloff_hdr(&curve, 45.0, 0.0, 0.0, 1.0);
+            let old = ToneMap::display(45.0, 0.0, 0.0);
+            let y = GREY * 2f32.powf(-3.0);
+            assert!((v8.apply(y) - old.apply(ToneMap::camera_rolloff_hdr(&curve, 0.0, 0.0, 0.0, 1.0).apply(y))).abs() < 0.003, "V8 unchanged");
+            let v8_flat = ToneMap::camera_rolloff_hdr(&curve, 0.0, 0.0, 0.0, 1.0).apply(y);
+            let (v9_gain, v8_gain) = (both.apply(y) / flat.apply(y), v8.apply(y) / v8_flat);
+            assert!(v9_gain < v8_gain - 0.02, "V9 darkens the deep tones more: {v9_gain} vs V8 {v8_gain}");
         }
     }
 
