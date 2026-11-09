@@ -90,18 +90,17 @@ fn raw_centre(src: &Rgb32f, s: &DevelopSettings) -> f64 {
 fn v8_raw_whites_lifts_a_dim_frame_more_and_a_bright_frame_less_than_v7() {
     // Lightroom's raw Whites +100 depends on how far the picture's brightest tones sit under white
     let dim = picture(-3.0, -2.0);
-    let (flat, v7, v9) =
-        (raw_centre(&dim, &whites(Process::V9, 0.0)), raw_centre(&dim, &whites(Process::V7, 100.0)), raw_centre(&dim, &whites(Process::V9, 100.0)));
-    assert!(v9 - flat > (v7 - flat) + 8.0, "a dim raw: V9 lifts {flat} to {v9}, V7 to {v7}");
+    // each process's lift from its own Whites 0 (V9 draws a raw without a camera tone on Lightroom Classic's base tone)
+    let lift = |src: &Rgb32f, p: Process| (raw_centre(src, &whites(p, 0.0)), raw_centre(src, &whites(p, 100.0)));
+    let ((flat, v9), (flat7, v7)) = (lift(&dim, Process::V9), lift(&dim, Process::V7));
+    assert!(v9 - flat > (v7 - flat7) + 8.0, "a dim raw: V9 lifts {flat} to {v9}, V7 {flat7} to {v7}");
     let bright = picture(-1.0, 4.0); // its field shows as white
-    let (flat, v7, v9) = (
-        raw_centre(&bright, &whites(Process::V9, 0.0)),
-        raw_centre(&bright, &whites(Process::V7, 100.0)),
-        raw_centre(&bright, &whites(Process::V9, 100.0)),
-    );
-    assert!(v9 > flat && v9 - flat < v7 - flat, "a bright raw: V9 lifts {flat} to {v9}, less than V7's {v7}");
-    // Whites down keeps the tone map's response: V8's, which V9 is built on (its roll-off), not V7's
-    assert_eq!(raw_centre(&bright, &whites(Process::V9, -100.0)), raw_centre(&bright, &whites(Process::V8, -100.0)));
+    let ((flat, v9), (flat7, v7)) = (lift(&bright, Process::V9), lift(&bright, Process::V7));
+    assert!(v9 > flat && v9 - flat < v7 - flat7, "a bright raw: V9 lifts {flat} to {v9}, less than V7's {flat7} to {v7}");
+    // Whites down is the tone map's own response (for a raw without a camera tone, on Lightroom Classic's base tone):
+    // it darkens the field
+    let down = raw_centre(&bright, &whites(Process::V9, -100.0));
+    assert!(down < flat - 8.0, "a bright raw: V9 Whites -100 takes {flat} to {down}");
 }
 
 /// A raw's sky: a saturated blue patch just below the sensor's white (scene-linear, Rec.2020) in a darker field.
