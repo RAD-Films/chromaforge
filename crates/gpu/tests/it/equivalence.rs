@@ -65,6 +65,32 @@ fn camera_tone_and_relative_wb() {
     check("camera chroma curve edited", &src, &info, &s, &RenderRequest::fit(320, 240));
 }
 
+/// Process V9 tones a raw under a profile without a tone curve with Lightroom Classic's base curve on each linear
+/// ProPhoto channel (`FinishParams::tone_per_channel`): the kernel must follow it.
+#[test]
+fn v9_lrc_base_tone_per_channel() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(2, 320, 240);
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap()
+    .under_default_curve();
+    let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+    let mut s = DevelopSettings::default();
+    assert_eq!(s.process.process(), Process::V9);
+    check("V9 base tone per channel", &src, &info, &s, &RenderRequest::fit(320, 240));
+    for (ev, contrast) in [(-1.0, 0.0), (-3.0, 25.0), (1.5, -20.0)] {
+        s.light.exposure = ev;
+        s.light.contrast = contrast;
+        s.color.saturation = 30.0;
+        check(&format!("V9 base tone per channel, exposure {ev}, contrast {contrast}"), &src, &info, &s, &RenderRequest::fit(320, 240));
+    }
+}
+
 fn scene(i: usize, w: usize, h: usize) -> Arc<Rgb32f> {
     Arc::new(lcc_scenes::demo_library()[i].render(w, h))
 }

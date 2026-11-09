@@ -973,16 +973,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = calibrate(c);
     }
 
-    // --- tone map on luminance, highlight desaturation
-    let yl = lum2020(c);
-    let o = tone_apply(yl);
+    // --- tone map on luminance (or per ProPhoto channel, `FinishParams::tone_per_channel`), highlight desaturation
+    var o = 0.0;
     var d = vec3<f32>(0.0);
-    if (yl > 1e-9) {
-        d = c * o / yl;
-    }
-    let k = chroma_scale(o);
-    if (k != 1.0) {
-        d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+    if (pu(F_TONE_PC) != 0u) {
+        let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
+        d = mul3(mat_at(F_TONE_PC_FROM), vec3<f32>(tone_apply(q.x), tone_apply(q.y), tone_apply(q.z)));
+        o = lum2020(d);
+    } else {
+        let yl = lum2020(c);
+        o = tone_apply(yl);
+        if (yl > 1e-9) {
+            d = c * o / yl;
+        }
+        let k = chroma_scale(o);
+        if (k != 1.0) {
+            d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+        }
     }
     let peak = pf(F_PEAK);
     let hdr = peak > 1.0;

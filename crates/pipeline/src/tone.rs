@@ -236,6 +236,53 @@ pub fn lrc_contrast(p: f32, c: f32) -> f32 {
     p + c * A * (p - PIVOT) * (1.0 - (2.0 * p - 1.0).abs()).max(0.0)
 }
 
+/// Lightroom Classic's base tone for a raw under a profile without a tone curve (process V9): display luminance
+/// (linear, SDR white = 1) at scene luminance `2^(LRC_BASE_FROM + i·LRC_BASE_STEP)`. Our own measurement (8 Nov
+/// 2026): LrC 15.5 zero-slider exports of 50 Canon R5 C frames (our own window scenes in ±3 EV brackets, under the
+/// photographer's matrix-only camera profile) against the same frames' scene luminance from our renderer, matched
+/// quantile for quantile per frame and pooled per 1/8 EV (median). On 13 held-out frames it is within 1.5 L* of
+/// LrC in every tone band (the camera-JPEG tone with [`LRC_LOOK`] it replaces was 2.6 L* off at L* 70–85). LrC
+/// applies it to each channel in linear ProPhoto ([`FinishParams::tone_per_channel`](crate::finish::FinishParams)).
+/// Measured up to 0.06 EV below the scene's clip; [`lrc_base`] closes on white above its last entry.
+const LRC_BASE: [f32; 112] = [
+    0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000005,
+    0.000038, 0.000065, 0.000065, 0.000075, 0.000086, 0.000119, 0.000151, 0.000151, 0.000151, 0.000183, 0.000260, 0.000304, 0.000315, 0.000346,
+    0.000379, 0.000465, 0.000574, 0.000618, 0.000650, 0.000714, 0.000822, 0.000899, 0.000954, 0.001063, 0.001182, 0.001321, 0.001473, 0.001640,
+    0.001819, 0.002011, 0.002246, 0.002484, 0.002721, 0.002984, 0.003276, 0.003588, 0.003917, 0.004278, 0.004691, 0.005183, 0.005748, 0.006387,
+    0.007122, 0.007957, 0.008920, 0.010064, 0.011355, 0.012842, 0.014598, 0.016613, 0.018948, 0.021551, 0.024536, 0.027993, 0.031921, 0.036490,
+    0.041682, 0.047515, 0.053942, 0.061077, 0.069218, 0.078629, 0.089038, 0.100332, 0.113370, 0.128198, 0.144567, 0.162622, 0.182975, 0.205814,
+    0.230815, 0.257556, 0.285884, 0.315857, 0.347035, 0.380088, 0.414811, 0.450592, 0.485610, 0.518591, 0.551585, 0.585155, 0.618057, 0.649854,
+    0.680819, 0.709953, 0.737495, 0.763935, 0.788249, 0.811006, 0.832872, 0.853652, 0.873180, 0.891077, 0.907238, 0.920102, 0.931384, 0.942408,
+];
+const LRC_BASE_FROM: f32 = -14.0;
+const LRC_BASE_STEP: f32 = 0.125;
+/// Rate (per EV, natural log) at which [`lrc_base`] closes on white above [`LRC_BASE`]'s last entry: the table's
+/// slope over its last half stop, so the curve stays smooth there.
+const LRC_BASE_SHOULDER: f32 = 1.78;
+
+/// Scene luminance `y` through [`LRC_BASE`]: monotone, 0 for black (and NaN or negative), approaching 1 above the
+/// measured range, 1 for +∞.
+pub fn lrc_base(y: f32) -> f32 {
+    if y == f32::INFINITY {
+        return 1.0;
+    }
+    if !(y.is_finite() && y > 0.0) {
+        return 0.0;
+    }
+    let x = y.log2();
+    let f = ((x - LRC_BASE_FROM) / LRC_BASE_STEP).max(0.0);
+    let last = LRC_BASE.len() - 1;
+    if f >= last as f32 {
+        let top = LRC_BASE.last().copied().unwrap_or(1.0);
+        let over = x - (LRC_BASE_FROM + last as f32 * LRC_BASE_STEP);
+        return 1.0 - (1.0 - top) * (-LRC_BASE_SHOULDER * over).exp();
+    }
+    let i = (f as usize).min(last - 1);
+    let t = (f - i as f32).min(1.0);
+    let (a, b) = (LRC_BASE.get(i).copied().unwrap_or(0.0), LRC_BASE.get(i + 1).copied().unwrap_or(0.0));
+    a + (b - a) * t
+}
+
 /// Display luminance `y` with [`LRC_LOOK`]: monotone, 0 stays 0 and 1 stays 1 (and above it, unchanged).
 pub fn lrc_look(y: f32) -> f32 {
     if !(y.is_finite() && y > 0.0) {
@@ -309,13 +356,13 @@ impl ToneMap {
         ToneMap::camera_with(|y| curve.apply_rolloff(y), curve.chroma, contrast, whites, blacks, peak)
     }
 
-    /// [`ToneMap::camera_rolloff_hdr`] for process V9: a camera JPEG's tone kept under a profile without a tone curve
-    /// ([`CameraTone::has_default_curve`]) in Lightroom Classic's default look ([`lrc_look`]), over V8's roll-off; any
-    /// other curve as V8 draws it.
+    /// [`ToneMap::camera_rolloff_hdr`] for process V9: under a profile without a tone curve
+    /// ([`CameraTone::has_default_curve`]), Lightroom Classic's base tone ([`lrc_base`]) in place of the camera JPEG's;
+    /// any other curve as V8 draws it.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
         let adjustment = ToneMap::display_shaped(contrast, whites, blacks, 1.0, true);
         if curve.has_default_curve() {
-            ToneMap::camera_adjusted(|y| lrc_look(curve.apply_rolloff(y)), curve.chroma, adjustment, contrast, whites, blacks, peak)
+            ToneMap::camera_adjusted(lrc_base, NO_CHROMA, adjustment, contrast, whites, blacks, peak)
         } else {
             ToneMap::camera_adjusted(|y| curve.apply_rolloff(y), curve.chroma, adjustment, contrast, whites, blacks, peak)
         }
@@ -726,7 +773,8 @@ mod tests {
             assert!(v >= previous && v <= 1.0, "{i}: {v} after {previous}");
             previous = v;
         }
-        // process 9's tone map has it; earlier processes don't
+        // process 9 draws a raw under a profile without a tone curve with Lightroom's base tone, whatever the camera
+        // JPEG's; earlier processes keep the camera's
         let knots = std::array::from_fn(|i| {
             let x = 0.002 * 1.25f32.powi(i as i32);
             [x, 1.0 - (-2.0 * x).exp()]
@@ -734,8 +782,17 @@ mod tests {
         let plain = CameraTone::new(knots).unwrap();
         let curve = plain.under_default_curve();
         let (v7, v9) = (ToneMap::camera(&curve, 0.0, 0.0, 0.0), ToneMap::camera_lrc(&curve, 0.0, 0.0, 0.0, 1.0));
-        assert!((v9.apply(0.1) - lrc_look(v7.apply(0.1))).abs() < 1e-4);
-        assert!(v9.apply(0.1) > v7.apply(0.1) * 1.1);
+        for y in [0.002f32, 0.02, 0.1, 0.18, 0.5, 0.9] {
+            assert!((v9.apply(y) - lrc_base(y)).abs() < 2e-3, "{y}: {} vs {}", v9.apply(y), lrc_base(y));
+        }
+        assert!((v9.apply(0.1) - v7.apply(0.1)).abs() > 0.02, "not the camera's tone");
+        let other = CameraTone::new(std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-4.0 * x).exp()]
+        }))
+        .unwrap()
+        .under_default_curve();
+        assert!((ToneMap::camera_lrc(&other, 0.0, 0.0, 0.0, 1.0).apply(0.1) - v9.apply(0.1)).abs() < 1e-6);
         // any other curve (a profile's own, a look fitted to the camera JPEG alone) gets no look
         assert!(curve.has_default_curve() && !plain.has_default_curve());
         assert!((ToneMap::camera_lrc(&plain, 0.0, 0.0, 0.0, 1.0).apply(0.1) - v7.apply(0.1)).abs() < 1e-4);
@@ -1102,6 +1159,33 @@ mod tests {
             let (v9_gain, v8_gain) = (both.apply(y) / flat.apply(y), v8.apply(y) / v8_flat);
             assert!(v9_gain < v8_gain - 0.02, "V9 darkens the deep tones more: {v9_gain} vs V8 {v8_gain}");
         }
+    }
+
+    /// Lightroom Classic's base tone as measured (8 Nov 2026, LrC zero-slider exports of our own R5 C frames): black at
+    /// black, grey near L* 75, rising everywhere, and closing on white smoothly above the measured range.
+    #[test]
+    fn lrc_base_is_lightrooms_measured_base_tone() {
+        let lstar = |y: f32| if y > 0.008856 { 116.0 * y.cbrt() - 16.0 } else { 903.3 * y };
+        for y in [0.0, -1.0, f32::NAN, f32::NEG_INFINITY] {
+            assert_eq!(lrc_base(y), 0.0);
+        }
+        assert_eq!(lrc_base(f32::INFINITY), 1.0);
+        // measured points (log2 scene luminance → LrC display luminance)
+        for (ev, want) in [(-7.86f32, 0.00363), (-5.04, 0.0521), (-3.34, 0.265), (-2.21, 0.562), (-1.08, 0.8186), (-0.52, 0.905)] {
+            let got = lrc_base(ev.exp2());
+            assert!((lstar(got) - lstar(want)).abs() < 0.5, "{ev} EV: {got} vs {want}");
+        }
+        let mut previous = 0.0;
+        for i in 0..6000 {
+            let v = lrc_base(2f32.powf(-16.0 + 20.0 * i as f32 / 5999.0));
+            assert!(v.is_finite() && v >= previous && v < 1.0, "{i}: {v} after {previous}");
+            previous = v;
+        }
+        // the shoulder: no step where the table ends, white within about a stop above it
+        let end = LRC_BASE_FROM + (LRC_BASE.len() - 1) as f32 * LRC_BASE_STEP;
+        let (below, at, above) = (lrc_base((end - 0.01).exp2()), lrc_base(end.exp2()), lrc_base((end + 0.01).exp2()));
+        assert!((above - at).abs() < 2e-3 && (at - below).abs() < 2e-3, "{below} {at} {above}");
+        assert!(lrc_base((end + 1.5).exp2()) > 0.99);
     }
 
     /// Hostile sliders still make a finite, rising table.
