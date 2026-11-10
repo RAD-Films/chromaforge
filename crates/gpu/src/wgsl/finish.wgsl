@@ -1241,6 +1241,7 @@ const HUE_FADE_EV: f32 = 0.5;
 
 // `finish::TOP_SHOULDER`
 const TOP_SHOULDER: vec4<f32> = vec4<f32>(0.7, 1.5, 0.6, 1.0);
+const TOP_SHOULDER_SCENE: vec2<f32> = vec2<f32>(0.9, 1.4);
 
 // `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V9)
 fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
@@ -1248,7 +1249,8 @@ fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
     if (!(peak > 0.0)) {
         return d;
     }
-    let b = sstep(TOP_SHOULDER.x * peak, TOP_SHOULDER.y * peak, hi) * sstep(TOP_SHOULDER.z * peak, TOP_SHOULDER.w * peak, o);
+    let b = sstep(TOP_SHOULDER.x * peak, TOP_SHOULDER.y * peak, hi) * sstep(TOP_SHOULDER.z * peak, TOP_SHOULDER.w * peak, o)
+        * sstep(TOP_SHOULDER_SCENE.x, TOP_SHOULDER_SCENE.y, max(c.x, max(c.y, c.z)));
     if (!(b > 0.0)) {
         return d;
     }

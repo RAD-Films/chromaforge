@@ -1124,11 +1124,13 @@ pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
     if t < 1.0 { (r.map(|c| yy + (c - yy) * t), t) } else { (r, 1.0) }
 }
 
-/// Where [`top_shoulder`] acts (relative to the peak): from nothing to full as the brightest
-/// channel after the tone map goes from the first to the second, and as the colour's luminance
-/// goes from the third to the fourth. Fitted to Lightroom Classic exports of the user's own charts
+/// Where [`top_shoulder`] acts: from nothing to full as the brightest channel after the tone map
+/// goes from the first to the second (relative to the peak), as the colour's luminance goes from
+/// the third to the fourth (relative to the peak), and as the scene colour's brightest channel goes
+/// from the fifth to the sixth. The scene gate keeps it off colours that are bright after the tone
+/// map but well below the sensor's white (where Lightroom Classic adds no chroma). Fitted to Lightroom Classic exports of the user's own charts
 /// (1,704 patches, chroma by brightness; lightness held within about 0.5 L*). Mirrored in `finish.wgsl`.
-pub const TOP_SHOULDER: [f32; 4] = [0.7, 1.5, 0.6, 1.0];
+pub const TOP_SHOULDER: [f32; 6] = [0.7, 1.5, 0.6, 1.0, 0.9, 1.4];
 
 /// Process V9's bright colours: `d` (scene colour `c` tone mapped on its luminance `o`, ratios kept)
 /// moved toward `c` tone mapped per channel, as far as [`TOP_SHOULDER`] says. Per channel, the
@@ -1142,8 +1144,8 @@ pub fn top_shoulder(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f
     if !peak.is_finite() || peak <= 0.0 || !hi.is_finite() || !o.is_finite() {
         return d;
     }
-    let [k0, k1, o0, o1] = TOP_SHOULDER;
-    let b = smooth(k0 * peak, k1 * peak, hi) * smooth(o0 * peak, o1 * peak, o);
+    let [k0, k1, o0, o1, s0, s1] = TOP_SHOULDER;
+    let b = smooth(k0 * peak, k1 * peak, hi) * smooth(o0 * peak, o1 * peak, o) * smooth(s0, s1, c[0].max(c[1]).max(c[2]));
     if b <= 0.0 {
         return d;
     }
@@ -1336,6 +1338,8 @@ mod tests {
         let got = top_shoulder(d, c, 0.95, 1.0, tone);
         assert!((0..3).all(|i| (got[i] - d[i]) * (pc[i] - d[i]) >= 0.0 && (got[i] - d[i]).abs() <= (pc[i] - d[i]).abs() + 1e-6), "{got:?}");
         assert_ne!(got, d);
+        // bright after the tone map but well below the sensor's white in the scene: untouched
+        assert_eq!(top_shoulder(d, [0.8, 0.5, 0.1], 0.95, 1.0, tone), d);
         // NaN, infinities and a zero peak give the colour back
         for (d, o, peak) in
             [([f32::NAN, 0.5, 0.1], 0.9, 1.0), ([f32::INFINITY, 0.5, 0.1], 0.9, 1.0), ([1.4, 0.9, 0.2], f32::NAN, 1.0), ([1.4, 0.9, 0.2], 0.9, 0.0)]
