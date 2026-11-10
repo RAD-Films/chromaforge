@@ -169,9 +169,10 @@ fn pop_scopes(scopes: [wgpu::ErrorScopeGuard; 2]) -> Option<String> {
 /// device takes pipeline creation from any thread, so the entry points are shared out to worker
 /// threads. This thread works too: every kernel is built even when no thread can be started.
 ///
-/// Each module prepared and each kernel built is [`Progress`]: a first start compiles every kernel
-/// (30 s on an RTX 4070 SUPER under DX12), longer than the start-up limit, and goes on as long as
-/// kernels keep coming.
+/// Each module prepared and each kernel built is [`Progress`], and once every module is in, the
+/// compile is [`Progress::compiling`]: under DX12 every start compiles every kernel with FXC (no
+/// cache; 35–64 s on an RTX 4070 SUPER and an RTX 5070 with builds running, nearly all of it
+/// `finish.wgsl`'s `main`), longer than the start-up limit.
 fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>, String> {
     let progress = Progress::current();
     let scopes = push_scopes(device);
@@ -196,6 +197,8 @@ fn build_kernels(device: &wgpu::Device) -> Result<HashMap<&'static str, Kernel>,
     if let Some(e) = pop_scopes(scopes) {
         return Err(e);
     }
+    // the driver made the device and took every module: from here it is compiling (`init.rs`)
+    progress.compiling();
     let jobs: Vec<(&Prepared, &'static str)> = MODULES.iter().zip(&prepared).flat_map(|(m, p)| m.entries.iter().map(move |e| (p, *e))).collect();
     let next = AtomicUsize::new(0);
     let built = std::sync::Mutex::new(HashMap::with_capacity(jobs.len()));
