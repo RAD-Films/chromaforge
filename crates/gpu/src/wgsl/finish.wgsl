@@ -63,9 +63,9 @@ fn lift_at(ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V9's extra Highlights pull at pixel (x, y) (`hl_edge::EdgePull::at`).
-fn edge_at(x: u32, y: u32) -> f32 {
-    let o = pu(F_EDGE_OFF);
+// A plane on the V9 Highlights grid (EDGE_W × EDGE_H at `o` in aux) at pixel (x, y), bilinearly
+// (`hl_edge::EdgePull::sample`).
+fn edge_sample(o: u32, x: u32, y: u32) -> f32 {
     let pw = pu(F_EDGE_W);
     let ph = pu(F_EDGE_H);
     if (pw == 0u || ph == 0u) {
@@ -87,7 +87,31 @@ fn edge_at(x: u32, y: u32) -> f32 {
     let ty = fy - f32(y0);
     let top = aux[o + y0 * pw + x0] + (aux[o + y0 * pw + x1] - aux[o + y0 * pw + x0]) * tx;
     let bottom = aux[o + y1 * pw + x0] + (aux[o + y1 * pw + x1] - aux[o + y1 * pw + x0]) * tx;
-    let v = pf(F_EDGE_GAIN) * (top + (bottom - top) * ty);
+    let v = top + (bottom - top) * ty;
+    return select(0.0, v, v == v);
+}
+
+// The picture's Highlights pull table (LIFT grid, at `o` in aux) at tone `ev` (`tone_lift::Lift::at`).
+fn table_at(o: u32, ev: f32) -> f32 {
+    let n = pu(F_LIFT_N);
+    var f = clamp((ev - pf(F_LIFT_LO)) / pf(F_LIFT_STEP), 0.0, f32(n - 1u));
+    if (!(f == f)) {
+        f = 0.0;
+    }
+    let i = min(u32(f), n - 2u);
+    let t = f - f32(i);
+    return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
+// Process V9's local Highlights pull at pixel (x, y) with base tone `base` (`hl_edge::EdgePull::at`).
+fn edge_at(x: u32, y: u32, base: f32) -> f32 {
+    var v = pf(F_EDGE_GAIN) * edge_sample(pu(F_EDGE_OFF), x, y);
+    if (pu(F_EDGE_WIDE_OFF) != 0u) {
+        let w = edge_sample(pu(F_EDGE_WIDE_OFF), x, y);
+        let o = pu(F_EDGE_TABLE_OFF);
+        let own = table_at(o, base);
+        v += pf(F_EDGE_GAIN) * (table_at(o, base + pf(F_EDGE_MIX) * (w - base)) - own + pf(F_EDGE_LEVEL) * own);
+    }
     return select(0.0, v, v == v);
 }
 
@@ -864,7 +888,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pu(F_LIFT) != 0u) {
         delta += lift_at(base);
         if (pu(F_EDGE_PULL) != 0u) {
-            delta += edge_at(x, y);
+            delta += edge_at(x, y, base);
         }
         hh = lt[4];
         ss = lt[5];
