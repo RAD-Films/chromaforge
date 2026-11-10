@@ -82,6 +82,16 @@ const AGREE: (f32, f32) = (0.15, 0.4);
 /// shows it.
 const PALE: (f32, f32) = (0.2, 0.4);
 
+/// With [`Rebuild::rim_hue`], how much of its colour a pixel with two channels clipped gives up for neutral at its
+/// level: `.0` when cool (blue over red), `.1` when warm. Rebuilt in their rim's colour alone, white cloud cores beside
+/// a blue sky took the sky's blue at twice the chroma Lightroom Classic shows (b* −22 against −10 at Highlights −100),
+/// and a lit bench its wood's yellow at 1.5 times (66 against 43). A small coloured object keeping its own colour
+/// ([`OWN_HUE`]) keeps it.
+const TWO_CLIPPED_FADE: (f32, f32) = (0.5, 0.25);
+/// The fade sets in as a pixel's second channel rises from this share of its clip to the clip, so nothing jumps where
+/// it clips and pixels with one channel clipped keep their colour.
+const SECOND_CLIP_LO: f32 = 0.95;
+
 /// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
 /// `OWN_HUE.0` to `OWN_HUE.1` stops (a small coloured object inside a pale clipped area, such as orange roof caps
 /// against a pale sky) keeps up to [`OWN_HUE_MAX`] of its own colour, its clipped channels at their clip. Taking the
@@ -546,9 +556,11 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             };
             let local = (trust > 0.0).then(|| rebuild(p, q, cl, borrowed, clip, max_level)).flatten().map(past_rim);
             // a small coloured object in a pale clipped area keeps part of its own colour ([`OWN_HUE`])
+            let mut own = 0.0f32;
             let local = match (local, rim_colour) {
                 (Some(a), Some(rc)) => {
                     let o = OWN_HUE_MAX * smoothstep(OWN_HUE.0, OWN_HUE.1, contradiction(p, q, cl, rc, clip));
+                    own = o / OWN_HUE_MAX;
                     Some(std::array::from_fn(|c| a[c] + (q[c] - a[c]) * o))
                 }
                 (l, _) => l,
@@ -582,6 +594,18 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
                 let v = level + (full - level) * t_level;
                 out = std::array::from_fn(|c| out[c] + (white[c] * v - out[c]) * t_colour);
+            }
+            // a pixel with two channels clipped keeps only part of its rim's colour ([`TWO_CLIPPED_FADE`]), fading in as
+            // its second channel nears its clip so that nothing jumps where it clips
+            if rim_hue {
+                let mut b = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(SECOND_CLIP_LO, 1.0, p[c] / clip) });
+                b.sort_by(|x, y| y.total_cmp(x));
+                let u = [out[0] / white[0], out[1] / white[1], out[2] / white[2]];
+                let warm = smoothstep(0.0, 0.2, (u[0] - u[2]) / (u[0] + u[2]).max(1e-9));
+                let fade = TWO_CLIPPED_FADE.0 + (TWO_CLIPPED_FADE.1 - TWO_CLIPPED_FADE.0) * warm;
+                let k = fade * b[1] * (1.0 - own);
+                let level = (out[0] + out[1] + out[2]) / total;
+                out = std::array::from_fn(|c| out[c] + (white[c] * level - out[c]) * k);
             }
             *px = [out[0] / wb[0], out[1] / wb[1], out[2] / wb[2]];
         }
