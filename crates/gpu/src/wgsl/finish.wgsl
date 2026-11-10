@@ -969,19 +969,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hdr = peak > 1.0;
     let deep = pu(F_DEEP) != 0u;
     if (pu(F_TOP_SHOULDER) != 0u) {
-        d = top_shoulder(d, c, o, peak);
-        o = lum2020(d);
-    }
-    let mx = max(d.x, max(d.y, d.z));
-    if (mx > peak) {
-        let t = clamp((mx - peak) / max(mx - o, 1e-6), 0.0, 1.0);
-        let grey = d + (o - d) * t;
-        if (pu(F_HUE_CLIP) != 0u) {
-            let kept = hue_clip(d, peak);
-            d = kept + (grey - kept) * hue_fade(o, mx, peak);
-        } else {
-            d = grey;
-        }
+        let moved = top_shoulder(d, c, o, peak);
+        d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
+    } else {
+        d = over_range(d, o, peak);
     }
 
     // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
@@ -1256,6 +1247,36 @@ fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
     }
     let pc = vec3<f32>(tone_apply(max(c.x, 0.0)), tone_apply(max(c.y, 0.0)), tone_apply(max(c.z, 0.0)));
     return d + (pc - d) * b;
+}
+
+// `finish::TOP_SHOULDER_HOLD`
+const TOP_SHOULDER_HOLD: vec3<f32> = vec3<f32>(0.12, 0.9, 1.8);
+
+// `finish::hold_lightness`
+fn hold_lightness(before: vec3<f32>, after: vec3<f32>, scene_top: f32) -> vec3<f32> {
+    let kept = lum2020(before);
+    let got = lum2020(after);
+    let floor_y = kept * (1.0 - TOP_SHOULDER_HOLD.x * sstep(TOP_SHOULDER_HOLD.y, TOP_SHOULDER_HOLD.z, scene_top));
+    if (!(got < floor_y)) {
+        return after;
+    }
+    let a = clamp((floor_y - got) / max(kept - got, 1e-6), 0.0, 1.0);
+    return after + (before - after) * a;
+}
+
+// `finish::over_range`
+fn over_range(d: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
+    let mx = max(d.x, max(d.y, d.z));
+    if (!(mx > peak)) {
+        return d;
+    }
+    let t = clamp((mx - peak) / max(mx - o, 1e-6), 0.0, 1.0);
+    let grey = d + (o - d) * t;
+    if (pu(F_HUE_CLIP) != 0u) {
+        let kept = hue_clip(d, peak);
+        return kept + (grey - kept) * hue_fade(o, mx, peak);
+    }
+    return grey;
 }
 
 // `finish::hue_fade`

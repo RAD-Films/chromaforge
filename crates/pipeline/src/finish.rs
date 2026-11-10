@@ -871,18 +871,13 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if k != 1.0 {
                 d = d.map(|v| o + (v - o) * k);
             }
-            let o = if fp.top_shoulder {
-                d = top_shoulder(d, c, o, peak, |v| tone.apply(v));
-                luminance_2020(d)
+            d = if fp.top_shoulder {
+                let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
+                let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
+                hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
             } else {
-                o
+                over_range(d, o, peak, fp.hue_clip)
             };
-            let mx = d[0].max(d[1]).max(d[2]);
-            if mx > peak {
-                let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
-                let grey = d.map(|v| v + (o - v) * t);
-                d = if fp.hue_clip { keep_hue(d, grey, o, peak) } else { grey };
-            }
 
             // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
             if let Some(p) = &ops.primaries {
@@ -1153,6 +1148,40 @@ pub fn top_shoulder(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f
     [d[0] + (pc[0] - d[0]) * b, d[1] + (pc[1] - d[1]) * b, d[2] + (pc[2] - d[2]) * b]
 }
 
+/// How much of a colour's luminance [`top_shoulder`] may take, against the render without it: nothing at the
+/// scene's brightest channel `[1]`, the share `[0]` from `[2]`. Slow enough that the render's own rise along an
+/// exposure ramp covers it, so lightness can't fall as the input rises. Fitted on a saturated red's ramp against
+/// Lightroom Classic exports (L* at the top of the ramp 90.2, against 90.0). Mirrored in `finish.wgsl`.
+pub const TOP_SHOULDER_HOLD: [f32; 3] = [0.12, 0.9, 1.8];
+
+/// `after` (a colour through [`top_shoulder`] and the over-range step) with the lightness it may not lose back from
+/// `before` (the same colour without the shoulder): per channel a saturated colour is darker than on luminance, and
+/// where the shoulder came in over a short stretch of an exposure ramp the brighter side rendered darker.
+#[inline]
+pub fn hold_lightness(before: [f32; 3], after: [f32; 3], scene_top: f32) -> [f32; 3] {
+    let [share, s0, s1] = TOP_SHOULDER_HOLD;
+    let (kept, got) = (luminance_2020(before), luminance_2020(after));
+    let floor = kept * (1.0 - share * smooth(s0, s1, scene_top));
+    let below = got < floor && floor.is_finite();
+    if !below {
+        return after;
+    }
+    let a = ((floor - got) / (kept - got).max(1e-6)).clamp(0.0, 1.0);
+    [after[0] + (before[0] - after[0]) * a, after[1] + (before[1] - after[1]) * a, after[2] + (before[2] - after[2]) * a]
+}
+
+/// A colour's channels brought to `peak` at most, toward its luminance `o`.
+#[inline]
+fn over_range(d: [f32; 3], o: f32, peak: f32, hue_clip: bool) -> [f32; 3] {
+    let mx = d[0].max(d[1]).max(d[2]);
+    if mx <= peak {
+        return d;
+    }
+    let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+    let grey = d.map(|v| v + (o - v) * t);
+    if hue_clip { keep_hue(d, grey, o, peak) } else { grey }
+}
+
 /// Luminance (relative to the peak) from which an over-range colour fades from keeping its hue
 /// ([`hue_clip`]) to moving toward its luminance as before V5, reached at the peak: a colour that is
 /// nearly white overall (a blown sky) still goes white, as a camera's per-channel curve takes it.
@@ -1323,6 +1352,23 @@ mod tests {
         assert_eq!(encode_srgb(lut, -1.0), 0.0);
         assert!((encode_srgb(lut, 2.0) - 1.0).abs() < 1e-6);
     }
+    #[test]
+    fn hold_lightness_gives_back_only_what_the_shoulder_may_not_take() {
+        let before = [1.0, 0.8, 0.8];
+        let dark = [1.0, 0.2, 0.1];
+        // below the scene gate nothing may go, and from its top the share may
+        let lum = luminance_2020;
+        assert!((lum(hold_lightness(before, dark, 0.5)) - lum(before)).abs() < 1e-5);
+        let held = hold_lightness(before, dark, 3.0);
+        assert!((lum(held) - lum(before) * (1.0 - TOP_SHOULDER_HOLD[0])).abs() < 1e-5, "{held:?}");
+        // a colour that kept its lightness is left as the shoulder made it
+        let close = [1.0, 0.75, 0.82];
+        assert_eq!(hold_lightness(before, close, 3.0), close);
+        // bad input does not spread
+        assert_eq!(hold_lightness([f32::NAN; 3], dark, 3.0), dark);
+        assert!(hold_lightness(before, dark, f32::NAN).iter().all(|v| v.is_finite()));
+    }
+
     #[test]
     fn top_shoulder_moves_only_bright_colours_and_survives_bad_input() {
         let tone = |v: f32| v / (1.0 + v) * 2.0;

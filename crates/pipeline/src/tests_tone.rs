@@ -231,3 +231,26 @@ fn bright_colours_keep_their_saturation_near_white() {
         assert_eq!(shot(Process::V8, true, c), shot(Process::V9, true, c), "{c:?}");
     }
 }
+
+/// Along an exposure ramp a saturated colour never renders darker as it gets brighter: where V9's curve per channel
+/// came in, the brighter side was darker, a light rim around red and magenta highlights.
+#[test]
+fn a_saturated_ramp_never_gets_darker_as_it_gets_brighter() {
+    let lin = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    for tint in [[1.0, 0.125, 0.015], [1.0, 0.3, 0.75], [1.0, 0.6, 0.05]] {
+        let mut last = 0.0f32;
+        for i in 0..80 {
+            let x = 0.4 + i as f32 * 0.03;
+            let c = tint.map(|t| t * x);
+            let src = Rgb32f::from_fn(4, 4, |_, _| c);
+            let info = SourceInfo { raw: true, ..SourceInfo::default() };
+            let p = render(&src, &info, &on(Process::V9), &RenderRequest::fit(4, 4)).image.data[5];
+            let y = 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+            assert!(y >= last - 0.006, "{tint:?} at {x}: luminance {y} after {last}");
+            last = last.max(y);
+        }
+    }
+}

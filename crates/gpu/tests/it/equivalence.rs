@@ -1755,6 +1755,11 @@ fn overrange_colours_match_on_every_process() {
         s.color.saturation = 40.0;
         check(&format!("{p:?} pushed past white"), &src, &raw, &s, &req);
     }
+    // a saturated ramp through the shoulder and the lightness it may not take
+    let ramp = Arc::new(Rgb32f::from_fn(640, 64, |x, _| [1.0, 0.125, 0.015].map(|t| t * (0.3 + x as f32 / 640.0 * 3.0))));
+    for p in [Process::V8, Process::V9] {
+        check(&format!("{p:?} saturated ramp"), &ramp, &raw, &DevelopSettings { process: p.version(), ..DevelopSettings::default() }, &req);
+    }
 }
 
 /// The loupe's display fit done on the device (`try_render_fitted`) gives the pixels the CPU's
