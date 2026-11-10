@@ -395,6 +395,9 @@ pub struct FinishParams {
     pub hue_clip: bool,
     /// 8-bit output is dithered with [`bayer_dither_offset`] (process V8) instead of rounded.
     pub dither: bool,
+    /// Bright colours take the tone curve per channel ([`top_shoulder`], process V9), so they keep
+    /// their saturation near white instead of fading to it.
+    pub top_shoulder: bool,
     pub sharpen: f32,
     pub sharpen_mask: f32,
     /// Soft-clip limit (stops) of the sharpening detail term: small damps halos (Detail 0), large keeps all (100).
@@ -476,8 +479,11 @@ impl FinishParams {
         });
         let calibration = s.section_enabled("calibration");
         let peak = s.hdr.peak();
+        let per_channel = tone_per_channel(s, info, peak);
         FinishParams {
-            tone_per_channel: tone_per_channel(s, info, peak),
+            // a render toned per channel already has the shoulder this step adds
+            top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info),
+            tone_per_channel: per_channel,
             peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
@@ -623,7 +629,7 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool
         }
         // a raw's tone curve rolls off into white in stops: a camera curve past its last knot, the
         // generic curve from half a stop below its white point instead of clipping (upstream #3783)
-        Process::V8 => match info.camera_tone.as_ref().filter(|_| raw) {
+        Process::V8 | Process::V9 => match info.camera_tone.as_ref().filter(|_| raw) {
             Some(curve) => ToneMap::camera_rolloff_hdr(curve, l.contrast, l.whites, l.blacks, peak),
             None if raw => ToneMap::rolloff_hdr(l.contrast, l.whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
@@ -1036,12 +1042,13 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     (o, d)
                 }
             };
-            let mx = d[0].max(d[1]).max(d[2]);
-            if mx > peak {
-                let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
-                let grey = d.map(|v| v + (o - v) * t);
-                d = if fp.hue_clip { keep_hue(d, grey, o, peak) } else { grey };
-            }
+            d = if fp.top_shoulder {
+                let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
+                let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
+                hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
+            } else {
+                over_range(d, o, peak, fp.hue_clip)
+            };
 
             // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
             if let Some(p) = &ops.primaries {
@@ -1345,6 +1352,68 @@ pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
     if t < 1.0 { (r.map(|c| yy + (c - yy) * t), t) } else { (r, 1.0) }
 }
 
+/// Where [`top_shoulder`] acts: from nothing to full as the brightest channel after the tone map
+/// goes from the first to the second (relative to the peak), as the colour's luminance goes from
+/// the third to the fourth (relative to the peak), and as its brightest scene channel goes from
+/// the fifth to the sixth, which keeps it off colours well below the sensor's white. Fitted to Lightroom Classic exports of the user's own charts
+/// (1,704 patches, chroma by brightness; lightness held within about 0.5 L*). Mirrored in `finish.wgsl`.
+pub const TOP_SHOULDER: [f32; 6] = [0.7, 1.5, 0.6, 1.0, 0.9, 1.4];
+
+/// Process V9's bright colours: `d` (scene colour `c` tone mapped on its luminance `o`, ratios kept)
+/// moved toward `c` tone mapped per channel, as far as [`TOP_SHOULDER`] says. Per channel, the
+/// curve's shoulder compresses the brightest channel more than the others, so a bright colour
+/// keeps its saturation at about its brightness; on luminance alone its brightest channel went
+/// over white and the over-range step faded it to white (yellows and reds near white lost two
+/// thirds of their chroma against Lightroom Classic's). Greys and darker colours are unchanged.
+#[inline]
+pub fn top_shoulder(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f32) -> f32) -> [f32; 3] {
+    let hi = d[0].max(d[1]).max(d[2]);
+    if !peak.is_finite() || peak <= 0.0 || !hi.is_finite() || !o.is_finite() {
+        return d;
+    }
+    let [k0, k1, o0, o1, s0, s1] = TOP_SHOULDER;
+    let b = smooth(k0 * peak, k1 * peak, hi) * smooth(o0 * peak, o1 * peak, o) * smooth(s0, s1, c[0].max(c[1]).max(c[2]));
+    if b <= 0.0 {
+        return d;
+    }
+    let pc = c.map(|v| tone(v.max(0.0)));
+    [d[0] + (pc[0] - d[0]) * b, d[1] + (pc[1] - d[1]) * b, d[2] + (pc[2] - d[2]) * b]
+}
+
+/// How much of a colour's luminance [`top_shoulder`] may take, against the render without it: nothing at the
+/// scene's brightest channel `[1]`, the share `[0]` from `[2]`. Slow enough that the render's own rise along an
+/// exposure ramp covers it, so lightness can't fall as the input rises. Fitted on a saturated red's ramp against
+/// Lightroom Classic exports (L* at the top of the ramp 90.2, against 90.0). Mirrored in `finish.wgsl`.
+pub const TOP_SHOULDER_HOLD: [f32; 3] = [0.12, 0.9, 1.8];
+
+/// `after` (a colour through [`top_shoulder`] and the over-range step) with the lightness it may not lose back from
+/// `before` (the same colour without the shoulder): per channel a saturated colour is darker than on luminance, and
+/// where the shoulder came in over a short stretch of an exposure ramp the brighter side rendered darker.
+#[inline]
+pub fn hold_lightness(before: [f32; 3], after: [f32; 3], scene_top: f32) -> [f32; 3] {
+    let [share, s0, s1] = TOP_SHOULDER_HOLD;
+    let (kept, got) = (luminance_2020(before), luminance_2020(after));
+    let floor = kept * (1.0 - share * smooth(s0, s1, scene_top));
+    let below = got < floor && floor.is_finite();
+    if !below {
+        return after;
+    }
+    let a = ((floor - got) / (kept - got).max(1e-6)).clamp(0.0, 1.0);
+    [after[0] + (before[0] - after[0]) * a, after[1] + (before[1] - after[1]) * a, after[2] + (before[2] - after[2]) * a]
+}
+
+/// A colour's channels brought to `peak` at most, toward its luminance `o`.
+#[inline]
+fn over_range(d: [f32; 3], o: f32, peak: f32, hue_clip: bool) -> [f32; 3] {
+    let mx = d[0].max(d[1]).max(d[2]);
+    if mx <= peak {
+        return d;
+    }
+    let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+    let grey = d.map(|v| v + (o - v) * t);
+    if hue_clip { keep_hue(d, grey, o, peak) } else { grey }
+}
+
 /// Luminance (relative to the peak) from which an over-range colour fades from keeping its hue
 /// ([`hue_clip`]) to moving toward its luminance as before V5, reached at the peak: a colour that is
 /// nearly white overall (a blown sky) still goes white, as a camera's per-channel curve takes it.
@@ -1586,6 +1655,47 @@ mod tests {
         assert_eq!(encode_srgb(lut, -1.0), 0.0);
         assert!((encode_srgb(lut, 2.0) - 1.0).abs() < 1e-6);
     }
+    #[test]
+    fn hold_lightness_gives_back_only_what_the_shoulder_may_not_take() {
+        let before = [1.0, 0.8, 0.8];
+        let dark = [1.0, 0.2, 0.1];
+        // below the scene gate nothing may go, and from its top the share may
+        let lum = luminance_2020;
+        assert!((lum(hold_lightness(before, dark, 0.5)) - lum(before)).abs() < 1e-5);
+        let held = hold_lightness(before, dark, 3.0);
+        assert!((lum(held) - lum(before) * (1.0 - TOP_SHOULDER_HOLD[0])).abs() < 1e-5, "{held:?}");
+        // a colour that kept its lightness is left as the shoulder made it
+        let close = [1.0, 0.75, 0.82];
+        assert_eq!(hold_lightness(before, close, 3.0), close);
+        // bad input does not spread
+        assert_eq!(hold_lightness([f32::NAN; 3], dark, 3.0), dark);
+        assert!(hold_lightness(before, dark, f32::NAN).iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn top_shoulder_moves_only_bright_colours_and_survives_bad_input() {
+        let tone = |v: f32| v / (1.0 + v) * 2.0;
+        // a grey: per channel and on luminance agree, unchanged
+        let t = tone(0.9);
+        let g = top_shoulder([t; 3], [0.9; 3], t, 1.0, tone);
+        assert!(g.iter().all(|v| (v - t).abs() < 1e-6), "{g:?}");
+        // a dark colour: untouched
+        assert_eq!(top_shoulder([0.5, 0.3, 0.1], [0.4, 0.2, 0.05], 0.3, 1.0, tone), [0.5, 0.3, 0.1]);
+        // a bright one moves toward the per-channel curve
+        let (d, c) = ([1.4, 0.9, 0.2], [2.0, 0.8, 0.12]);
+        let pc = c.map(tone);
+        let got = top_shoulder(d, c, 0.95, 1.0, tone);
+        assert!((0..3).all(|i| (got[i] - d[i]) * (pc[i] - d[i]) >= 0.0 && (got[i] - d[i]).abs() <= (pc[i] - d[i]).abs() + 1e-6), "{got:?}");
+        assert_ne!(got, d);
+        // NaN, infinities and a zero peak give the colour back
+        for (d, o, peak) in
+            [([f32::NAN, 0.5, 0.1], 0.9, 1.0), ([f32::INFINITY, 0.5, 0.1], 0.9, 1.0), ([1.4, 0.9, 0.2], f32::NAN, 1.0), ([1.4, 0.9, 0.2], 0.9, 0.0)]
+        {
+            let r = top_shoulder(d, [2.0, 0.8, 0.1], o, peak, tone);
+            assert!(r.iter().zip(d).all(|(a, b)| a.to_bits() == b.to_bits()), "{d:?} {o} {peak}: {r:?}");
+        }
+    }
+
     #[test]
     fn hue_clip_limits_the_brightest_channel_and_keeps_hue() {
         assert_eq!(hue_clip([0.9, 0.5, 0.1], 1.0), [0.9, 0.5, 0.1], "in range: unchanged");

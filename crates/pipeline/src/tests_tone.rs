@@ -204,3 +204,53 @@ fn exposure_keeps_the_highlights_the_generic_curve_recorded() {
         assert_eq!(v7.apply(y), v8.apply(y), "{y}");
     }
 }
+
+/// Process V9: a raw's bright colours keep their saturation near white, as Lightroom Classic's
+/// renders do. Before, the tone map on luminance pushed a bright yellow's brightest channel over
+/// white and the over-range step faded it to white. Greys, darker colours and JPEGs are unchanged.
+#[test]
+fn bright_colours_keep_their_saturation_near_white() {
+    let shot = |process: Process, raw: bool, c: [f32; 3]| {
+        let src = Rgb32f::from_fn(8, 8, |_, _| c);
+        let info = SourceInfo { raw, ..SourceInfo::default() };
+        let p = render(&src, &info, &on(process), &RenderRequest::fit(8, 8)).image.data[4 * 8 + 4];
+        [i32::from(p[0]), i32::from(p[1]), i32::from(p[2])]
+    };
+    let spread = |p: [i32; 3]| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+    for c in [[1.6, 1.3, 0.2], [2.4, 0.6, 0.45], [1.6, 0.6, 1.7]] {
+        let (v8, v9) = (shot(Process::V8, true, c), shot(Process::V9, true, c));
+        assert!(spread(v9) >= spread(v8) + 12, "{c:?}: V8 {v8:?}, V9 {v9:?}");
+        // the brightness stays: the brightest channel within a few levels
+        let top = |p: [i32; 3]| p[0].max(p[1]).max(p[2]);
+        assert!((top(v9) - top(v8)).abs() <= 6, "{c:?}: V8 {v8:?}, V9 {v9:?}");
+        // a JPEG's colours are the picture's own: not toned per channel
+        assert_eq!(shot(Process::V8, false, c), shot(Process::V9, false, c), "{c:?} as a JPEG");
+    }
+    // greys and darker colours render as before
+    for c in [[0.9; 3], [0.4; 3], [0.2, 0.15, 0.03], [0.05, 0.1, 0.3]] {
+        assert_eq!(shot(Process::V8, true, c), shot(Process::V9, true, c), "{c:?}");
+    }
+}
+
+/// Along an exposure ramp a saturated colour never renders darker as it gets brighter: where V9's curve per channel
+/// came in, the brighter side was darker, a light rim around red and magenta highlights.
+#[test]
+fn a_saturated_ramp_never_gets_darker_as_it_gets_brighter() {
+    let lin = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    for tint in [[1.0, 0.125, 0.015], [1.0, 0.3, 0.75], [1.0, 0.6, 0.05]] {
+        let mut last = 0.0f32;
+        for i in 0..80 {
+            let x = 0.4 + i as f32 * 0.03;
+            let c = tint.map(|t| t * x);
+            let src = Rgb32f::from_fn(4, 4, |_, _| c);
+            let info = SourceInfo { raw: true, ..SourceInfo::default() };
+            let p = render(&src, &info, &on(Process::V9), &RenderRequest::fit(4, 4)).image.data[5];
+            let y = 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+            assert!(y >= last - 0.006, "{tint:?} at {x}: luminance {y} after {last}");
+            last = last.max(y);
+        }
+    }
+}

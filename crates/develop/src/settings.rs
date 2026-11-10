@@ -258,6 +258,9 @@ pub enum Process {
     /// HDR renders follow Lightroom Classic's HDR tone: above the SDR mid tones the HDR value unrolls the SDR
     /// shoulder (`ToneMap::hdr_from_sdr`, measured on LrC 15.5 exports of our own charts and of real raws) and
     /// clips at the headroom, instead of creeping toward it.
+    /// Bright colours take the tone curve per channel: a colour near white keeps its saturation at about its
+    /// brightness (`finish::top_shoulder`) instead of its brightest channel going over white and the colour fading
+    /// to white, as Lightroom Classic renders it (yellows and reds near white had lost two thirds of their chroma).
     V9,
 }
 
