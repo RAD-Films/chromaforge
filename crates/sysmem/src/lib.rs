@@ -69,6 +69,21 @@ pub fn lower_thread_priority() -> bool {
     }
 }
 
+/// Run the calling thread at the lowest normal priority, below [`lower_thread_priority`]'s: the
+/// batch workers (exports, Build Previews) give way to the render workers of the photo on screen,
+/// not only to the desktop. Returns whether the priority changed; `false` anywhere but Windows
+/// (nothing happens). Safe to call from any thread, any number of times.
+pub fn lowest_thread_priority() -> bool {
+    #[cfg(windows)]
+    {
+        windows::lowest()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Bytes free for this user on the drive that holds `path` (the folder itself, or the nearest
 /// folder above it that exists), `None` when it can't be told. Windows asks `GetDiskFreeSpaceExW`;
 /// other systems run POSIX `df -Pk`. Blocking (a few ms; `df` a process start): not for a UI frame.
@@ -122,6 +137,8 @@ mod windows {
 
     /// `THREAD_PRIORITY_BELOW_NORMAL` (processthreadsapi.h).
     const BELOW_NORMAL: i32 = -1;
+    /// `THREAD_PRIORITY_LOWEST` (processthreadsapi.h).
+    const LOWEST: i32 = -2;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -137,6 +154,13 @@ mod windows {
         // `SetThreadPriority` takes; the priority is a documented constant. Neither reads or writes
         // memory we own, and a failure only leaves the priority as it was.
         unsafe { SetThreadPriority(GetCurrentThread(), BELOW_NORMAL) != 0 }
+    }
+
+    pub fn lowest() -> bool {
+        // SAFETY: as in `lower`: documented, thread-safe kernel32 functions on the calling thread's
+        // constant pseudo handle, with a documented priority constant; no memory of ours is read
+        // or written, and a failure leaves the priority as it was.
+        unsafe { SetThreadPriority(GetCurrentThread(), LOWEST) != 0 }
     }
 
     #[link(name = "kernel32")]
@@ -251,6 +275,13 @@ mod tests {
         assert_eq!(sum, 499_500);
         assert_eq!(changed, cfg!(windows));
         assert_eq!(again, cfg!(windows));
+    }
+
+    #[test]
+    fn a_thread_at_the_lowest_priority_keeps_working() {
+        let (changed, sum) = std::thread::spawn(|| (super::lowest_thread_priority(), (0..1000u64).sum::<u64>())).join().unwrap();
+        assert_eq!(sum, 499_500);
+        assert_eq!(changed, cfg!(windows));
     }
 
     #[test]

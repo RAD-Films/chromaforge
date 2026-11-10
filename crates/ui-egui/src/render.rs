@@ -1302,10 +1302,11 @@ impl Renderer {
             // the neighbours prepared ahead take turns at the GPU behind the view's own renders
             // and keep one short submission queued at a time, so the window's frames slot in
             // between (`lcc_gpu::as_batch`); a thumbnail on screen does not wait for an
-            // export's turn
+            // export's turn. Their processor work runs on the batch workers
+            // (`lcc_engine::batch::run`): the photo on screen's decode does not queue behind theirs.
             let prefetch = matches!(slot, Slot::Prefetch(_));
             let run = || match (background, prefetch) {
-                (true, true) => lcc_engine::memory::in_background(|| lcc_engine::gpu::as_batch(|| job.run())),
+                (true, true) => lcc_engine::batch::run(|| lcc_engine::memory::in_background(|| lcc_engine::gpu::as_batch(|| job.run()))),
                 (true, false) => lcc_engine::memory::in_background(|| job.run()),
                 _ => job.run(),
             };
@@ -1477,8 +1478,16 @@ impl Renderer {
             slot,
             key,
             priority,
-            // (behind the view's own renders at the GPU, one short submission queued at a time)
-            Box::new(move || Self::run_for(slot, || lcc_engine::memory::in_background(|| lcc_engine::gpu::as_batch(|| job.run())), &display, None)),
+            // (behind the view's own renders at the GPU, one short submission queued at a time; its
+            // processor work on the batch workers, behind the photo on screen's)
+            Box::new(move || {
+                Self::run_for(
+                    slot,
+                    || lcc_engine::batch::run(|| lcc_engine::memory::in_background(|| lcc_engine::gpu::as_batch(|| job.run()))),
+                    &display,
+                    None,
+                )
+            }),
         );
     }
 

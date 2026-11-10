@@ -3131,12 +3131,19 @@ impl Drop for StopOnDrop {
 }
 
 /// Run one photo's export holding its working memory from [`crate::memory::export_gate`]; a panic
-/// becomes that photo's error, not the batch's end. `stop()`: the batch was cancelled.
-fn run_gated(item: PreparedExport, stop: &dyn Fn() -> bool) -> Result<Exported, String> {
+/// becomes that photo's error, not the batch's end. `stop()`: the batch was cancelled. The photo
+/// runs on a batch worker ([`crate::batch::run`]): its processor stages never hold up the photo on
+/// screen's.
+fn run_gated(item: PreparedExport, stop: &(dyn Fn() -> bool + Sync)) -> Result<Exported, String> {
     if stop() {
         return Err(CANCELLED.into());
     }
     let _held = crate::memory::export_gate().acquire(item.weight);
+    crate::batch::run(move || run_held(item, stop))
+}
+
+/// [`run_gated`]'s work, its memory held.
+fn run_held(item: PreparedExport, stop: &(dyn Fn() -> bool + Sync)) -> Result<Exported, String> {
     let what = format!("exporting {}", item.file_name);
     // (its GPU renders take turns with the other photos' and stay behind the window's: `lcc_gpu::as_batch`)
     // (on the processor when the GPU is turned off for exports: `set_export_gpu`)

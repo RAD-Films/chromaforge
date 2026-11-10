@@ -306,6 +306,22 @@ pub(crate) fn cpu_only() -> bool {
     CPU_ONLY.try_with(|c| c.get()).unwrap_or(false)
 }
 
+/// This thread's routing: second card, batch work, a held turn, processor only.
+pub(crate) fn flags() -> [bool; 4] {
+    [uses_helper(), is_batch(), in_turn(), cpu_only()]
+}
+
+/// Set this thread's routing ([`flags`]); returns what it was.
+pub(crate) fn set_flags(f: [bool; 4]) -> [bool; 4] {
+    let was = flags();
+    let [helper, batch, turn, cpu] = f;
+    let _ = HELPER.try_with(|c| c.set(helper));
+    let _ = BATCH.try_with(|c| c.set(batch));
+    let _ = IN_TURN.try_with(|c| c.set(turn));
+    let _ = CPU_ONLY.try_with(|c| c.set(cpu));
+    was
+}
+
 /// Are this thread's renders batch work?
 pub(crate) fn is_batch() -> bool {
     BATCH.try_with(|b| b.get()).unwrap_or(false)

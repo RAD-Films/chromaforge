@@ -341,6 +341,99 @@ fn count_render(helper: bool) {
     });
 }
 
+/// A thread's GPU routing (its card, [`as_batch`], [`on_cpu`], a held turn) and its test hooks ([`inject_fault`], a simulated failure, its render
+/// counts), taken along when part of its work runs on another thread (a batch worker): that thread
+/// renders as this one would, and what its renders did comes back ([`Carried::give_back`]).
+#[derive(Debug, Default)]
+pub struct ThreadState {
+    #[cfg(not(target_arch = "wasm32"))]
+    flags: [bool; 4],
+    fault: Option<Fault>,
+    broken: Option<String>,
+}
+
+/// What [`ThreadState::run`]'s work leaves for the thread it came from.
+#[derive(Debug, Default)]
+#[must_use = "give_back() returns it to the calling thread"]
+pub struct Carried {
+    renders: [u64; 4],
+    fault: Option<Fault>,
+    broken: Option<String>,
+}
+
+impl ThreadState {
+    /// The calling thread's state (an injected fault not yet used moves along).
+    pub fn take() -> ThreadState {
+        ThreadState {
+            #[cfg(not(target_arch = "wasm32"))]
+            flags: gate::flags(),
+            fault: FAULT.try_with(std::cell::Cell::take).ok().flatten(),
+            broken: BROKEN_HERE.try_with(|b| b.borrow().clone()).ok().flatten(),
+        }
+    }
+
+    /// Run `f` here with this state, then put this thread's own back (also when `f` panics).
+    pub fn run<R>(self, f: impl FnOnce() -> R) -> (R, Carried) {
+        struct Restore {
+            #[cfg(not(target_arch = "wasm32"))]
+            flags: [bool; 4],
+            fault: Option<Fault>,
+            broken: Option<String>,
+            renders: [u64; 4],
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                #[cfg(not(target_arch = "wasm32"))]
+                gate::set_flags(self.flags);
+                let _ = FAULT.try_with(|c| c.set(self.fault.take()));
+                let _ = BROKEN_HERE.try_with(|b| *b.borrow_mut() = self.broken.take());
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = THREAD_RENDERS.try_with(|c| c.set(self.renders));
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let renders = THREAD_RENDERS.try_with(std::cell::Cell::get).unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        let renders = [0; 4];
+        let _restore = Restore {
+            #[cfg(not(target_arch = "wasm32"))]
+            flags: gate::set_flags(self.flags),
+            fault: FAULT.try_with(|c| c.replace(self.fault)).ok().flatten(),
+            broken: BROKEN_HERE.try_with(|b| b.replace(self.broken)).ok().flatten(),
+            renders,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = THREAD_RENDERS.try_with(|c| c.set([0; 4]));
+        let r = f();
+        let carried = Carried {
+            #[cfg(not(target_arch = "wasm32"))]
+            renders: THREAD_RENDERS.try_with(std::cell::Cell::get).unwrap_or_default(),
+            #[cfg(target_arch = "wasm32")]
+            renders: [0; 4],
+            fault: FAULT.try_with(std::cell::Cell::take).ok().flatten(),
+            broken: BROKEN_HERE.try_with(|b| b.borrow().clone()).ok().flatten(),
+        };
+        (r, carried)
+    }
+}
+
+impl Carried {
+    /// Back on the thread the work came from: its renders count here, an unused fault and a
+    /// simulated failure stay with this thread.
+    pub fn give_back(self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = THREAD_RENDERS.try_with(|c| {
+            let mut n = c.get();
+            for (k, add) in n.iter_mut().zip(self.renders) {
+                *k = k.saturating_add(add);
+            }
+            c.set(n);
+        });
+        let _ = FAULT.try_with(|c| c.set(self.fault));
+        let _ = BROKEN_HERE.try_with(|b| *b.borrow_mut() = self.broken);
+    }
+}
+
 /// GPU renders since the process started, by card and kind of work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderCounts {
