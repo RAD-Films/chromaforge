@@ -284,14 +284,8 @@ fn task_for(s: &Session, state: &PreviewBuild) -> TaskGuard {
 /// has room ([`crate::media::background_photo`]: with a second card both cards get photos; the
 /// editing card only while the interface is idle). The source is decoded first, outside the
 /// photo's turn at a card (a raw's decode is a second or more of processor work; the card's turn
-/// is for the renders). The whole photo runs on a batch worker ([`crate::batch::run`]), so its
-/// processor work never queues the photo on screen's behind it.
-pub(crate) fn run_photo(jobs: Vec<RenderJob>) -> bool {
-    crate::batch::run(move || run_photo_here(jobs))
-}
-
-/// [`run_photo`] on the calling thread.
-fn run_photo_here(mut jobs: Vec<RenderJob>) -> bool {
+/// is for the renders).
+pub(crate) fn run_photo(mut jobs: Vec<RenderJob>) -> bool {
     let Some(first) = jobs.first() else { return true };
     let decoded = match &first.source {
         crate::media::SourceRef::Loaded(d) => (**d).clone(),
