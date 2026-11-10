@@ -204,3 +204,30 @@ fn exposure_keeps_the_highlights_the_generic_curve_recorded() {
         assert_eq!(v7.apply(y), v8.apply(y), "{y}");
     }
 }
+
+/// Process V9: a raw's bright colours keep their saturation near white, as Lightroom Classic's
+/// renders do. Before, the tone map on luminance pushed a bright yellow's brightest channel over
+/// white and the over-range step faded it to white. Greys, darker colours and JPEGs are unchanged.
+#[test]
+fn bright_colours_keep_their_saturation_near_white() {
+    let shot = |process: Process, raw: bool, c: [f32; 3]| {
+        let src = Rgb32f::from_fn(8, 8, |_, _| c);
+        let info = SourceInfo { raw, ..SourceInfo::default() };
+        let p = render(&src, &info, &on(process), &RenderRequest::fit(8, 8)).image.data[4 * 8 + 4];
+        [i32::from(p[0]), i32::from(p[1]), i32::from(p[2])]
+    };
+    let spread = |p: [i32; 3]| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+    for c in [[1.6, 1.3, 0.2], [2.4, 0.6, 0.45], [1.6, 0.6, 1.7]] {
+        let (v8, v9) = (shot(Process::V8, true, c), shot(Process::V9, true, c));
+        assert!(spread(v9) >= spread(v8) + 12, "{c:?}: V8 {v8:?}, V9 {v9:?}");
+        // the brightness stays: the brightest channel within a few levels
+        let top = |p: [i32; 3]| p[0].max(p[1]).max(p[2]);
+        assert!((top(v9) - top(v8)).abs() <= 6, "{c:?}: V8 {v8:?}, V9 {v9:?}");
+        // a JPEG's colours are the picture's own: not toned per channel
+        assert_eq!(shot(Process::V8, false, c), shot(Process::V9, false, c), "{c:?} as a JPEG");
+    }
+    // greys and darker colours render as before
+    for c in [[0.9; 3], [0.4; 3], [0.2, 0.15, 0.03], [0.05, 0.1, 0.3]] {
+        assert_eq!(shot(Process::V8, true, c), shot(Process::V9, true, c), "{c:?}");
+    }
+}

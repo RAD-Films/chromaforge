@@ -243,6 +243,10 @@ pub enum Process {
     /// jointly, leaving Y alone, with edge-aware weights from a denoised guide and a brake for
     /// isolated colour specks (adapted from upstream #1348).
     V8,
+    /// Bright colours take the tone curve per channel: a colour near white keeps its saturation at about its
+    /// brightness (`finish::top_shoulder`) instead of its brightest channel going over white and the colour fading
+    /// to white, as Lightroom Classic renders it (yellows and reds near white had lost two thirds of their chroma).
+    V9,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -252,14 +256,15 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 | Process::V8 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V8 | Process::V9 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 8] = [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8];
-    pub const LATEST: Process = Process::V8;
+    pub const ALL: [Process; 9] =
+        [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8, Process::V9];
+    pub const LATEST: Process = Process::V9;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -271,6 +276,7 @@ impl Process {
             Process::V6 => ProcessVersion(6),
             Process::V7 => ProcessVersion(7),
             Process::V8 => ProcessVersion(8),
+            Process::V9 => ProcessVersion(9),
         }
     }
 }
