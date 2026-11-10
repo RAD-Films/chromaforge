@@ -9,6 +9,14 @@
 //! [`GATE`] EV of white get up to [`AMOUNT`] EV more pull where the spread is. The rim then sits 0.3 L* from
 //! Lightroom's.
 //!
+//! The picture's pull is also read at a tone that leans towards the surroundings': Lightroom pulls a bright object
+//! in dark surroundings (a lamp, a lit face in a dark room, a window seen from inside) less than the same tone in
+//! a bright sky, and a dark gap between bright areas more. Each pixel's base tone moves [`MIX`] of the way to an
+//! edge-aware base [`WIDE`] of the frame wide before the pull is read there, and half the change this makes to the
+//! picture's average pull is given back ([`LEVEL_SHARE`]). Measured on the same 63 frames: on the five darkest
+//! (night and window-lit rooms) Lightroom's −100 bright areas went from 13–21 L* rms off to 8–14; over the 13
+//! held-out frames the bright unclipped areas from 5.9 to 5.3, the whole picture from 3.3 to 3.4.
+//!
 //! The spread is taken once per photo on a fixed-size render of the whole frame ([`EDGE`] px long), so previews,
 //! zoomed windows and exports agree, and read back bilinearly at each output pixel.
 
@@ -34,13 +42,32 @@ const LEAK: f32 = 0.1;
 const FULL_AT: f32 = 0.5;
 /// Tones from `GATE + 1` EV under white (none) to `GATE` EV under it (all) get the pull.
 const GATE: f32 = 2.5;
+/// The surroundings' base: a guided filter of log luminance this share of the long edge wide…
+const WIDE: f32 = 0.04;
+/// …that keeps edges of more than about √`WIDE_EPS` EV.
+const WIDE_EPS: f32 = 2.0;
+/// How far each pixel's base tone leans towards the surroundings' before the pull is read.
+pub const MIX: f32 = 0.5;
+/// The share of the leaning's change to the picture's average pull that [`EdgePull::level`] gives back.
+const LEVEL_SHARE: f32 = 0.5;
+/// The most of the picture's pull [`EdgePull::level`] adds back or takes off.
+const LEVEL_MAX: f32 = 0.5;
 
-/// The extra pull of one photo: a plane over the whole output frame, at Highlights −100.
+/// The local part of one photo's Highlights pull: planes over the whole output frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgePull {
     /// The pull (EV, ≤ 0) at Highlights −100, on the whole frame at [`EDGE`] px long.
     pub plane: Arc<Plane>,
-    /// The Highlights slider's share of it.
+    /// The surroundings' base tone (EV over grey, exposure included), on the same grid.
+    pub wide: Arc<Plane>,
+    /// The picture's pull at the slider ([`crate::tone_lift`]'s grid), read again at the leaning tone.
+    pub pull: Arc<crate::tone_lift::Lift>,
+    /// The share of the picture's pull added back (or taken off) everywhere so the leaning moves the picture's
+    /// average pull only half as far as it would alone ([`LEVEL_SHARE`]): mostly it moves the pull between brighter
+    /// and darker surroundings.
+    pub level: f32,
+    /// The Highlights slider's share of the pull next to clipped areas, and again of the leaning (which the pull
+    /// table already scales by it): Lightroom's −50 leans much less than half as far as its −100.
     pub gain: f32,
     /// Plane pixels per output pixel, `(x, y)`.
     pub scale: (f32, f32),
@@ -49,9 +76,23 @@ pub struct EdgePull {
 }
 
 impl EdgePull {
-    /// The pull (EV) at rendered pixel `(x, y)`, read bilinearly from the plane.
-    pub fn at(&self, x: usize, y: usize) -> f32 {
-        let (pw, ph) = (self.plane.width, self.plane.height);
+    /// The extra pull (EV) at rendered pixel `(x, y)` whose base tone (EV over grey, exposure included) is `base`.
+    pub fn at(&self, x: usize, y: usize, base: f32) -> f32 {
+        let edge = self.gain * self.sample(&self.plane, x, y);
+        let lean = if self.wide.data.is_empty() {
+            0.0
+        } else {
+            let w = self.sample(&self.wide, x, y);
+            let own = self.pull.at(base);
+            self.gain * (self.pull.at(base + MIX * (w - base)) - own + self.level * own)
+        };
+        let v = edge + lean;
+        if v.is_finite() { v } else { 0.0 }
+    }
+
+    /// `plane` (on the [`EDGE`] grid) at rendered pixel `(x, y)`, bilinearly.
+    fn sample(&self, plane: &Plane, x: usize, y: usize) -> f32 {
+        let (pw, ph) = (plane.width, plane.height);
         if pw == 0 || ph == 0 {
             return 0.0;
         }
@@ -61,10 +102,10 @@ impl EdgePull {
         let (x0, y0) = (fx as usize, fy as usize);
         let (x1, y1) = ((x0 + 1).min(pw - 1), (y0 + 1).min(ph - 1));
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-        let at = |x: usize, y: usize| self.plane.data.get(y * pw + x).copied().unwrap_or(0.0);
+        let at = |x: usize, y: usize| plane.data.get(y * pw + x).copied().unwrap_or(0.0);
         let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
         let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
-        let v = self.gain * (top + (bottom - top) * ty);
+        let v = top + (bottom - top) * ty;
         if v.is_finite() { v } else { 0.0 }
     }
 }
@@ -83,8 +124,15 @@ fn white_of(tm: &ToneMap) -> Option<f32> {
 
 /// The pull at Highlights −100 for a white-balanced, exposed `img` (scene linear, exposure `ev` still to add) whose
 /// camera curve reaches white at scene tone `white`, with `ppl` pixels per long edge.
+#[cfg(test)]
 fn unit_plane(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> Plane {
+    unit_planes(img, ev, white, ppl).0
+}
+
+/// [`unit_plane`], the surroundings' base tone (EV over grey, exposure `ev` added) and the pixels' own tones.
+fn unit_planes(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> (Plane, Plane, Plane) {
     let log_l = img.map(log_lum);
+    let wide = crate::local::guided_fast(&log_l, (WIDE * ppl as f32).max(1.0), WIDE_EPS).map(|v| if (v + ev).is_finite() { v + ev } else { 0.0 });
     let mut clipped = Plane::new(img.width, img.height);
     for (o, c) in clipped.data.iter_mut().zip(&img.data) {
         let m = c[0].max(c[1]).max(c[2]);
@@ -97,10 +145,25 @@ fn unit_plane(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> Plane {
         let v = -AMOUNT * w * smooth(white - GATE - 1.0, white - GATE, l + ev);
         *o = if v.is_finite() { v } else { 0.0 };
     }
-    plane
+    (plane, wide, log_l)
 }
 
-type Cached = (u64, Arc<Plane>);
+/// [`EdgePull::level`] for a picture whose tones (EV over grey, exposure included) are `own` and whose
+/// surroundings' are `wide`: [`LEVEL_SHARE`] of the leaning's total over the picture's total pull, negated, held to
+/// ±[`LEVEL_MAX`].
+fn level(own: &Plane, wide: &Plane, ev: f32, pull: &crate::tone_lift::Lift) -> f32 {
+    let (mut lean, mut total) = (0.0f64, 0.0f64);
+    for (l, w) in own.data.iter().zip(&wide.data) {
+        let b = l + ev;
+        let p = pull.at(b);
+        lean += f64::from(pull.at(b + MIX * (w - b)) - p);
+        total += f64::from(p);
+    }
+    let c = if total < 0.0 { -f64::from(LEVEL_SHARE) * lean / total } else { 0.0 };
+    if c.is_finite() { (c as f32).clamp(-LEVEL_MAX, LEVEL_MAX) } else { 0.0 }
+}
+
+type Cached = (u64, Arc<Plane>, Arc<Plane>, f32);
 static LAST: Mutex<Option<Cached>> = Mutex::new(None);
 
 /// The extra Highlights pull of `s` for a render of `full` output pixels (the rendered ones from `origin`) of the
@@ -136,18 +199,24 @@ pub fn for_frame(
             white.to_bits(),
         ))
     };
-    let cached = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(k, _)| *k == key).map(|(_, p)| p.clone());
-    let plane = match cached {
+    let pull = Arc::new(crate::tone_lift::pull_table(src, info, s, frame)?);
+    // (the level is a ratio of two sums of the pull, so it doesn't change with the slider, only with the picture)
+    let cached =
+        LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(k, ..)| *k == key).map(|(_, p, w, c)| (p.clone(), w.clone(), *c));
+    let (plane, wide, level) = match cached {
         Some(p) => p,
         None => {
             let mut img = Rgb32f::clone(&frame_proxy(src, frame, pw, ph));
             white_balance(&mut img, info, s);
-            let p = Arc::new(unit_plane(&img, ev, white, frame.px_per_long(pw)));
-            *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, p.clone()));
-            p
+            let (p, w, own) = unit_planes(&img, ev, white, frame.px_per_long(pw));
+            let c = level(&own, &w, ev, &pull);
+            let (p, w) = (Arc::new(p), Arc::new(w));
+            *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, p.clone(), w.clone(), c));
+            (p, w, c)
         }
     };
-    Some(Arc::new(EdgePull { plane, gain, scale: (pw as f32 / full.0 as f32, ph as f32 / full.1 as f32), origin }))
+    let scale = (pw as f32 / full.0 as f32, ph as f32 / full.1 as f32);
+    Some(Arc::new(EdgePull { plane, wide, pull, level, gain, scale, origin }))
 }
 
 #[cfg(test)]
@@ -179,11 +248,64 @@ mod tests {
     fn reads_back_bilinearly_and_never_off_the_plane() {
         let mut plane = Plane::new(2, 1);
         plane.data = vec![0.0, -1.0];
-        let e = EdgePull { plane: Arc::new(plane), gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
-        assert_eq!(e.at(0, 0), 0.0);
-        assert!((e.at(2, 0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0));
-        assert_eq!(e.at(usize::MAX, usize::MAX), -0.5);
-        let empty = EdgePull { plane: Arc::new(Plane::new(0, 0)), gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
-        assert_eq!(empty.at(3, 3), 0.0);
+        let none = || Arc::new(Plane::new(0, 0));
+        let no_pull = Arc::new(crate::tone_lift::Lift(Vec::new()));
+        let e = EdgePull { plane: Arc::new(plane), wide: none(), pull: no_pull.clone(), level: 0.0, gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
+        assert_eq!(e.at(0, 0, 1.0), 0.0);
+        assert!((e.at(2, 0, 1.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 1.0));
+        assert_eq!(e.at(usize::MAX, usize::MAX, f32::NAN), -0.5);
+        let empty = EdgePull { plane: none(), wide: none(), pull: no_pull, level: 0.0, gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
+        assert_eq!(empty.at(3, 3, 0.0), 0.0);
+    }
+
+    /// The level gives back half the leaning's change to the average pull, and nothing without surroundings.
+    #[test]
+    fn the_level_gives_back_half_the_leaning() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let plane = |v: &[f32]| {
+            let mut p = Plane::new(v.len(), 1);
+            p.data = v.to_vec();
+            p
+        };
+        // bright tones in darker surroundings: the leaning lightens them, the level pulls back half of it
+        let (own, wide) = (plane(&[2.0, 2.0, -4.0]), plane(&[0.0, 0.0, -4.0]));
+        let c = level(&own, &wide, 0.0, &pull);
+        let (lean, total) = (2.0 * (pull.at(1.0) - pull.at(2.0)), 2.0 * pull.at(2.0));
+        assert!((c - (-LEVEL_SHARE * lean / total)).abs() < 1e-4, "{c}");
+        assert!(c > 0.0);
+        // the same surroundings as the tones, or no pull at all: nothing
+        assert_eq!(level(&own, &own, 0.0, &pull), 0.0);
+        assert_eq!(level(&plane(&[-6.0]), &plane(&[3.0]), -4.0, &Lift(vec![0.0; LIFT_N])), 0.0);
+        assert_eq!(level(&plane(&[f32::NAN]), &plane(&[3.0]), 0.0, &pull), 0.0);
+    }
+
+    /// The pull read at a tone leaning towards the surroundings': a bright patch in dark surroundings is pulled
+    /// less than the picture's curve gives it, a dark patch in bright surroundings more.
+    #[test]
+    fn the_pull_leans_towards_the_surroundings() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        // a pull of −0.5 EV per EV above 0 EV
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let flat = |v: f32| {
+            let mut p = Plane::new(4, 4);
+            p.data.fill(v);
+            Arc::new(p)
+        };
+        let e = |w: f32| EdgePull {
+            plane: flat(0.0),
+            wide: flat(w),
+            pull: Arc::new(pull.clone()),
+            level: 0.0,
+            gain: 1.0,
+            scale: (1.0, 1.0),
+            origin: (0, 0),
+        };
+        // a 2 EV tone in -2 EV surroundings is read at 0 EV: 1 EV less pull than its own
+        assert!((e(-2.0).at(1, 1, 2.0) - 1.0).abs() < 1e-4, "{}", e(-2.0).at(1, 1, 2.0));
+        // in surroundings of its own tone nothing changes
+        assert!(e(2.0).at(1, 1, 2.0).abs() < 1e-6);
+        // a 0 EV tone in 4 EV surroundings is read at 2 EV: 1 EV more pull
+        assert!((e(4.0).at(1, 1, 0.0) + 1.0).abs() < 1e-4, "{}", e(4.0).at(1, 1, 0.0));
     }
 }

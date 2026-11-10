@@ -61,6 +61,12 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_SY", 1),
     ("EDGE_OX", 1),
     ("EDGE_OY", 1),
+    // …the surroundings' base on the same grid at EDGE_WIDE_OFF (0 = none), and the picture's pull table (on the
+    // LIFT grid) at EDGE_TABLE_OFF, read again at base + EDGE_MIX · (wide − base), plus EDGE_LEVEL of it at base
+    ("EDGE_WIDE_OFF", 1),
+    ("EDGE_TABLE_OFF", 1),
+    ("EDGE_MIX", 1),
+    ("EDGE_LEVEL", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -345,6 +351,12 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some(e) = edge {
         aux.extend_from_slice(&e.plane.data);
     }
+    let lean = edge.filter(|e| e.wide.data.len() == e.plane.data.len() && e.pull.0.len() == lcc_pipeline::tone_lift::LIFT_N);
+    let (wide_off, table_off) = (aux.len(), aux.len() + lean.map_or(0, |e| e.wide.data.len()));
+    if let Some(e) = lean {
+        aux.extend_from_slice(&e.wide.data);
+        aux.extend_from_slice(&e.pull.0);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -564,6 +576,12 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.f("EDGE_SY", e.scale.1);
         p.u("EDGE_OX", u32::try_from(e.origin.0).unwrap_or(u32::MAX));
         p.u("EDGE_OY", u32::try_from(e.origin.1).unwrap_or(u32::MAX));
+    }
+    if lean.is_some() {
+        p.u("EDGE_WIDE_OFF", wide_off as u32);
+        p.u("EDGE_TABLE_OFF", table_off as u32);
+        p.f("EDGE_MIX", lcc_pipeline::hl_edge::MIX);
+        p.f("EDGE_LEVEL", lean.map_or(0.0, |e| e.level));
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

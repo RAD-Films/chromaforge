@@ -390,6 +390,23 @@ pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
     (active(s) && h < 0.0).then(|| highlights_gain(finite(h)))
 }
 
+/// A raw's Highlights − pull of `s` ([`highlights`], at the slider's share) as a table on this module's grid, for the
+/// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V9 or there is nothing to measure. The
+/// table [`for_frame`] gives already holds it at each pixel's base tone; [`crate::hl_edge`] reads it again at a
+/// tone that leans towards the surroundings'.
+pub(crate) fn pull_table(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) -> Option<Lift> {
+    let gh = highlights_down(s)?;
+    let p = highlights::Pull::of(&*tones(src, info, s, frame)?);
+    Some(Lift(
+        (0..LIFT_N)
+            .map(|i| {
+                let v = gh * p.at(LIFT_LO + LIFT_STEP * i as f32);
+                if v.is_finite() { v.clamp(-MAX_SHIFT, 0.0) } else { 0.0 }
+            })
+            .collect(),
+    ))
+}
+
 /// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V9 and above, Whites up
 /// ([`Whites`]). The tone map then leaves its white point where Whites 0 has it ([`crate::finish`]).
 pub fn whites_on_raw(s: &DevelopSettings) -> bool {
