@@ -50,8 +50,13 @@ fn build() -> Option<Arc<rayon::ThreadPool>> {
 /// routing ([`lcc_gpu::ThreadState`]) and [`crate::memory::in_background`] are carried over to
 /// (its renders count on the calling thread). On a batch worker already, or when no pool can be
 /// built, `f` runs here. A panic in `f` continues on the calling thread.
+///
+/// Never from a rayon worker of another pool: there `install` would wait by running that pool's
+/// queued jobs, i.e. another render nested on this thread (its GPU failure state and memory
+/// reservations mixed with this one's). From any rayon worker `f` runs in place, as before batch
+/// pools; only plain threads (the render workers, export and build lanes) hand work over.
 pub fn run<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if on_batch_worker() {
+    if on_batch_worker() || rayon::current_thread_index().is_some() {
         return f();
     }
     let pool = LANE
@@ -126,6 +131,62 @@ mod tests {
             (super::on_batch_worker(), super::run(move || std::thread::current().id() == here))
         });
         assert_eq!(outer, (true, true));
+    }
+
+    /// From a worker of another rayon pool, batch work runs in place: that worker never waits by
+    /// running the other pool's queued jobs (a second render nested on it).
+    #[test]
+    fn batch_work_from_a_rayon_worker_runs_in_place() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let (same, batch) = pool.install(|| {
+            let here = std::thread::current().id();
+            super::run(move || (std::thread::current().id() == here, super::on_batch_worker()))
+        });
+        assert!(same && !batch, "ran on the rayon worker itself");
+    }
+
+    /// An export's photos and a view render at once: every batch photo runs on a batch worker,
+    /// never nested inside another photo's work (each sees only its own marker), the render's
+    /// parallel loops finish meanwhile, and nothing deadlocks.
+    #[test]
+    fn an_export_and_a_view_render_at_once_neither_nests_nor_deadlocks() {
+        thread_local! { static IN_PHOTO: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+        let nested = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lanes: Vec<_> = (0..3)
+            .map(|lane| {
+                let nested = nested.clone();
+                std::thread::spawn(move || {
+                    for photo in 0..6 {
+                        let id = lane * 100 + photo;
+                        let nested = nested.clone();
+                        super::run(move || {
+                            assert!(super::on_batch_worker());
+                            (0..64u64).into_par_iter().for_each(|_| {
+                                if IN_PHOTO.with(|p| p.get().is_some_and(|other| other != id)) {
+                                    nested.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                IN_PHOTO.with(|p| p.set(Some(id)));
+                                std::thread::sleep(Duration::from_millis(1));
+                                IN_PHOTO.with(|p| p.set(None));
+                            });
+                        });
+                    }
+                })
+            })
+            .collect();
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                let s: u64 = (0..100_000u64).into_par_iter().sum();
+                assert_eq!(s, 4_999_950_000);
+            }
+            let _ = done.send(());
+        });
+        finished.recv_timeout(Duration::from_secs(20)).expect("the view render finished beside the export");
+        for l in lanes {
+            l.join().expect("export lane");
+        }
+        assert_eq!(nested.load(std::sync::atomic::Ordering::Relaxed), 0, "a photo ran nested inside another");
     }
 
     #[test]
