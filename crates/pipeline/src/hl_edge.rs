@@ -1,23 +1,24 @@
-//! The small, outline-following part of a raw's Highlights − in process V9: bright tones next to clipped areas go
-//! down a little more than the picture's curve ([`crate::tone_lift`]) takes them.
+//! A raw's Highlights − in process V9, read per pixel: the picture's pull ([`crate::tone_lift::pull_table`]) at the
+//! tone of each pixel's surroundings, and a little more next to clipped areas.
 //!
-//! Measured on Lightroom Classic exports of our own Canon EOS R5 C raws (rounds 9b and 10, OneSlips, Nov 2026): with
-//! the per-picture curve alone, pixels at the edge of a clipped sky came out 2.5 L* lighter than Lightroom's −100,
-//! a light rim around the clouds, while pixels 60 px away matched. Lightroom pulls bright tones near clipped areas
-//! further, following the areas' outlines. Here the clipped areas (brightest channel past the camera curve's white)
+//! **The surroundings.** Lightroom Classic keeps the detail inside bright areas when it pulls them: clouds in a
+//! partly clipped sky stay 11–14 L* above the sky between them at −100 (rounds 9b and 10 of our own Canon EOS R5 C
+//! raws, OneSlips, Nov 2026), and a lamp's cone on a wall stays brighter than the wall. Read at each pixel's own
+//! tone (or at a cloud-sized base), a pull that falls by about as much as the tone rises flattened the bright
+//! band to one level: clouds went to 5–7 L*, the cone to a flat patch with a hard line where the band began. So
+//! the pull is read at a wide base of the scene's log luminance, a bilateral grid [`WIDE`] of the frame's long
+//! edge across that merges tones within about [`RANGE`] EV (sky with clouds, a cone with its wall) and keeps
+//! larger steps (sky against ground) apart; the pixel's own detail over that base rides on top unchanged. Measured
+//! at 1024 px against Lightroom's −100: clouds 0.5 L* under its contrast (was 2.3), the bright unclipped areas
+//! 5.7 / 5.3 L* rms on fitted / held-out frames (was 6.4 / 5.9), the whole picture 3.6 / 3.1 (was 3.9 / 3.3).
+//!
+//! **Next to clipped areas.** Pixels at the edge of a clipped sky came out 2.5 L* lighter than Lightroom's −100,
+//! a light rim around the clouds, while pixels 60 px away matched: Lightroom pulls bright tones near clipped areas
+//! further, following the areas' outlines. The clipped areas (brightest channel past the camera curve's white)
 //! are spread edge-aware, guided by log luminance, over a few hundredths of the frame, and bright tones within
-//! [`GATE`] EV of white get up to [`AMOUNT`] EV more pull where the spread is. The rim then sits 0.3 L* from
-//! Lightroom's.
+//! [`GATE`] EV of white get up to [`AMOUNT`] EV more pull where the spread is.
 //!
-//! The picture's pull is also read at a tone that leans towards the surroundings': Lightroom pulls a bright object
-//! in dark surroundings (a lamp, a lit face in a dark room, a window seen from inside) less than the same tone in
-//! a bright sky, and a dark gap between bright areas more. Each pixel's base tone moves [`MIX`] of the way to an
-//! edge-aware base [`WIDE`] of the frame wide before the pull is read there, and half the change this makes to the
-//! picture's average pull is given back ([`LEVEL_SHARE`]). Measured on the same 63 frames: on the five darkest
-//! (night and window-lit rooms) Lightroom's −100 bright areas went from 13–21 L* rms off to 8–14; over the 13
-//! held-out frames the bright unclipped areas from 5.9 to 5.3, the whole picture from 3.3 to 3.4.
-//!
-//! The spread is taken once per photo on a fixed-size render of the whole frame ([`EDGE`] px long), so previews,
+//! Both are taken once per photo on a fixed-size render of the whole frame ([`EDGE`] px long), so previews,
 //! zoomed windows and exports agree, and read back bilinearly at each output pixel.
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,16 +43,12 @@ const LEAK: f32 = 0.1;
 const FULL_AT: f32 = 0.5;
 /// Tones from `GATE + 1` EV under white (none) to `GATE` EV under it (all) get the pull.
 const GATE: f32 = 2.5;
-/// The surroundings' base: a guided filter of log luminance this share of the long edge wide…
-const WIDE: f32 = 0.04;
-/// …that keeps edges of more than about √`WIDE_EPS` EV.
-const WIDE_EPS: f32 = 2.0;
-/// How far each pixel's base tone leans towards the surroundings' before the pull is read.
-pub const MIX: f32 = 0.5;
-/// The share of the leaning's change to the picture's average pull that [`EdgePull::level`] gives back.
-const LEVEL_SHARE: f32 = 0.5;
-/// The most of the picture's pull [`EdgePull::level`] adds back or takes off.
-const LEVEL_MAX: f32 = 0.5;
+/// The surroundings' base: a bilateral grid this share of the long edge across (its Gaussian's sigma)…
+const WIDE: f32 = 0.03;
+/// …that merges tones within about this many EV (the width of its tone bins) and keeps larger steps apart.
+const RANGE: f32 = 1.5;
+/// The most tone bins the grid keeps (a picture with a wider range gets wider bins).
+const MAX_BINS: usize = 48;
 
 /// The local part of one photo's Highlights pull: planes over the whole output frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,14 +57,9 @@ pub struct EdgePull {
     pub plane: Arc<Plane>,
     /// The surroundings' base tone (EV over grey, exposure included), on the same grid.
     pub wide: Arc<Plane>,
-    /// The picture's pull at the slider ([`crate::tone_lift`]'s grid), read again at the leaning tone.
+    /// The picture's pull at the slider ([`crate::tone_lift`]'s grid), read at the surroundings' tone.
     pub pull: Arc<crate::tone_lift::Lift>,
-    /// The share of the picture's pull added back (or taken off) everywhere so the leaning moves the picture's
-    /// average pull only half as far as it would alone ([`LEVEL_SHARE`]): mostly it moves the pull between brighter
-    /// and darker surroundings.
-    pub level: f32,
-    /// The Highlights slider's share of the pull next to clipped areas, and again of the leaning (which the pull
-    /// table already scales by it): Lightroom's −50 leans much less than half as far as its −100.
+    /// The Highlights slider's share of the pull next to clipped areas.
     pub gain: f32,
     /// Plane pixels per output pixel, `(x, y)`.
     pub scale: (f32, f32),
@@ -76,17 +68,11 @@ pub struct EdgePull {
 }
 
 impl EdgePull {
-    /// The extra pull (EV) at rendered pixel `(x, y)` whose base tone (EV over grey, exposure included) is `base`.
-    pub fn at(&self, x: usize, y: usize, base: f32) -> f32 {
+    /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV.
+    pub fn at(&self, x: usize, y: usize, shift: f32) -> f32 {
         let edge = self.gain * self.sample(&self.plane, x, y);
-        let lean = if self.wide.data.is_empty() {
-            0.0
-        } else {
-            let w = self.sample(&self.wide, x, y);
-            let own = self.pull.at(base);
-            self.gain * (self.pull.at(base + MIX * (w - base)) - own + self.level * own)
-        };
-        let v = edge + lean;
+        let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(self.sample(&self.wide, x, y) + shift) };
+        let v = edge + wide;
         if v.is_finite() { v } else { 0.0 }
     }
 
@@ -122,48 +108,86 @@ fn white_of(tm: &ToneMap) -> Option<f32> {
     (0..=640).map(|i| -8.0 + i as f32 / 32.0).find(|&e| d(e) >= top - 0.05)
 }
 
-/// The pull at Highlights −100 for a white-balanced, exposed `img` (scene linear, exposure `ev` still to add) whose
-/// camera curve reaches white at scene tone `white`, with `ppl` pixels per long edge.
+/// The pull next to clipped areas at Highlights −100 for a white-balanced, exposed `img` (scene linear, exposure
+/// `ev` still to add) whose camera curve reaches white at scene tone `white`, with `ppl` pixels per long edge.
 #[cfg(test)]
 fn unit_plane(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> Plane {
-    unit_planes(img, ev, white, ppl).0
+    unit_planes(img, ev, Some(white), ppl).0
 }
 
-/// [`unit_plane`], the surroundings' base tone (EV over grey, exposure `ev` added) and the pixels' own tones.
-fn unit_planes(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> (Plane, Plane, Plane) {
+/// [`unit_plane`] (zero without a `white`) and the surroundings' base tone (EV over grey, exposure `ev` added).
+fn unit_planes(img: &Rgb32f, ev: f32, white: Option<f32>, ppl: f64) -> (Plane, Plane) {
     let log_l = img.map(log_lum);
-    let wide = crate::local::guided_fast(&log_l, (WIDE * ppl as f32).max(1.0), WIDE_EPS).map(|v| if (v + ev).is_finite() { v + ev } else { 0.0 });
+    let wide = bilateral(&log_l, WIDE * ppl as f32, RANGE).map(|v| if (v + ev).is_finite() { v + ev } else { 0.0 });
+    let mut plane = Plane::new(img.width, img.height);
+    let Some(white) = white else { return (plane, wide) };
     let mut clipped = Plane::new(img.width, img.height);
     for (o, c) in clipped.data.iter_mut().zip(&img.data) {
         let m = c[0].max(c[1]).max(c[2]);
         *o = if log_lum([m, m, m]) + ev >= white { 1.0 } else { 0.0 };
     }
     let near = crate::masks::guided_cross(&log_l, &clipped, (RADIUS * ppl as f32).max(1.0), LEAK);
-    let mut plane = Plane::new(img.width, img.height);
     for ((o, n), l) in plane.data.iter_mut().zip(&near.data).zip(&log_l.data) {
         let w = (n / FULL_AT).clamp(0.0, 1.0);
         let v = -AMOUNT * w * smooth(white - GATE - 1.0, white - GATE, l + ev);
         *o = if v.is_finite() { v } else { 0.0 };
     }
-    (plane, wide, log_l)
+    (plane, wide)
 }
 
-/// [`EdgePull::level`] for a picture whose tones (EV over grey, exposure included) are `own` and whose
-/// surroundings' are `wide`: [`LEVEL_SHARE`] of the leaning's total over the picture's total pull, negated, held to
-/// ±[`LEVEL_MAX`].
-fn level(own: &Plane, wide: &Plane, ev: f32, pull: &crate::tone_lift::Lift) -> f32 {
-    let (mut lean, mut total) = (0.0f64, 0.0f64);
-    for (l, w) in own.data.iter().zip(&wide.data) {
-        let b = l + ev;
-        let p = pull.at(b);
-        lean += f64::from(pull.at(b + MIX * (w - b)) - p);
-        total += f64::from(p);
+/// A bilateral grid of `l`: each pixel's tone splatted linearly into tone bins `range` wide (wider when the
+/// picture's tones need more than [`MAX_BINS`]), each bin's weights and tones blurred with a Gaussian of `sigma`
+/// px and softened across neighbouring bins (1, 2, 1), and read back at the pixel's own tone. Tones within a bin
+/// or two of each other mix; farther apart they stay apart. A pixel with nothing around keeps its tone.
+fn bilateral(l: &Plane, sigma: f32, range: f32) -> Plane {
+    let fin = |v: f32| if v.is_finite() { v.clamp(-32.0, 32.0) } else { 0.0 };
+    let (lo, hi) = l.data.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(fin(v)), b.max(fin(v))));
+    let mut out = Plane::new(l.width, l.height);
+    if l.data.is_empty() || lo > hi {
+        return out;
     }
-    let c = if total < 0.0 { -f64::from(LEVEL_SHARE) * lean / total } else { 0.0 };
-    if c.is_finite() { (c as f32).clamp(-LEVEL_MAX, LEVEL_MAX) } else { 0.0 }
+    let step = range.max((hi - lo) / (MAX_BINS - 2) as f32).max(1e-3);
+    let n = (((hi - lo) / step).ceil() as usize + 2).clamp(2, MAX_BINS);
+    // the bin below a tone and how far it sits towards the next
+    let bin = |v: f32| {
+        let t = ((fin(v) - lo) / step).clamp(0.0, (n - 1) as f32);
+        let b = (t as usize).min(n - 2);
+        (b, (t - b as f32).clamp(0.0, 1.0))
+    };
+    let mut grid: Vec<(Plane, Plane)> = (0..n).map(|_| (Plane::new(l.width, l.height), Plane::new(l.width, l.height))).collect();
+    for (i, &v) in l.data.iter().enumerate() {
+        let (b, f) = bin(v);
+        for (k, wt) in [(b, 1.0 - f), (b + 1, f)] {
+            if let Some((w, t)) = grid.get_mut(k)
+                && let (Some(w), Some(t)) = (w.data.get_mut(i), t.data.get_mut(i))
+            {
+                *w += wt;
+                *t += wt * fin(v);
+            }
+        }
+    }
+    let grid: Vec<(Plane, Plane)> = grid.iter().map(|(w, t)| (lcc_raster::blur::gaussian(w, sigma), lcc_raster::blur::gaussian(t, sigma))).collect();
+    // bin `k` at pixel `i`, softened over its neighbours
+    let read = |k: usize, i: usize| {
+        let (mut sw, mut st) = (0.0f32, 0.0f32);
+        for (d, wt) in [(-1i64, 0.25f32), (0, 0.5), (1, 0.25)] {
+            let Some((w, t)) = usize::try_from(k as i64 + d).ok().and_then(|kk| grid.get(kk)) else { continue };
+            sw += wt * w.data.get(i).copied().unwrap_or(0.0);
+            st += wt * t.data.get(i).copied().unwrap_or(0.0);
+        }
+        (sw, st)
+    };
+    for (i, (o, &v)) in out.data.iter_mut().zip(&l.data).enumerate() {
+        let (b, f) = bin(v);
+        let ((w0, t0), (w1, t1)) = (read(b, i), read(b + 1, i));
+        let (sw, st) = (w0 * (1.0 - f) + w1 * f, t0 * (1.0 - f) + t1 * f);
+        let r = if sw > 1e-6 { st / sw } else { fin(v) };
+        *o = if r.is_finite() { r } else { fin(v) };
+    }
+    out
 }
 
-type Cached = (u64, Arc<Plane>, Arc<Plane>, f32);
+type Cached = (u64, Arc<Plane>, Arc<Plane>);
 static LAST: Mutex<Option<Cached>> = Mutex::new(None);
 
 /// The extra Highlights pull of `s` for a render of `full` output pixels (the rendered ones from `origin`) of the
@@ -184,7 +208,8 @@ pub fn for_frame(
     if pw == 0 || ph == 0 || full.0 == 0 || full.1 == 0 || src.width == 0 || src.height == 0 {
         return None;
     }
-    let white = white_of(tm)?;
+    // (without a white the pull next to clipped areas is off; the pull itself stays)
+    let white = white_of(tm);
     let ev = s.light.exposure as f32;
     let key = {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -196,27 +221,24 @@ pub fn for_frame(
             [t.to_bits(), tint.to_bits(), info.as_shot_temp.to_bits(), info.as_shot_tint.to_bits()],
             crate::local::white_balance_key(info, s),
             ev.to_bits(),
-            white.to_bits(),
+            white.map(f32::to_bits),
         ))
     };
     let pull = Arc::new(crate::tone_lift::pull_table(src, info, s, frame)?);
-    // (the level is a ratio of two sums of the pull, so it doesn't change with the slider, only with the picture)
-    let cached =
-        LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(k, ..)| *k == key).map(|(_, p, w, c)| (p.clone(), w.clone(), *c));
-    let (plane, wide, level) = match cached {
+    let cached = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(k, ..)| *k == key).map(|(_, p, w)| (p.clone(), w.clone()));
+    let (plane, wide) = match cached {
         Some(p) => p,
         None => {
             let mut img = Rgb32f::clone(&frame_proxy(src, frame, pw, ph));
             white_balance(&mut img, info, s);
-            let (p, w, own) = unit_planes(&img, ev, white, frame.px_per_long(pw));
-            let c = level(&own, &w, ev, &pull);
+            let (p, w) = unit_planes(&img, ev, white, frame.px_per_long(pw));
             let (p, w) = (Arc::new(p), Arc::new(w));
-            *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, p.clone(), w.clone(), c));
-            (p, w, c)
+            *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, p.clone(), w.clone()));
+            (p, w)
         }
     };
     let scale = (pw as f32 / full.0 as f32, ph as f32 / full.1 as f32);
-    Some(Arc::new(EdgePull { plane, wide, pull, level, gain, scale, origin }))
+    Some(Arc::new(EdgePull { plane, wide, pull, gain, scale, origin }))
 }
 
 #[cfg(test)]
@@ -250,40 +272,18 @@ mod tests {
         plane.data = vec![0.0, -1.0];
         let none = || Arc::new(Plane::new(0, 0));
         let no_pull = Arc::new(crate::tone_lift::Lift(Vec::new()));
-        let e = EdgePull { plane: Arc::new(plane), wide: none(), pull: no_pull.clone(), level: 0.0, gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
-        assert_eq!(e.at(0, 0, 1.0), 0.0);
-        assert!((e.at(2, 0, 1.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 1.0));
+        let e = EdgePull { plane: Arc::new(plane), wide: none(), pull: no_pull.clone(), gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
+        assert_eq!(e.at(0, 0, 0.0), 0.0);
+        assert!((e.at(2, 0, 0.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 0.0));
         assert_eq!(e.at(usize::MAX, usize::MAX, f32::NAN), -0.5);
-        let empty = EdgePull { plane: none(), wide: none(), pull: no_pull, level: 0.0, gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
+        let empty = EdgePull { plane: none(), wide: none(), pull: no_pull, gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
         assert_eq!(empty.at(3, 3, 0.0), 0.0);
     }
 
-    /// The level gives back half the leaning's change to the average pull, and nothing without surroundings.
+    /// The pull is read at the surroundings' tone, whatever the pixel's own: a bright patch in darker surroundings
+    /// gets the surroundings' (smaller) pull and keeps its contrast over them.
     #[test]
-    fn the_level_gives_back_half_the_leaning() {
-        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
-        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
-        let plane = |v: &[f32]| {
-            let mut p = Plane::new(v.len(), 1);
-            p.data = v.to_vec();
-            p
-        };
-        // bright tones in darker surroundings: the leaning lightens them, the level pulls back half of it
-        let (own, wide) = (plane(&[2.0, 2.0, -4.0]), plane(&[0.0, 0.0, -4.0]));
-        let c = level(&own, &wide, 0.0, &pull);
-        let (lean, total) = (2.0 * (pull.at(1.0) - pull.at(2.0)), 2.0 * pull.at(2.0));
-        assert!((c - (-LEVEL_SHARE * lean / total)).abs() < 1e-4, "{c}");
-        assert!(c > 0.0);
-        // the same surroundings as the tones, or no pull at all: nothing
-        assert_eq!(level(&own, &own, 0.0, &pull), 0.0);
-        assert_eq!(level(&plane(&[-6.0]), &plane(&[3.0]), -4.0, &Lift(vec![0.0; LIFT_N])), 0.0);
-        assert_eq!(level(&plane(&[f32::NAN]), &plane(&[3.0]), 0.0, &pull), 0.0);
-    }
-
-    /// The pull read at a tone leaning towards the surroundings': a bright patch in dark surroundings is pulled
-    /// less than the picture's curve gives it, a dark patch in bright surroundings more.
-    #[test]
-    fn the_pull_leans_towards_the_surroundings() {
+    fn the_pull_is_read_at_the_surroundings_tone() {
         use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
         // a pull of −0.5 EV per EV above 0 EV
         let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
@@ -292,20 +292,40 @@ mod tests {
             p.data.fill(v);
             Arc::new(p)
         };
-        let e = |w: f32| EdgePull {
-            plane: flat(0.0),
-            wide: flat(w),
-            pull: Arc::new(pull.clone()),
-            level: 0.0,
-            gain: 1.0,
-            scale: (1.0, 1.0),
-            origin: (0, 0),
-        };
-        // a 2 EV tone in -2 EV surroundings is read at 0 EV: 1 EV less pull than its own
-        assert!((e(-2.0).at(1, 1, 2.0) - 1.0).abs() < 1e-4, "{}", e(-2.0).at(1, 1, 2.0));
-        // in surroundings of its own tone nothing changes
-        assert!(e(2.0).at(1, 1, 2.0).abs() < 1e-6);
-        // a 0 EV tone in 4 EV surroundings is read at 2 EV: 1 EV more pull
-        assert!((e(4.0).at(1, 1, 0.0) + 1.0).abs() < 1e-4, "{}", e(4.0).at(1, 1, 0.0));
+        let e = |w: f32| EdgePull { plane: flat(0.0), wide: flat(w), pull: Arc::new(pull.clone()), gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
+        assert!((e(2.0).at(1, 1, 0.0) + 1.0).abs() < 1e-4, "{}", e(2.0).at(1, 1, 0.0));
+        assert!(e(-2.0).at(1, 1, 0.0).abs() < 1e-6);
+    }
+
+    /// The bilateral base merges tones a little apart (clouds in a sky) and keeps a large step (sky against ground)
+    /// apart, and stays finite on hostile values.
+    #[test]
+    fn the_surroundings_merge_clouds_and_keep_the_horizon() {
+        let (w, h) = (200usize, 200usize);
+        let mut l = Plane::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // sky at 2 EV with 0.8 EV clouds in a checker of 20 px cells; ground at -4 EV below row 150
+                l.data[y * w + x] = if y >= 150 {
+                    -4.0
+                } else if (x / 20 + y / 20) % 2 == 0 {
+                    2.8
+                } else {
+                    2.0
+                };
+            }
+        }
+        let b = bilateral(&l, 12.0, RANGE);
+        let at = |x: usize, y: usize| b.data[y * w + x];
+        // cloud and sky cells read nearly the same base, between their tones
+        assert!((at(10, 50) - at(30, 50)).abs() < 0.15, "{} {}", at(10, 50), at(30, 50));
+        assert!(at(30, 50) > 2.1 && at(10, 50) < 2.7);
+        // the sky right above the ground keeps a sky base, the ground a ground base
+        assert!(at(100, 145) > 1.5, "{}", at(100, 145));
+        assert!(at(100, 155) < -3.0, "{}", at(100, 155));
+        let mut bad = Plane::new(3, 1);
+        bad.data = vec![f32::NAN, f32::INFINITY, -1e30];
+        assert!(bilateral(&bad, 2.0, RANGE).data.iter().all(|v| v.is_finite()));
+        assert!(bilateral(&Plane::new(0, 0), 2.0, RANGE).data.is_empty());
     }
 }

@@ -939,7 +939,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let mut delta = 0.0f32;
             // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
             let (hh, ss) = if let Some(lf) = lift {
-                delta += lf.at(base) + fp.edge_pull.as_deref().map_or(0.0, |e| e.at(x, y, base));
+                delta += lf.at(base) + fp.edge_pull.as_deref().map_or(0.0, |e| e.at(x, y, shift));
                 (l_hl, l_sh)
             } else {
                 (hl + l_hl, sh + l_sh)

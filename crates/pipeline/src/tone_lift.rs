@@ -264,9 +264,10 @@ impl Lift {
         }
         // Shadows +100 never darkens much and Highlights −100 never brightens much (a fit's tail can say otherwise)
         let cw = whites::WHITES_UP_RAW.curve(td);
-        // a raw's Highlights −: Lightroom's pull of the scene tone ([`highlights`]) in place of the displayed-tone curve
-        let pull = (display.is_some() && gh > 0.0).then(|| highlights::Pull::of(t));
-        let hl = |d: f32| if pull.is_some() { 0.0 } else { gh * ch.at(d).min(SIGN_SLACK) };
+        // a raw's Highlights −: Lightroom's pull of the scene tone ([`highlights`]), read per pixel at its
+        // surroundings' tone by [`crate::hl_edge`] ([`pull_table`]), in place of the displayed-tone curve
+        let pulled_elsewhere = display.is_some() && gh > 0.0;
+        let hl = |d: f32| if pulled_elsewhere { 0.0 } else { gh * ch.at(d).min(SIGN_SLACK) };
         let shift = |d: f32| gs * cs.at(d).max(-SIGN_SLACK) + hl(d) + gw * cw.at(d);
         let v = (0..LIFT_N)
             .map(|i| {
@@ -274,7 +275,7 @@ impl Lift {
                 // (a raw: the curve read at the displayed tone, its shift turned into a scene shift)
                 let s = match display {
                     None => shift(e),
-                    Some(d) => scene_shift(d, e, shift(d(e))) + pull.map_or(0.0, |p| gh * p.at(e)),
+                    Some(d) => scene_shift(d, e, shift(d(e))),
                 };
                 if s.is_finite() { s.clamp(-MAX_SHIFT, MAX_SHIFT) } else { 0.0 }
             })
@@ -391,20 +392,55 @@ pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
 }
 
 /// A raw's Highlights − pull of `s` ([`highlights`], at the slider's share) as a table on this module's grid, for the
-/// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V9 or there is nothing to measure. The
-/// table [`for_frame`] gives already holds it at each pixel's base tone; [`crate::hl_edge`] reads it again at a
-/// tone that leans towards the surroundings'.
+/// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V9 or there is nothing to measure.
+/// [`crate::hl_edge`] reads it at each pixel's surroundings' tone ([`for_frame`]'s table leaves it out). Tones
+/// keep their order with room to spare ([`in_order`]).
 pub(crate) fn pull_table(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) -> Option<Lift> {
     let gh = highlights_down(s)?;
     let p = highlights::Pull::of(&*tones(src, info, s, frame)?);
-    Some(Lift(
-        (0..LIFT_N)
-            .map(|i| {
-                let v = gh * p.at(LIFT_LO + LIFT_STEP * i as f32);
-                if v.is_finite() { v.clamp(-MAX_SHIFT, 0.0) } else { 0.0 }
-            })
-            .collect(),
-    ))
+    Some(in_order((0..LIFT_N).map(|i| gh * p.at(LIFT_LO + LIFT_STEP * i as f32)).collect()))
+}
+
+/// The least a pulled tone rises per EV of the tone it pulls ([`in_order`]).
+const MIN_SLOPE: f32 = 0.1;
+/// Half-width (table entries) of the three box passes that round the pull's corners ([`in_order`]).
+const ROUND: usize = 8;
+
+/// A pull table (EV, ≤ 0, on this module's grid) whose pulled tones rise by at least [`MIN_SLOPE`] per EV, with its
+/// corners rounded over about ±0.4 EV. A pull that falls faster than the tone rises (Lightroom's curve, on a dark
+/// frame) would otherwise flatten a band of bright tones to one level, or turn it over, and its edge would show as
+/// a line across a smooth gradient such as a lamp's light on a wall. Rounding keeps the slope at least
+/// [`MIN_SLOPE`] (an average of rising tones rises as fast) and leaves no corner for the eye to catch.
+fn in_order(v: Vec<f32>) -> Lift {
+    let tone = |i: usize| LIFT_LO + LIFT_STEP * i as f32;
+    let mut last = f32::MIN;
+    let floored: Vec<f32> = v
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let s = if s.is_finite() { s.clamp(-MAX_SHIFT, 0.0) } else { 0.0 };
+            let o = (tone(i) + s).max(last + MIN_SLOPE * LIFT_STEP);
+            last = o;
+            o - tone(i)
+        })
+        .collect();
+    let mut a = floored;
+    for _ in 0..3 {
+        let n = a.len();
+        let mut sum = 0.0f64;
+        let at = |k: i64| a.get(k.clamp(0, n as i64 - 1) as usize).copied().unwrap_or(0.0) as f64;
+        let r = ROUND as i64;
+        let mut b = Vec::with_capacity(n);
+        for k in -r..=r {
+            sum += at(k);
+        }
+        for i in 0..n as i64 {
+            b.push((sum / (2 * r + 1) as f64) as f32);
+            sum += at(i + r + 1) - at(i - r);
+        }
+        a = b;
+    }
+    Lift(a.into_iter().map(|s| if s.is_finite() { s.clamp(-MAX_SHIFT, 0.0) } else { 0.0 }).collect())
 }
 
 /// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V9 and above, Whites up
@@ -589,15 +625,37 @@ mod tests {
         let d = |e: f32| e;
         let s = Lift::new(&picture(), 1.0, 0.0, Some(&d));
         let h = Lift::new(&picture(), 0.0, -1.0, Some(&d));
-        // (a raw's Highlights − is Lightroom's pull of the scene tone instead, [`highlights`])
-        let pull = highlights::Pull::of(&picture());
+        // (a raw's Highlights − is Lightroom's pull of the scene tone instead, [`highlights`], read per pixel by
+        // [`crate::hl_edge`] from [`pull_table`]: this table leaves it out)
         for (e, want_s, _) in GOLDEN_RAW {
             assert!((s.at(e) - want_s).abs() < 3e-3, "shadows at {e}: {} vs {want_s}", s.at(e));
-            assert!((h.at(e) - pull.at(e)).abs() < 3e-3, "highlights at {e}: {} vs {}", h.at(e), pull.at(e));
+            assert_eq!(h.at(e), 0.0, "highlights at {e}");
         }
         // and a display-referred picture doesn't get it
         let tiff = Lift::new(&picture(), 1.0, 0.0, None);
         assert!((tiff.at(-5.0) - GOLDEN[0].1).abs() < 2e-3);
+    }
+
+    /// A pull that falls twice as fast as the tone rises over 3 EV (and a NaN) comes out with the pulled tones
+    /// rising by at least [`MIN_SLOPE`] per EV everywhere, never brightening, with no corner sharper than the
+    /// rounding leaves: no flat band and no line where the steep part starts.
+    #[test]
+    fn the_pull_keeps_tones_in_order_with_no_flat_band() {
+        let e = |i: usize| LIFT_LO + LIFT_STEP * i as f32;
+        let raw: Vec<f32> = (0..LIFT_N).map(|i| if i == 700 { f32::NAN } else { -2.0 * (e(i) - 1.0).clamp(0.0, 3.0) }).collect();
+        let t = in_order(raw);
+        assert_eq!(t.0.len(), LIFT_N);
+        assert!(t.0.iter().all(|v| v.is_finite() && *v <= 0.0));
+        let out = |i: usize| e(i) + t.0[i];
+        for i in 1..LIFT_N - ROUND * 3 {
+            let slope = (out(i) - out(i - 1)) / LIFT_STEP;
+            assert!(slope >= MIN_SLOPE - 1e-3, "slope {slope} at {}", e(i));
+        }
+        // the slope changes gradually: no step in it between neighbouring entries larger than the rounding allows
+        let worst = (2..LIFT_N - ROUND * 3).map(|i| (((out(i) - out(i - 1)) - (out(i - 1) - out(i - 2))) / LIFT_STEP).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.2, "slope jumps by {worst} between entries");
+        // away from the steep part the pull is untouched
+        assert!(t.at(-4.0).abs() < 1e-6 && (t.at(0.0)).abs() < 1e-6);
     }
 
     const GOLDEN_RAW: [(f32, f32, f32); 4] =

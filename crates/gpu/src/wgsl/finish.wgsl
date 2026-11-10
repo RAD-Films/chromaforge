@@ -103,14 +103,11 @@ fn table_at(o: u32, ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V9's local Highlights pull at pixel (x, y) with base tone `base` (`hl_edge::EdgePull::at`).
-fn edge_at(x: u32, y: u32, base: f32) -> f32 {
+// Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` (`hl_edge::EdgePull::at`).
+fn edge_at(x: u32, y: u32, shift: f32) -> f32 {
     var v = pf(F_EDGE_GAIN) * edge_sample(pu(F_EDGE_OFF), x, y);
     if (pu(F_EDGE_WIDE_OFF) != 0u) {
-        let w = edge_sample(pu(F_EDGE_WIDE_OFF), x, y);
-        let o = pu(F_EDGE_TABLE_OFF);
-        let own = table_at(o, base);
-        v += pf(F_EDGE_GAIN) * (table_at(o, base + pf(F_EDGE_MIX) * (w - base)) - own + pf(F_EDGE_LEVEL) * own);
+        v += table_at(pu(F_EDGE_TABLE_OFF), edge_sample(pu(F_EDGE_WIDE_OFF), x, y) + shift);
     }
     return select(0.0, v, v == v);
 }
@@ -1123,7 +1120,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pu(F_LIFT) != 0u) {
         delta += lift_at(base);
         if (pu(F_EDGE_PULL) != 0u) {
-            delta += edge_at(x, y, base);
+            delta += edge_at(x, y, shift);
         }
         hh = lt[4];
         ss = lt[5];

@@ -61,12 +61,10 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_SY", 1),
     ("EDGE_OX", 1),
     ("EDGE_OY", 1),
-    // …the surroundings' base on the same grid at EDGE_WIDE_OFF (0 = none), and the picture's pull table (on the
-    // LIFT grid) at EDGE_TABLE_OFF, read again at base + EDGE_MIX · (wide − base), plus EDGE_LEVEL of it at base
+    // …the surroundings' base on the same grid at EDGE_WIDE_OFF (0 = none), where the picture's pull table (on the
+    // LIFT grid, at EDGE_TABLE_OFF) is read
     ("EDGE_WIDE_OFF", 1),
     ("EDGE_TABLE_OFF", 1),
-    ("EDGE_MIX", 1),
-    ("EDGE_LEVEL", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -342,7 +340,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some(l) = lift {
         aux.extend_from_slice(&l.0);
     }
-    // process V9's extra Highlights pull (only with the table it adds to, as on the CPU)
+    // process V9's raw Highlights pull (only with the table it adds to, as on the CPU)
     let edge_off = aux.len();
     let edge = fp
         .edge_pull
@@ -580,8 +578,6 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if lean.is_some() {
         p.u("EDGE_WIDE_OFF", wide_off as u32);
         p.u("EDGE_TABLE_OFF", table_off as u32);
-        p.f("EDGE_MIX", lcc_pipeline::hl_edge::MIX);
-        p.f("EDGE_LEVEL", lean.map_or(0.0, |e| e.level));
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {
