@@ -89,7 +89,8 @@ const PALE: (f32, f32) = (0.2, 0.4);
 /// ([`OWN_HUE`]) keeps it.
 const TWO_CLIPPED_FADE: (f32, f32) = (0.5, 0.25);
 /// The fade sets in as a pixel's second channel rises from this share of its clip to the clip, so nothing jumps where
-/// it clips and pixels with one channel clipped keep their colour.
+/// it clips and pixels with one channel clipped keep their colour. Only pairs with green fade: on chart brackets under
+/// magenta light, patches with red and blue clipped kept their hue within 1° without the fade and lost all chroma with it.
 const SECOND_CLIP_LO: f32 = 0.95;
 
 /// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
@@ -598,12 +599,13 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             // a pixel with two channels clipped keeps only part of its rim's colour ([`TWO_CLIPPED_FADE`]), fading in as
             // its second channel nears its clip so that nothing jumps where it clips
             if rim_hue {
-                let mut b = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(SECOND_CLIP_LO, 1.0, p[c] / clip) });
-                b.sort_by(|x, y| y.total_cmp(x));
+                // only pairs with green: red and blue clipped together (magenta light) keep their colour
+                let b = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(SECOND_CLIP_LO, 1.0, p[c] / clip) });
+                let pair = b[1].min(b[0].max(b[2]));
                 let u = [out[0] / white[0], out[1] / white[1], out[2] / white[2]];
                 let warm = smoothstep(0.0, 0.2, (u[0] - u[2]) / (u[0] + u[2]).max(1e-9));
                 let fade = TWO_CLIPPED_FADE.0 + (TWO_CLIPPED_FADE.1 - TWO_CLIPPED_FADE.0) * warm;
-                let k = fade * b[1] * (1.0 - own);
+                let k = fade * pair * (1.0 - own);
                 let level = (out[0] + out[1] + out[2]) / total;
                 out = std::array::from_fn(|c| out[c] + (white[c] * level - out[c]) * k);
             }
@@ -954,6 +956,21 @@ mod tests {
             }
         }
         (hue, step)
+    }
+
+    /// Chart patches under magenta light, red and blue clipped and green not: with [`Rebuild::rim_hue`] the patch keeps
+    /// its magenta rim's chroma (the two-channel fade only takes pairs with green).
+    #[test]
+    fn with_rim_hue_a_red_and_blue_clipped_patch_keeps_its_magenta() {
+        let rim = [1.2, 0.24, 1.2];
+        let core = [3.0, 0.6, 3.0];
+        let mut img = Rgb32f::from_fn(64, 64, |x, y| sensor(if (16..48).contains(&x) && (16..48).contains(&y) { core } else { rim }));
+        let cl = by_value(&img.get(32, 32), 0.99);
+        assert_eq!(cl, [true, false, true], "the patch clips in red and blue");
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
+        let (got, want) = (away(balanced(img.get(32, 32))), away(rim));
+        assert!(got >= 0.8 * want, "chroma {got} against the rim's {want}");
     }
 
     /// The 6719 cyan blob: a green-clipped sky beside a bright teal surface turned cyan where the rebuild borrowed
