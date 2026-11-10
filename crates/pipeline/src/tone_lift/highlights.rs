@@ -39,11 +39,14 @@ const K0: f32 = 0.253;
 const K1: f32 = 1.041;
 const K_MAX: f32 = 1.6;
 
-/// Anchor `a = A0 + A50 · p50 + A90 · p90 + A99 · p99` (scene percentiles, EV over grey), held to `A_LO..A_HI`.
-const A0: f32 = 3.546;
-const A50: f32 = 0.678;
-const A90: f32 = 0.471;
-const A99: f32 = -0.238;
+/// Anchor `a = A0 + A50 · p50 + A90 · p90 + A99 · p99` (scene percentiles, EV over grey, held at the white:
+/// [`Pull::of`]), held to `A_LO..A_HI`. Refitted on our 64 raws to the anchors fitted before on unheld percentiles
+/// (0.14 EV rms apart, 0.31 at most), then `A0` lowered 0.05 against Lightroom Classic at −100: clipped areas +0.2 L*
+/// over it, bright unclipped areas 5.7 / 5.3 L* rms (fit / held-out).
+const A0: f32 = 3.622;
+const A50: f32 = 0.690;
+const A90: f32 = 0.494;
+const A99: f32 = -0.324;
 const A_LO: f32 = -7.0;
 const A_HI: f32 = 2.5;
 
@@ -75,10 +78,15 @@ pub(super) struct Pull {
 }
 
 impl Pull {
-    /// The pull for a picture whose scene tones (EV over grey, white-balanced and exposed) are `t`.
-    pub(super) fn of(t: &Tones) -> Pull {
+    /// The pull for a picture whose scene tones (EV over grey, white-balanced and exposed) are `t`, its percentiles
+    /// held at `white` (the scene tone where the raw's camera curve reaches white) when given. Every tone above it shows
+    /// as white, and a clipped area's rebuilt colour moves its luminance there: the 99th percentile often lies inside a
+    /// clipped area, and changing only the colour of clipped pixels moved the whole picture's pull by up to 10 L*.
+    pub(super) fn of(t: &Tones, white: Option<f32>) -> Pull {
+        let cap = white.filter(|w| w.is_finite()).unwrap_or(f32::INFINITY);
+        let p = |q: f32| t.percentile_held(q, cap);
         let k = K0 + K1 * t.below(-2.0);
-        let a = A0 + A50 * t.percentile(50.0) + A90 * t.percentile(90.0) + A99 * t.percentile(99.0);
+        let a = A0 + A50 * p(50.0) + A90 * p(90.0) + A99 * p(99.0);
         Pull { k: if k.is_finite() { k.clamp(0.0, K_MAX) } else { K0 }, a: if a.is_finite() { a.clamp(A_LO, A_HI) } else { 0.0 } }
     }
 
@@ -112,11 +120,21 @@ mod tests {
     fn dark_pictures_get_a_deeper_pull() {
         let bright = Tones::new((0..100).map(|i| -1.0 + i as f32 * 0.03)).unwrap();
         let dark = Tones::new((0..100).map(|i| -6.0 + i as f32 * 0.07)).unwrap();
-        let (b, d) = (Pull::of(&bright), Pull::of(&dark));
+        let (b, d) = (Pull::of(&bright, None), Pull::of(&dark, None));
         assert!(d.k > b.k);
         assert!(d.at(0.0) < b.at(0.0), "{} vs {}", d.at(0.0), b.at(0.0));
         assert!(b.at(-12.0) == 0.0 && d.at(-12.0) == 0.0);
         // well past a bright picture's anchor the pull is past a stop
         assert!(b.at(8.0) < -1.0, "{}", b.at(8.0));
+    }
+
+    /// A clipped area (the top tenth of the tones, above the white at 2.6 EV) whose rebuilt luminance changes, as when
+    /// only its colour does: the pull stays the same. Read unheld, the anchor moved with it.
+    #[test]
+    fn tones_above_the_white_do_not_move_the_pull() {
+        let picture = |top: f32| Tones::new((0..100).map(|i| if i < 90 { -7.0 + i as f32 * 0.06 } else { top })).unwrap();
+        let (a, b) = (picture(2.8), picture(3.6));
+        assert_eq!(Pull::of(&a, Some(2.6)), Pull::of(&b, Some(2.6)));
+        assert_ne!(Pull::of(&a, None), Pull::of(&b, None));
     }
 }

@@ -102,7 +102,7 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 /// The scene tone (EV over grey) where `tm`'s displayed tone reaches its top, within 0.05 EV.
-fn white_of(tm: &ToneMap) -> Option<f32> {
+pub(crate) fn white_of(tm: &ToneMap) -> Option<f32> {
     let d = |e: f32| (tm.apply(GREY * e.exp2()).max(1e-9) / GREY).log2();
     let top = d(12.0);
     (0..=640).map(|i| -8.0 + i as f32 / 32.0).find(|&e| d(e) >= top - 0.05)
@@ -224,7 +224,7 @@ pub fn for_frame(
             white.map(f32::to_bits),
         ))
     };
-    let pull = Arc::new(crate::tone_lift::pull_table(src, info, s, frame)?);
+    let pull = Arc::new(crate::tone_lift::pull_table(src, info, s, frame, white)?);
     let cached = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(k, ..)| *k == key).map(|(_, p, w)| (p.clone(), w.clone()));
     let (plane, wide) = match cached {
         Some(p) => p,

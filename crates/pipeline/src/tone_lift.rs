@@ -116,12 +116,17 @@ impl Tones {
 
     /// The `q`th percentile (0–100), linearly interpolated between the sorted tones (numpy's default).
     pub fn percentile(&self, q: f32) -> f32 {
+        self.percentile_held(q, f32::INFINITY)
+    }
+
+    /// [`Tones::percentile`] of the tones each held at `cap` (the same as of tones capped before sorting).
+    pub fn percentile_held(&self, q: f32, cap: f32) -> f32 {
         let v = &self.0;
         let n = v.len();
         let pos = (q.clamp(0.0, 100.0) / 100.0) * (n.saturating_sub(1)) as f32;
         let i = (pos.floor() as usize).min(n.saturating_sub(1));
         let j = (i + 1).min(n.saturating_sub(1));
-        let (a, b) = (v.get(i).copied().unwrap_or(0.0), v.get(j).copied().unwrap_or(0.0));
+        let (a, b) = (v.get(i).copied().unwrap_or(0.0).min(cap), v.get(j).copied().unwrap_or(0.0).min(cap));
         a + (b - a) * (pos - i as f32)
     }
 
@@ -395,9 +400,10 @@ pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
 /// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V9 or there is nothing to measure.
 /// [`crate::hl_edge`] reads it at each pixel's surroundings' tone ([`for_frame`]'s table leaves it out). Tones
 /// keep their order with room to spare ([`in_order`]).
-pub(crate) fn pull_table(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) -> Option<Lift> {
+/// `white` is the scene tone where the raw's camera curve reaches white ([`highlights::Pull::of`]).
+pub(crate) fn pull_table(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, white: Option<f32>) -> Option<Lift> {
     let gh = highlights_down(s)?;
-    let p = highlights::Pull::of(&*tones(src, info, s, frame)?);
+    let p = highlights::Pull::of(&*tones(src, info, s, frame)?, white);
     Some(in_order((0..LIFT_N).map(|i| gh * p.at(LIFT_LO + LIFT_STEP * i as f32)).collect()))
 }
 
