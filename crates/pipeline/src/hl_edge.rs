@@ -21,7 +21,10 @@
 //! the core 3–5 L* under Lightroom's −100, a blend that ended too soon, while partly clipped pixels need it.
 //!
 //! Both are taken once per photo on a fixed-size render of the whole frame ([`EDGE`] px long), so previews,
-//! zoomed windows and exports agree, and read back bilinearly at each output pixel.
+//! zoomed windows and exports agree, and read back at each output pixel from the four nearest grid cells, each by
+//! how near it is and how close its surroundings' tone is to the pixel's own ([`EdgePull::at`]). Read bilinearly
+//! alone, a dark pixel beside a clipped area took part of the area's much deeper pull: a dark olive line 1–2 px
+//! wide (at 3000 px) along the edge, where Lightroom's −100 shows none.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -54,6 +57,9 @@ const WIDE: f32 = 0.03;
 const RANGE: f32 = 1.5;
 /// The most tone bins the grid keeps (a picture with a wider range gets wider bins).
 const MAX_BINS: usize = 48;
+/// Reading the planes back, a grid cell counts less the further its surroundings' tone lies from the pixel's own: by a
+/// Gaussian with this sigma (EV), half the grid's tone bin, so that cells across a step the grid keeps apart don't mix.
+pub const READ_TONE: f32 = RANGE * 0.5;
 
 /// The local part of one photo's Highlights pull: planes over the whole output frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,19 +79,35 @@ pub struct EdgePull {
 }
 
 impl EdgePull {
-    /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV.
-    pub fn at(&self, x: usize, y: usize, shift: f32) -> f32 {
-        let edge = self.gain * self.sample(&self.plane, x, y);
-        let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(self.sample(&self.wide, x, y) + shift) };
+    /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV and whose own
+    /// base tone (EV over grey, exposure and `shift` included) is `own`. The four nearest grid cells count by how near
+    /// they are and by how close their surroundings' tone is to `own` ([`READ_TONE`]), so a pixel beside a much
+    /// brighter area (a clipped one) takes the pull of its own side.
+    pub fn at(&self, x: usize, y: usize, shift: f32, own: f32) -> f32 {
+        let Some(cells) = self.cells(x, y) else { return 0.0 };
+        let wide_at = |i: usize| self.wide.data.get(i).copied().unwrap_or(0.0);
+        let guided = !self.wide.data.is_empty() && own.is_finite();
+        let tone = cells.map(|(i, b)| {
+            let z = if guided { ((wide_at(i) + shift - own) / READ_TONE).abs().min(8.0) } else { 0.0 };
+            let v = b * (-0.5 * z * z).exp();
+            if v.is_finite() { v } else { 0.0 }
+        });
+        let sum: f32 = tone.iter().sum();
+        let w = if sum > 1e-30 { tone.map(|v| v / sum) } else { cells.map(|(_, b)| b) };
+        let read = |p: &Plane| cells.iter().zip(&w).map(|(&(i, _), &k)| k * p.data.get(i).copied().unwrap_or(0.0)).sum::<f32>();
+        let edge = if self.plane.data.is_empty() { 0.0 } else { self.gain * read(&self.plane) };
+        let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(read(&self.wide) + shift) };
         let v = edge + wide;
         if v.is_finite() { v } else { 0.0 }
     }
 
-    /// `plane` (on the [`EDGE`] grid) at rendered pixel `(x, y)`, bilinearly.
-    fn sample(&self, plane: &Plane, x: usize, y: usize) -> f32 {
+    /// The four grid cells around rendered pixel `(x, y)`: their index in the planes and bilinear weight, or `None`
+    /// on an empty grid.
+    fn cells(&self, x: usize, y: usize) -> Option<[(usize, f32); 4]> {
+        let plane = if self.wide.data.is_empty() { &self.plane } else { &self.wide };
         let (pw, ph) = (plane.width, plane.height);
         if pw == 0 || ph == 0 {
-            return 0.0;
+            return None;
         }
         let fx = ((self.origin.0.saturating_add(x) as f32 + 0.5) * self.scale.0 - 0.5).clamp(0.0, (pw - 1) as f32);
         let fy = ((self.origin.1.saturating_add(y) as f32 + 0.5) * self.scale.1 - 0.5).clamp(0.0, (ph - 1) as f32);
@@ -93,11 +115,7 @@ impl EdgePull {
         let (x0, y0) = (fx as usize, fy as usize);
         let (x1, y1) = ((x0 + 1).min(pw - 1), (y0 + 1).min(ph - 1));
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-        let at = |x: usize, y: usize| plane.data.get(y * pw + x).copied().unwrap_or(0.0);
-        let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
-        let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
-        let v = top + (bottom - top) * ty;
-        if v.is_finite() { v } else { 0.0 }
+        Some([(y0 * pw + x0, (1.0 - tx) * (1.0 - ty)), (y0 * pw + x1, tx * (1.0 - ty)), (y1 * pw + x0, (1.0 - tx) * ty), (y1 * pw + x1, tx * ty)])
     }
 }
 
@@ -292,11 +310,11 @@ mod tests {
         let none = || Arc::new(Plane::new(0, 0));
         let no_pull = Arc::new(crate::tone_lift::Lift(Vec::new()));
         let e = EdgePull { plane: Arc::new(plane), wide: none(), pull: no_pull.clone(), gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
-        assert_eq!(e.at(0, 0, 0.0), 0.0);
-        assert!((e.at(2, 0, 0.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 0.0));
-        assert_eq!(e.at(usize::MAX, usize::MAX, f32::NAN), -0.5);
+        assert_eq!(e.at(0, 0, 0.0, 0.0), 0.0);
+        assert!((e.at(2, 0, 0.0, 0.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 0.0, 0.0));
+        assert_eq!(e.at(usize::MAX, usize::MAX, f32::NAN, f32::NAN), -0.5);
         let empty = EdgePull { plane: none(), wide: none(), pull: no_pull, gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
-        assert_eq!(empty.at(3, 3, 0.0), 0.0);
+        assert_eq!(empty.at(3, 3, 0.0, 0.0), 0.0);
     }
 
     /// The pull is read at the surroundings' tone, whatever the pixel's own: a bright patch in darker surroundings
@@ -312,8 +330,25 @@ mod tests {
             Arc::new(p)
         };
         let e = |w: f32| EdgePull { plane: flat(0.0), wide: flat(w), pull: Arc::new(pull.clone()), gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
-        assert!((e(2.0).at(1, 1, 0.0) + 1.0).abs() < 1e-4, "{}", e(2.0).at(1, 1, 0.0));
-        assert!(e(-2.0).at(1, 1, 0.0).abs() < 1e-6);
+        assert!((e(2.0).at(1, 1, 0.0, 3.0) + 1.0).abs() < 1e-4, "{}", e(2.0).at(1, 1, 0.0, 3.0));
+        assert!(e(-2.0).at(1, 1, 0.0, -1.0).abs() < 1e-6);
+    }
+
+    /// Beside a much brighter area on the grid (a clipped core at 3 EV, its pull −1.5 EV), a dark pixel (at −1 EV)
+    /// takes the pull of its own side, where a bilinear read gave it about half the core's: a dark line along the
+    /// edge. A pixel as bright as the core still takes the core's.
+    #[test]
+    fn a_dark_pixel_beside_a_bright_area_takes_its_own_sides_pull() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let mut wide = Plane::new(2, 1);
+        wide.data = vec![-1.0, 3.0];
+        let e =
+            EdgePull { plane: Arc::new(Plane::new(2, 1)), wide: Arc::new(wide), pull: Arc::new(pull), gain: 1.0, scale: (0.5, 0.5), origin: (0, 0) };
+        // output pixel 2 sits halfway between the two cells
+        assert!(e.at(2, 0, 0.0, -1.0).abs() < 0.01, "dark pixel: {}", e.at(2, 0, 0.0, -1.0));
+        assert!((e.at(2, 0, 0.0, 3.0) + 1.5).abs() < 0.01, "bright pixel: {}", e.at(2, 0, 0.0, 3.0));
+        assert!(e.at(2, 0, 0.0, f32::NAN).is_finite());
     }
 
     /// The bilateral base merges tones a little apart (clouds in a sky) and keeps a large step (sky against ground)

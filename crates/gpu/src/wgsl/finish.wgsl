@@ -63,9 +63,10 @@ fn lift_at(ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// A plane on the V9 Highlights grid (EDGE_W × EDGE_H at `o` in aux) at pixel (x, y), bilinearly
-// (`hl_edge::EdgePull::sample`).
-fn edge_sample(o: u32, x: u32, y: u32) -> f32 {
+// Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
+// `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V9 Highlights grid (EDGE_W × EDGE_H in aux), each by
+// its bilinear weight and how close its surroundings' tone is to `own`.
+fn edge_at(x: u32, y: u32, shift: f32, own: f32) -> f32 {
     let pw = pu(F_EDGE_W);
     let ph = pu(F_EDGE_H);
     if (pw == 0u || ph == 0u) {
@@ -85,9 +86,38 @@ fn edge_sample(o: u32, x: u32, y: u32) -> f32 {
     let y1 = min(y0 + 1u, ph - 1u);
     let tx = fx - f32(x0);
     let ty = fy - f32(y0);
-    let top = aux[o + y0 * pw + x0] + (aux[o + y0 * pw + x1] - aux[o + y0 * pw + x0]) * tx;
-    let bottom = aux[o + y1 * pw + x0] + (aux[o + y1 * pw + x1] - aux[o + y1 * pw + x0]) * tx;
-    let v = top + (bottom - top) * ty;
+    let idx = array<u32, 4>(y0 * pw + x0, y0 * pw + x1, y1 * pw + x0, y1 * pw + x1);
+    let bil = array<f32, 4>((1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty);
+    let wo = pu(F_EDGE_WIDE_OFF);
+    let guided = wo != 0u && own == own && abs(own) < 1e30;
+    var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    var sum = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        var z = 0.0;
+        if (guided) {
+            z = min(abs((aux[wo + idx[k]] + shift - own) / pf(F_EDGE_READ_TONE)), 8.0);
+        }
+        var v = bil[k] * exp(-0.5 * z * z);
+        v = select(0.0, v, v == v);
+        w[k] = v;
+        sum += v;
+    }
+    for (var k = 0u; k < 4u; k++) {
+        w[k] = select(bil[k], w[k] / sum, sum > 1e-30);
+    }
+    let eo = pu(F_EDGE_OFF);
+    var edge = 0.0;
+    var wide = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        edge += w[k] * aux[eo + idx[k]];
+        if (wo != 0u) {
+            wide += w[k] * aux[wo + idx[k]];
+        }
+    }
+    var v = pf(F_EDGE_GAIN) * edge;
+    if (wo != 0u) {
+        v += table_at(pu(F_EDGE_TABLE_OFF), wide + shift);
+    }
     return select(0.0, v, v == v);
 }
 
@@ -103,14 +133,6 @@ fn table_at(o: u32, ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` (`hl_edge::EdgePull::at`).
-fn edge_at(x: u32, y: u32, shift: f32) -> f32 {
-    var v = pf(F_EDGE_GAIN) * edge_sample(pu(F_EDGE_OFF), x, y);
-    if (pu(F_EDGE_WIDE_OFF) != 0u) {
-        v += table_at(pu(F_EDGE_TABLE_OFF), edge_sample(pu(F_EDGE_WIDE_OFF), x, y) + shift);
-    }
-    return select(0.0, v, v == v);
-}
 
 // `finish::eval_curves` on one channel: for HDR renders (`hdr`) a value above SDR white continues
 // with slope 1 from the curve's end point.
@@ -1120,7 +1142,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pu(F_LIFT) != 0u) {
         delta += lift_at(base);
         if (pu(F_EDGE_PULL) != 0u) {
-            delta += edge_at(x, y, shift);
+            delta += edge_at(x, y, shift, base);
         }
         hh = lt[4];
         ss = lt[5];
