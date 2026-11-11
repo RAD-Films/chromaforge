@@ -602,6 +602,14 @@ fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option
     Some([to.to_f32(), to.inverse()?.to_f32()])
 }
 
+/// Prototype (magenta near the clip): for a render toned per ProPhoto channel, the white-balance stage clips the
+/// scene colour at zero in linear ProPhoto instead of Rec.2020. Straight from the raw (the profile's matrix), a
+/// saturated magenta light has a negative ProPhoto green (−0.05 to −0.16 of its brightest channel); Lightroom Classic
+/// renders that green as exactly 0, while a clip in the narrower Rec.2020 left it 0.01–0.35 of the brightest channel.
+pub(crate) fn prophoto_floor(s: &DevelopSettings, info: &SourceInfo) -> Option<[[[f32; 3]; 3]; 2]> {
+    tone_per_channel(s, info, 1.0)
+}
+
 /// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
 /// ([`ToneMap::hdr_from_sdr`] of V9's SDR tone map); `false` keeps V9's own curves at `peak`.
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
