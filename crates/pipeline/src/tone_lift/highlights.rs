@@ -11,44 +11,51 @@
 //! Fitted on 50 shots and scored on 13 it never saw (all-pixel / bright-unclipped L* rms against Lightroom's −100):
 //! 3.3 / 6.0, where the fitted per-picture curve of [`super::raw`] was 4.2 / 8.3; at −50 1.9 / 3.0 (was 2.2 / 4.0).
 //! Lightroom's −50 is about half its −100 up to white, which [`super::highlights_gain`] already gives.
+//!
+//! The curve and its per-picture constants were then solved together against the rendered result: one render per
+//! constant on 64 shots gave how each moves every pixel, the step was solved on 51 shots with the curve kept smooth,
+//! and its size picked by rendering. Change of the L* between each Highlights stage and 0 against Lightroom's, rms
+//! over pixels lighter than L* 40 (fitted / held-out 13 shots): −25 1.19 / 0.81 (was 1.27 / 0.87), −50 2.21 / 1.45
+//! (2.36 / 1.55), −75 3.29 / 2.37 (3.49 / 2.50), −100 4.10 / 3.36 (4.31 / 3.48). Most of what remains differs picture
+//! by picture: the picture's tone statistics did not predict it on the held-out shots, nor did its surroundings at any
+//! scale from 1 to 50 % of the long edge.
 
 use super::Tones;
 
 /// The curve at depth 1: pull (EV, negative darkens) at `E − a` (EV), linear between knots.
 const KNOTS: [(f32, f32); 13] = [
-    (-8.0, 0.0),
-    (-6.0, -0.2),
-    (-4.0, -0.42),
-    (-3.0, -0.5),
-    (-2.0, -0.64),
-    (-1.0, -1.05),
-    (0.0, -1.95),
-    (1.0, -2.6),
-    (2.0, -3.1),
-    (2.25, -3.25),
-    (3.0, -4.0),
-    (3.75, -4.75),
-    (5.0, -5.6),
+    (-8.0, 0.000),
+    (-6.0, -0.141),
+    (-4.0, -0.347),
+    (-3.0, -0.458),
+    (-2.0, -0.678),
+    (-1.0, -1.146),
+    (0.0, -1.960),
+    (1.0, -2.600),
+    (2.0, -3.165),
+    (2.25, -3.325),
+    (3.0, -4.000),
+    (3.75, -4.750),
+    (5.0, -5.600),
 ];
 
 /// Past the last knot the pull keeps growing this much per EV.
 const TAIL: f32 = -0.7;
 
 /// Depth `k = K0 + K1 · share of tones under −2 EV`, held to `K_MAX`.
-const K0: f32 = 0.253;
-const K1: f32 = 1.041;
+const K0: f32 = 0.294;
+const K1: f32 = 1.047;
 const K_MAX: f32 = 1.6;
 
 /// Anchor `a = A0 + A50 · p50 + A90 · p90 + A99 · p99` (scene percentiles, EV over grey, held at the white:
-/// [`Pull::of`]), held to `A_LO..A_HI`. Refitted on our 64 raws to the anchors fitted before on unheld percentiles
-/// (0.14 EV rms apart, 0.31 at most), then `A0` lowered 0.05 against Lightroom Classic at −100: clipped areas +0.2 L*
-/// over it, bright unclipped areas 5.7 / 5.3 L* rms (fit / held-out).
-const A0: f32 = 3.622;
-const A50: f32 = 0.690;
-const A90: f32 = 0.494;
-const A99: f32 = -0.324;
+/// [`Pull::of`]), held to `A_LO..A_HI`. `A_HI` reaches past the anchors of bright pictures (5.5 EV on our 64 raws, 17 of
+/// which a limit of 2.5 held back).
+const A0: f32 = 3.516;
+const A50: f32 = 0.657;
+const A90: f32 = 0.471;
+const A99: f32 = -0.292;
 const A_LO: f32 = -7.0;
-const A_HI: f32 = 2.5;
+const A_HI: f32 = 6.0;
 
 /// The pull curve at depth 1 (EV) for `x = E − a`.
 fn curve(x: f32) -> f32 {
@@ -104,7 +111,7 @@ mod tests {
     #[test]
     fn curve_is_flat_in_the_shadows_and_falls_past_white() {
         assert_eq!(curve(-20.0), 0.0);
-        assert!((curve(0.0) + 1.95).abs() < 1e-6);
+        assert!((curve(0.0) + 1.96).abs() < 1e-6);
         assert!((curve(7.0) - (-5.6 - 1.4)).abs() < 1e-5);
         // never rises: tones keep their order under the pull's slope (> −1)
         let mut last = 0.0f32;
