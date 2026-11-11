@@ -1724,6 +1724,23 @@ mod tests {
         assert_eq!(near_white([f32::NAN, 0.1, 0.2], 1.0)[1], 0.1);
         // blue-led (little luminance for its brightest channel): unchanged
         assert_eq!(near_white([0.3, 0.05, 1.0], 1.0), [0.3, 0.05, 1.0]);
+        // a raised peak moves the start with it
+        assert_eq!(near_white([1.0, 0.4, 0.1], 2.0), [1.0, 0.4, 0.1]);
+    }
+
+    #[test]
+    fn near_white_spares_magenta_and_blue_led_colours() {
+        // the pull on a warm colour at white, against magenta at the same brightest channel
+        let pull = |p: [f32; 3]| near_white(p, 1.0)[1] - p[1];
+        let warm = pull([1.0, 0.5, 0.0]);
+        assert!((warm - 0.5 * NEAR_WHITE[0]).abs() < 1e-6, "{warm}");
+        // red-led magenta: luminance just over the gate's start, a sliver of the pull at most
+        let magenta = pull([1.0, 0.0, 0.6]);
+        assert!((0.0..0.05 * warm).contains(&magenta), "{magenta} vs {warm}");
+        // blue-led magenta and purple: under the gate, unchanged
+        for p in [[0.8, 0.0, 1.0], [0.5, 0.05, 1.0], [0.6, 0.1, 1.2]] {
+            assert_eq!(near_white(p, 1.0), p);
+        }
     }
 
     /// The brightest and darkest channel take the curve and the middle one keeps its place between them: on each
