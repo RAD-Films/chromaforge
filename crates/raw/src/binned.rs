@@ -35,19 +35,26 @@ impl RawImage {
     /// applied, not oriented). `None` when the data cannot be binned ([`RawImage::can_bin`]) or its `OpcodeList3`
     /// holds an operation that needs every pixel ([`crate::opcodes::Opcode::binned`]); callers then demosaic.
     pub fn develop_binned(&self, k: usize, clip: f32) -> Result<Option<Rgb32f>> {
-        Ok(self.bin(k, clip, true)?.map(|(img, _)| img))
+        Ok(self.bin(k, clip, true, false)?.map(|(img, _)| img))
     }
 
     /// Like [`RawImage::develop_binned`], with every channel the mean of its block's samples, and the
     /// clip mask: per output pixel, bits [`crate::highlight::CLIPPED_R`] / `_G` / `_B` for the colours
     /// with a sample at or above `clip` in the block. Hand both to [`crate::highlight::reconstruct_masked`].
     pub fn develop_binned_masked(&self, k: usize, clip: f32) -> Result<Option<(Rgb32f, Vec<u8>)>> {
-        self.bin(k, clip, false)
+        self.bin(k, clip, false, false)
+    }
+
+    /// [`RawImage::develop_binned_masked`] with the colour planes of a Bayer mosaic moved onto the block's centre. Its red
+    /// and blue samples lie half a sensor pixel to either side of the centre, so on a hard edge one output row took its
+    /// red from the dark side and its blue from the bright side: a coloured line that a full-size render doesn't have.
+    pub fn develop_binned_masked_aligned(&self, k: usize, clip: f32) -> Result<Option<(Rgb32f, Vec<u8>)>> {
+        self.bin(k, clip, false, true)
     }
 
     /// The binned image and its clip mask; `keep_max`: a channel with a clipped sample takes the
     /// block's maximum sample of the colour instead of the mean.
-    fn bin(&self, k: usize, clip: f32, keep_max: bool) -> Result<Option<(Rgb32f, Vec<u8>)>> {
+    fn bin(&self, k: usize, clip: f32, keep_max: bool, align: bool) -> Result<Option<(Rgb32f, Vec<u8>)>> {
         self.validate()?;
         if !self.can_bin(k) {
             return Ok(None);
@@ -127,6 +134,12 @@ impl RawImage {
                 }
             }
         });
+        if align
+            && cfa.is_bayer()
+            && let Some((layout, _)) = layouts.get((c.y % ph) * pw + c.x % pw)
+        {
+            align_planes(&mut out, plane_offsets(layout, k));
+        }
         if list3.is_empty() {
             return Ok(Some((out, mask)));
         }
@@ -140,6 +153,45 @@ impl RawImage {
         let mask = (y0..y0 + ch).flat_map(|y| mask[y * bw + x0..y * bw + x0 + cw].iter().copied()).collect();
         Ok(Some((out.into_crop(x0, y0, cw, ch), mask)))
     }
+}
+
+/// How far each colour's samples lie from the centre of a `k × k` block, in blocks, `(x, y)`.
+fn plane_offsets(layout: &[u8], k: usize) -> [(f32, f32); 3] {
+    let centre = (k as f32 - 1.0) / 2.0;
+    std::array::from_fn(|c| {
+        let (mut x, mut y, mut n) = (0f32, 0f32, 0f32);
+        for (t, _) in layout.iter().enumerate().filter(|(_, l)| **l as usize == c) {
+            x += (t % k) as f32;
+            y += (t / k) as f32;
+            n += 1.0;
+        }
+        if n > 0.0 { ((x / n - centre) / k as f32, (y / n - centre) / k as f32) } else { (0.0, 0.0) }
+    })
+}
+
+/// Each colour plane read at the blocks' centres: between a block's own value (which lies `offsets` away from its
+/// centre) and the neighbouring block's on the other side of it.
+fn align_planes(img: &mut Rgb32f, offsets: [(f32, f32); 3]) {
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 || offsets.iter().all(|&(x, y)| x == 0.0 && y == 0.0) {
+        return;
+    }
+    let src = img.clone();
+    let at = |x: usize, y: usize, c: usize| src.data.get(y * w + x).map_or(0.0, |p| p[c]);
+    img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.iter_mut().enumerate() {
+            for (c, &(dx, dy)) in offsets.iter().enumerate() {
+                if dx == 0.0 && dy == 0.0 {
+                    continue;
+                }
+                let nx = if dx > 0.0 { x.saturating_sub(1) } else { (x + 1).min(w - 1) };
+                let ny = if dy > 0.0 { y.saturating_sub(1) } else { (y + 1).min(h - 1) };
+                let (ax, ay) = (dx.abs(), dy.abs());
+                px[c] =
+                    at(x, y, c) * (1.0 - ax) * (1.0 - ay) + at(nx, y, c) * ax * (1.0 - ay) + at(x, ny, c) * (1.0 - ax) * ay + at(nx, ny, c) * ax * ay;
+            }
+        }
+    });
 }
 
 /// Colours of the `k × k` samples of a block whose corner sits at pattern position `(i, j)`
@@ -184,6 +236,22 @@ mod tests {
             metadata: Metadata::default(),
             lens_metadata: Default::default(),
         }
+    }
+
+    /// A hard edge through the middle of the blocks: the plain block has its red from above the edge and its blue from
+    /// below (the coloured line of a reduced-size render), the aligned one nearly the same in both.
+    #[test]
+    fn aligned_binning_keeps_a_hard_edge_free_of_colour() {
+        let img = Rgb32f::from_fn(24, 24, |_, y| if y < 9 { [0.02; 3] } else { [0.8; 3] });
+        let raw = raw_from(&mosaic_from_rgb(&img, &Cfa::bayer("RGGB").unwrap()), 0.0, 16383.0);
+        let plain = raw.develop_binned_masked(2, 0.99).unwrap().unwrap().0;
+        let aligned = raw.develop_binned_masked_aligned(2, 0.99).unwrap().unwrap().0;
+        let spread = |i: &Rgb32f| (i.get(5, 4)[2] - i.get(5, 4)[0]).abs();
+        assert!(spread(&plain) > 0.7, "{:?}", plain.get(5, 4));
+        assert!(spread(&aligned) < 0.6 * spread(&plain), "{:?}", aligned.get(5, 4));
+        // away from the edge nothing moves
+        assert_eq!(aligned.get(5, 1), plain.get(5, 1));
+        assert_eq!(aligned.get(5, 9), plain.get(5, 9));
     }
 
     #[test]

@@ -846,6 +846,8 @@ fn load_bytes_now(
         let bin = bin_factor(&raw, max_edge);
         // (binned: block means, and which colours had a clipped sample in each block)
         let binned = match bin {
+            // process V9 (`rebuild_of`): the colour planes on the block centres, as a full-size render has them
+            Some(k) if options.highlight_headroom => raw.develop_binned_masked_aligned(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
             Some(k) => raw.develop_binned_masked(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
             None => None,
         };

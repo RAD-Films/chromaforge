@@ -91,6 +91,16 @@ const COLOUR_FADE: (f32, f32) = (1.4, 1.6);
 /// How far above its clip, in stops, a rebuilt channel lies before [`COLOUR_FADE`] applies in full, so that a pixel
 /// just clipped still continues its unclipped neighbours.
 const COLOUR_FADE_ONSET: f32 = 0.15;
+/// With [`Rebuild::rim_hue`], a partly clipped pixel's brightness follows its surviving channels instead of what the rim's
+/// colour implies: at most the fully clipped level, less this many stops per stop that its lowest unclipped channel lies
+/// below clip. The rim of a sky implies far too much light in a cloud in front of it, which capped every pixel there at
+/// the same level, with the cloud's shape left in its red channel. Measured on Lightroom Classic exports.
+const LEVEL_SLOPE: f32 = 0.5;
+/// Stops below clip over which a partly clipped pixel's brightness joins the fully clipped level.
+const LEVEL_TO_FULL: f32 = 0.25;
+/// Share of the neutral level its unclipped channels imply that a clipped channel is lifted to in [`own_colour`]. Measured:
+/// below 0.8 the clip's own level rules (pink clouds), 1.0 turns those clouds green.
+const OWN_LEVEL: f32 = 0.95;
 /// From this share of its clip, a channel counts as clipped for the magenta exception in the colour fade.
 const MAGENTA_CLIP_LO: f32 = 0.95;
 
@@ -352,6 +362,24 @@ fn rebuild(p: [f32; 3], q: [f32; 3], cl: [bool; 3], r: [f32; 3], clip: f32, max_
     Some(std::array::from_fn(|c| if cl[c] { q[c].max(sum * r[c]) } else { q[c] }))
 }
 
+/// A partly clipped pixel's own colour, as far as it has one: its unclipped channels as they are, its clipped ones lifted
+/// to [`OWN_LEVEL`] of the level of neutral the unclipped channels imply. A clipped channel's sensor value only bounds it
+/// from below: left there, a green-clipped grey cloud turned pink. Follows [`bound`], so nothing changes where a channel
+/// clips.
+fn own_colour(p: [f32; 3], q: [f32; 3], cl: [bool; 3], clip: f32, white: [f32; 3]) -> [f32; 3] {
+    let (mut sum, mut weight) = (0f32, 0f32);
+    for c in 0..3 {
+        let b = bound(p, cl, clip, c);
+        sum += (1.0 - b) * q[c] / white[c].max(1e-3);
+        weight += 1.0 - b;
+    }
+    if weight <= 1e-6 {
+        return q;
+    }
+    let level = OWN_LEVEL * sum / weight;
+    std::array::from_fn(|c| q[c] + (white[c] * level - q[c]).max(0.0) * bound(p, cl, clip, c))
+}
+
 /// Reconstruct partially clipped channels, with a neutral that is neutral in camera RGB. See
 /// [`reconstruct_with`].
 pub fn reconstruct(img: &mut Rgb32f, wb: [f32; 3], clip: f32) -> usize {
@@ -561,7 +589,8 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             let local = match (local, rim_colour) {
                 (Some(a), Some(rc)) => {
                     let o = OWN_HUE_MAX * smoothstep(OWN_HUE.0, OWN_HUE.1, contradiction(p, q, cl, rc, clip));
-                    Some(std::array::from_fn(|c| a[c] + (q[c] - a[c]) * o))
+                    let own = own_colour(p, q, cl, clip, white);
+                    Some(std::array::from_fn(|c| a[c] + (own[c] - a[c]) * o))
                 }
                 (l, _) => l,
             };
@@ -599,10 +628,13 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 let at_clip = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(MAGENTA_CLIP_LO, 1.0, p[c] / clip) });
                 let magenta = at_clip[0].min(at_clip[2]) * (1.0 - at_clip[1]);
                 let t = (1.0 - keep) * smoothstep(0.0, COLOUR_FADE_ONSET, if left { above } else { 1.0 }) * (1.0 - magenta);
+                let stops = if left { below } else { 0.0 };
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
-                let v = level + (full - level) * t_level;
-                out = std::array::from_fn(|c| white[c] * v + (out[c] - white[c] * level) * (1.0 - t));
+                let lv = level.min(full * (-LEVEL_SLOPE * stops).exp2());
+                let v = lv + (full - lv) * (1.0 - smoothstep(0.0, LEVEL_TO_FULL, stops));
+                let scale = if level > 1e-9 { (lv / level).min(1.0) } else { 1.0 };
+                out = std::array::from_fn(|c| white[c] * v + (out[c] - white[c] * level) * (1.0 - t) * scale);
             } else if t_colour > 0.0 {
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
@@ -984,6 +1016,32 @@ mod tests {
         let row: Vec<[f32; 3]> = (0..128).map(|x| chroma(balanced(img.get(x, 48)))).collect();
         let step = row.windows(2).map(|w| (0..3).map(|c| (w[1][c] - w[0][c]).abs()).fold(0.0f32, f32::max)).fold(0.0f32, f32::max);
         assert!(step <= 0.006, "chroma steps by {step}");
+    }
+
+    /// A cloud in front of a sky, its green and blue clipped, its shape only in the red channel: the rebuilt brightness
+    /// follows the red. The rim's colour alone implied more than the fully clipped level everywhere, a flat white front.
+    #[test]
+    fn with_rim_hue_a_cloud_front_keeps_the_shape_of_its_surviving_channel() {
+        let red = |x: usize| 0.55 + 0.42 * x as f32 / 127.0;
+        let mut img = Rgb32f::from_fn(128, 64, |x, y| if y < 16 { [0.18, 0.93, 0.7] } else { [red(x), 1.0, 1.0] });
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let bright = |x: usize| {
+            let p = balanced(img.get(x, 48));
+            p[0] + p[1] + p[2]
+        };
+        for (a, b) in [(20, 60), (60, 100), (100, 124)] {
+            assert!(bright(b) > 1.015 * bright(a), "brightness at {a} {} and {b} {}", bright(a), bright(b));
+        }
+    }
+
+    /// A grey cloud with green clipped: green's sensor value is only a lower bound, so its own colour lifts green to the
+    /// level red and blue imply, instead of leaving it at the clip below them (pink cloud undersides on 6732).
+    #[test]
+    fn own_colour_lifts_a_clipped_channel_to_the_level_of_the_others() {
+        let (p, q) = ([0.6, 1.0, 0.77], [1.2, 1.0, 1.15]);
+        let own = own_colour(p, q, [false, true, false], 0.99, [1.0; 3]);
+        assert!(own[1] > 1.1, "green stays at {}", own[1]);
+        assert_eq!((own[0], own[2]), (q[0], q[2]), "the unclipped channels change: {own:?}");
     }
 
     /// The 6719 cyan blob: a green-clipped sky beside a bright teal surface turned cyan where the rebuild borrowed
