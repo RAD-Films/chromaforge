@@ -96,6 +96,14 @@ const COLOUR_FADE_ONSET: f32 = 0.15;
 /// below clip. The rim of a sky implies far too much light in a cloud in front of it, which capped every pixel there at
 /// the same level, with the cloud's shape left in its red channel. Measured on Lightroom Classic exports.
 const LEVEL_SLOPE: f32 = 0.5;
+/// Over this many stops below clip the last unclipped channel stops needing [`COLOUR_FADE_ONSET`]: a pixel about to clip
+/// fully goes to the clipped neutral whatever its rebuilt channels do. Without it, warm light whose red clips last kept
+/// its colour right up to the clip and jumped to neutral in one pixel.
+const COLOUR_FADE_LAST: f32 = 0.1;
+/// How far red and green of a warm pixel with both at clip come together as its colour fades. They clip at levels the
+/// white balance sets apart, so left alone warm light goes too red at the clip (hue 59–66°, Lightroom Classic 77–84° on
+/// an R5 C frame; 80–90° at this share).
+const WARM_CONVERGE: f32 = 0.4;
 /// Stops below clip over which a partly clipped pixel's brightness joins the fully clipped level.
 const LEVEL_TO_FULL: f32 = 0.25;
 /// Share of the neutral level its unclipped channels imply that a clipped channel is lifted to in [`own_colour`]. Measured:
@@ -360,6 +368,17 @@ fn rebuild(p: [f32; 3], q: [f32; 3], cl: [bool; 3], r: [f32; 3], clip: f32, max_
     let top = r[0].max(r[1]).max(r[2]).max(1e-3);
     let sum = (sum / k as f32).max(near_clip.max(floor).min(max_level / top));
     Some(std::array::from_fn(|c| if cl[c] { q[c].max(sum * r[c]) } else { q[c] }))
+}
+
+/// `out` with red and green moved `share` of the way to their mean, where red (relative to `white`) is the higher.
+fn warm_converged(mut out: [f32; 3], white: [f32; 3], share: f32) -> [f32; 3] {
+    let (r, g) = (out[0] / white[0].max(1e-3), out[1] / white[1].max(1e-3));
+    if r > g {
+        let (w, mean) = (share.clamp(0.0, 1.0), 0.5 * (r + g));
+        out[0] = white[0] * (r + (mean - r) * w);
+        out[1] = white[1] * (g + (mean - g) * w);
+    }
+    out
 }
 
 /// A partly clipped pixel's own colour, as far as it has one: its unclipped channels as they are, its clipped ones lifted
@@ -627,7 +646,10 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 // patches kept their hue within 1 degree without the fade and lost all chroma with it
                 let at_clip = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(MAGENTA_CLIP_LO, 1.0, p[c] / clip) });
                 let magenta = at_clip[0].min(at_clip[2]) * (1.0 - at_clip[1]);
-                let t = (1.0 - keep) * smoothstep(0.0, COLOUR_FADE_ONSET, if left { above } else { 1.0 }) * (1.0 - magenta);
+                let onset = smoothstep(0.0, COLOUR_FADE_ONSET, if left { above } else { 1.0 });
+                let last = 1.0 - smoothstep(0.0, COLOUR_FADE_LAST, if left { below } else { 0.0 });
+                let t = (1.0 - keep) * (onset + (1.0 - onset) * last) * (1.0 - magenta);
+                out = warm_converged(out, white, WARM_CONVERGE * t * (1.0 - side) * bound(p, cl, clip, 0) * bound(p, cl, clip, 1));
                 let stops = if left { below } else { 0.0 };
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
@@ -1042,6 +1064,38 @@ mod tests {
         let own = own_colour(p, q, [false, true, false], 0.99, [1.0; 3]);
         assert!(own[1] > 1.1, "green stays at {}", own[1]);
         assert_eq!((own[0], own[2]), (q[0], q[2]), "the unclipped channels change: {own:?}");
+    }
+
+    /// Red moves down and green up by the same amount, and only when red is the higher, so nothing changes where they cross.
+    #[test]
+    fn warm_converged_brings_red_and_green_together() {
+        let got = warm_converged([2.0, 1.0, 0.5], [1.0; 3], 0.4);
+        assert!((got[0] - 1.8).abs() < 1e-5 && (got[1] - 1.2).abs() < 1e-5 && got[2] == 0.5, "{got:?}");
+        assert_eq!(warm_converged([1.0, 2.0, 0.5], [1.0; 3], 0.4), [1.0, 2.0, 0.5]);
+    }
+
+    /// With every channel order and rim colour, nothing jumps where the last channel clips: all that's left is the
+    /// neutral, reached smoothly. Warm light whose red clips last jumped by 0.105 of chroma in one pixel.
+    #[test]
+    fn with_rim_hue_nothing_steps_where_the_last_channel_clips() {
+        for last in 0..3usize {
+            for rim in [[0.18f32, 0.55, 0.5], [0.5, 0.3, 0.12], [0.2, 0.2, 0.2]] {
+                let mut img = Rgb32f::from_fn(256, 64, |x, y| {
+                    if y < 16 {
+                        rim
+                    } else {
+                        let mut p = [1.0f32; 3];
+                        p[last] = 0.8 + 0.3 * x as f32 / 255.0;
+                        p
+                    }
+                });
+                reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+                let row: Vec<[f32; 3]> = (0..256).map(|x| chroma(balanced(img.get(x, 48)))).collect();
+                let step = row.windows(2).map(|w| (0..3).map(|c| (w[1][c] - w[0][c]).abs()).fold(0.0f32, f32::max)).fold(0.0f32, f32::max);
+                assert!(step <= 0.02, "last {last}, rim {rim:?}: chroma steps by {step}");
+                assert!(row[255].iter().all(|c| (c - 1.0 / 3.0).abs() < 1e-3), "last {last}, rim {rim:?}: ends at {:?}", row[255]);
+            }
+        }
     }
 
     /// The 6719 cyan blob: a green-clipped sky beside a bright teal surface turned cyan where the rebuild borrowed
