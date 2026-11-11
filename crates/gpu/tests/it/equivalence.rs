@@ -2317,7 +2317,7 @@ fn v9_prophoto_floor_matches() {
     .unwrap()
     .under_default_curve();
     let req = RenderRequest::fit(w, h);
-    let plain = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve.clone()), ..Default::default() };
+    let plain = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
     let tables = SourceInfo { camera_tone: Some(curve), ..deferred_tables_source(1.0) };
     for (name, info) in [("matrix", &plain), ("tables", &tables)] {
         let mut s = DevelopSettings::for_raw(5500.0, 0.0);
