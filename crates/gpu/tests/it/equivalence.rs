@@ -66,7 +66,8 @@ fn camera_tone_and_relative_wb() {
 }
 
 /// Process V9 tones a raw under a profile without a tone curve with Lightroom Classic's base curve on each linear
-/// ProPhoto channel (`FinishParams::tone_per_channel`): the kernel must follow it.
+/// ProPhoto channel (`FinishParams::tone_per_channel`), the middle channel kept in its place between the other two and
+/// each channel clipped at the output: the kernel must follow it (exposure +1.5 takes bright colours past the range).
 #[test]
 fn v9_lrc_base_tone_per_channel() {
     if !gpu() {

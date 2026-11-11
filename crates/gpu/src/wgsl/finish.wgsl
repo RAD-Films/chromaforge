@@ -1215,7 +1215,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var d = vec3<f32>(0.0);
     if (pu(F_TONE_PC) != 0u) {
         let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
-        d = mul3(mat_at(F_TONE_PC_FROM), vec3<f32>(tone_apply(q.x), tone_apply(q.y), tone_apply(q.z)));
+        d = mul3(mat_at(F_TONE_PC_FROM), tone_keeping_hue(q));
         o = lum2020(d);
     } else {
         let yl = lum2020(c);
@@ -1234,7 +1234,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pu(F_TOP_SHOULDER) != 0u) {
         let moved = top_shoulder(d, c, o, peak);
         d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
-    } else {
+    } else if (pu(F_TONE_PC) == 0u) {
+        // (toned per channel: clipped per channel at the output instead)
         d = over_range(d, o, peak);
     }
 
@@ -1331,6 +1332,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         r = mul3(mat_at(F_PROOF_OUT), keep_hue_in_gamut(q0, gamut_apply(q0, py, tq, peak), py, peak));
     } else {
         r = mul3(mat_at(F_OUT_M), d);
+        if (pu(F_TONE_PC) != 0u) {
+            r = clamp(r, vec3<f32>(0.0), vec3<f32>(peak));
+        }
     }
     let oy = vec3<f32>(pf(F_OUT_Y), pf(F_OUT_Y + 1u), pf(F_OUT_Y + 2u));
     let tg = gamut_scale(r, oy, peak);
@@ -1511,6 +1515,34 @@ const HUE_FADE_EV: f32 = 0.5;
 // `finish::TOP_SHOULDER`
 const TOP_SHOULDER: vec4<f32> = vec4<f32>(0.7, 1.5, 0.6, 1.0);
 const TOP_SHOULDER_SCENE: vec2<f32> = vec2<f32>(0.9, 1.4);
+
+// `finish::tone_keeping_hue`: the brightest and darkest channel take the tone curve, the middle one keeps its place
+fn tone_keeping_hue(p: vec3<f32>) -> vec3<f32> {
+    var t = vec3<f32>(tone_apply(p.x), tone_apply(p.y), tone_apply(p.z));
+    var hi = 2u;
+    if (p.x >= p.y && p.x >= p.z) {
+        hi = 0u;
+    } else if (p.y >= p.z) {
+        hi = 1u;
+    }
+    var lo = 2u;
+    if (p.x < p.y && p.x < p.z) {
+        lo = 0u;
+    } else if (p.y < p.z) {
+        lo = 1u;
+    }
+    if (hi == lo) {
+        return t;
+    }
+    let mid = 3u - hi - lo;
+    let a = p[lo];
+    let b = p[hi];
+    if (b > a) {
+        let share = clamp((p[mid] - a) / (b - a), 0.0, 1.0);
+        t[mid] = t[lo] + (t[hi] - t[lo]) * share;
+    }
+    return t;
+}
 
 // `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V9)
 fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
