@@ -82,16 +82,17 @@ const AGREE: (f32, f32) = (0.15, 0.4);
 /// shows it.
 const PALE: (f32, f32) = (0.2, 0.4);
 
-/// With [`Rebuild::rim_hue`], how much of its colour a pixel with two channels clipped gives up for neutral at its
-/// level: `.0` when cool (blue over red), `.1` when warm. Rebuilt in their rim's colour alone, white cloud cores beside
-/// a blue sky took the sky's blue at twice the chroma Lightroom Classic shows (b* −22 against −10 at Highlights −100),
-/// and a lit bench its wood's yellow at 1.5 times (66 against 43). A small coloured object keeping its own colour
-/// ([`OWN_HUE`]) keeps it.
-const TWO_CLIPPED_FADE: (f32, f32) = (0.5, 0.25);
-/// The fade sets in as a pixel's second channel rises from this share of its clip to the clip, so nothing jumps where
-/// it clips and pixels with one channel clipped keep their colour. Only pairs with green fade: on chart brackets under
-/// magenta light, patches with red and blue clipped kept their hue within 1° without the fade and lost all chroma with it.
-const SECOND_CLIP_LO: f32 = 0.95;
+/// With [`Rebuild::rim_hue`], a partly clipped pixel's colour fades toward the clipped neutral as its lowest unclipped
+/// channel nears its clip: none of it is left at the clip, all of it from this many stops below, `.0` when that channel
+/// is red (a blue sky), `.1` when it is blue or green (warm surfaces). Measured on Lightroom Classic exports of our own
+/// frames, by stops below clip. One law for one, two or three clipped channels, so nothing changes where another
+/// channel clips: a fade that started at the second clip drew a contour across skies.
+const COLOUR_FADE: (f32, f32) = (1.4, 1.6);
+/// How far above its clip, in stops, a rebuilt channel lies before [`COLOUR_FADE`] applies in full, so that a pixel
+/// just clipped still continues its unclipped neighbours.
+const COLOUR_FADE_ONSET: f32 = 0.15;
+/// From this share of its clip, a channel counts as clipped for the magenta exception in the colour fade.
+const MAGENTA_CLIP_LO: f32 = 0.95;
 
 /// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
 /// `OWN_HUE.0` to `OWN_HUE.1` stops (a small coloured object inside a pale clipped area, such as orange roof caps
@@ -557,11 +558,9 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             };
             let local = (trust > 0.0).then(|| rebuild(p, q, cl, borrowed, clip, max_level)).flatten().map(past_rim);
             // a small coloured object in a pale clipped area keeps part of its own colour ([`OWN_HUE`])
-            let mut own = 0.0f32;
             let local = match (local, rim_colour) {
                 (Some(a), Some(rc)) => {
                     let o = OWN_HUE_MAX * smoothstep(OWN_HUE.0, OWN_HUE.1, contradiction(p, q, cl, rc, clip));
-                    own = o / OWN_HUE_MAX;
                     Some(std::array::from_fn(|c| a[c] + (q[c] - a[c]) * o))
                 }
                 (l, _) => l,
@@ -590,24 +589,25 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
             let saturation = if hi > 0.0 && hi.is_finite() { 1.0 - lo.max(0.0) / hi } else { 1.0 };
             let start = 0.5 * smoothstep(PALE.0, PALE.1, saturation);
             let (t_level, t_colour) = (smoothstep(0.5, 1.0, way), smoothstep(start, start + 0.5, way));
-            if t_colour > 0.0 {
+            if rim_hue {
+                let side = smoothstep(-0.25, 0.25, (p[2].max(1e-6) / p[0].max(1e-6)).log2());
+                let width = COLOUR_FADE.1 + (COLOUR_FADE.0 - COLOUR_FADE.1) * side;
+                let left = lowest < clip;
+                let keep = smoothstep(0.0, width, if left { below } else { 0.0 });
+                // red and blue clipped with green well below (magenta light) keep their colour: on chart brackets those
+                // patches kept their hue within 1 degree without the fade and lost all chroma with it
+                let at_clip = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(MAGENTA_CLIP_LO, 1.0, p[c] / clip) });
+                let magenta = at_clip[0].min(at_clip[2]) * (1.0 - at_clip[1]);
+                let t = (1.0 - keep) * smoothstep(0.0, COLOUR_FADE_ONSET, if left { above } else { 1.0 }) * (1.0 - magenta);
+                let level = (out[0] + out[1] + out[2]) / total;
+                let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
+                let v = level + (full - level) * t_level;
+                out = std::array::from_fn(|c| white[c] * v + (out[c] - white[c] * level) * (1.0 - t));
+            } else if t_colour > 0.0 {
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
                 let v = level + (full - level) * t_level;
                 out = std::array::from_fn(|c| out[c] + (white[c] * v - out[c]) * t_colour);
-            }
-            // a pixel with two channels clipped keeps only part of its rim's colour ([`TWO_CLIPPED_FADE`]), fading in as
-            // its second channel nears its clip so that nothing jumps where it clips
-            if rim_hue {
-                // only pairs with green: red and blue clipped together (magenta light) keep their colour
-                let b = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(SECOND_CLIP_LO, 1.0, p[c] / clip) });
-                let pair = b[1].min(b[0].max(b[2]));
-                let u = [out[0] / white[0], out[1] / white[1], out[2] / white[2]];
-                let warm = smoothstep(0.0, 0.2, (u[0] - u[2]) / (u[0] + u[2]).max(1e-9));
-                let fade = TWO_CLIPPED_FADE.0 + (TWO_CLIPPED_FADE.1 - TWO_CLIPPED_FADE.0) * warm;
-                let k = fade * pair * (1.0 - own);
-                let level = (out[0] + out[1] + out[2]) / total;
-                out = std::array::from_fn(|c| out[c] + (white[c] * level - out[c]) * k);
             }
             *px = [out[0] / wb[0], out[1] / wb[1], out[2] / wb[2]];
         }
@@ -971,6 +971,19 @@ mod tests {
         let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
         let (got, want) = (away(balanced(img.get(32, 32))), away(rim));
         assert!(got >= 0.8 * want, "chroma {got} against the rim's {want}");
+    }
+
+    /// A sky with green clipped and blue rising through its own clip: with [`Rebuild::rim_hue`] the colour depends on
+    /// how far the lowest unclipped channel lies below its clip, so nothing changes where the second channel clips. A
+    /// fade that started there drew a contour across skies (6719 and 6732 at Highlights −100).
+    #[test]
+    fn with_rim_hue_nothing_steps_where_a_second_channel_clips() {
+        let blue = |x: usize| 0.75 + 0.5 * x as f32 / 127.0;
+        let mut img = Rgb32f::from_fn(128, 64, |x, y| if y < 16 { [0.18, 0.55, 0.5] } else { [0.3, 1.0, blue(x).min(1.0)] });
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let row: Vec<[f32; 3]> = (0..128).map(|x| chroma(balanced(img.get(x, 48)))).collect();
+        let step = row.windows(2).map(|w| (0..3).map(|c| (w[1][c] - w[0][c]).abs()).fold(0.0f32, f32::max)).fold(0.0f32, f32::max);
+        assert!(step <= 0.006, "chroma steps by {step}");
     }
 
     /// The 6719 cyan blob: a green-clipped sky beside a bright teal surface turned cyan where the rebuild borrowed
