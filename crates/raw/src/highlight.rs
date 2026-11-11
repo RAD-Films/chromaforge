@@ -107,9 +107,10 @@ const WARM_CONVERGE: f32 = 0.4;
 /// With red and green both clipped and blue below them, red's excess over green (relative to the white) is set to this
 /// many times green's over blue, so the pixel keeps one warm hue however far blue lies below its clip. Left to the rim
 /// colour and the fade, a pale one came out with red at green (hue 100–117°, an olive band around warm highlights) and a
-/// rich one too red; Lightroom Classic shows 77–85° on R5 C frames of both bodies. Chosen on four frames of one body
-/// (77–83° at 1.3), checked on four of the other (72–82°).
-const WARM_RED: f32 = 1.3;
+/// rich one too red; Lightroom Classic shows 77–85° on R5 C frames of both bodies. With the middle channel toned in
+/// its place (the V9 tone under a profile without a curve), 1.0 gives the hue Lightroom Classic shows: within 1° on
+/// nine frames of one body, where it was chosen, and 1–3° on ten of the other (1.3 gave 6–12° too red).
+const WARM_RED: f32 = 1.0;
 /// Stops below clip over which a partly clipped pixel's brightness joins the fully clipped level.
 const LEVEL_TO_FULL: f32 = 0.25;
 /// Share of the neutral level its unclipped channels imply that a clipped channel is lifted to in [`own_colour`]. Measured:
