@@ -10,6 +10,12 @@
 //!    ([`super::Method::Ahd`], processes V1-V8). [`super::Method::AhdBlend`] (process V9) blends the two by how far
 //!    apart their sums are (see [`BLEND`]), so a clear edge still takes one candidate.
 //!
+//! [`super::Method::AhdBlend`] also knows clipped samples: within [`REACH`] of one, every interpolated channel stays
+//! within the range of its colour's samples around the pixel ([`CLIP`]). A clipped sample reads lower than the
+//! light was, so a colour difference taken against it (red minus a green interpolated from clipped greens) is far
+//! too negative or too positive, and the next pixel's colour went past anything its samples allow: black specks on
+//! a lamp's bright rim (a channel below zero) and neon green-cyan pixels where branches cross a white sky.
+//!
 //! Work is done in overlapping tiles (bounded memory, rayon-parallel), one band of tiles at a time written
 //! straight into the output. Each step runs only where the tile's output depends on it: the choice reads the
 //! homogeneity 1 pixel around the tile, which reads Lab 2 pixels around, the candidates read the greens 3
@@ -26,10 +32,22 @@ const MARGIN: usize = 6;
 /// which sum is larger, and picking outright turned the noise into short horizontal and vertical strokes (a maze,
 /// coloured where white balance is strong). 12 keeps the PSNR of the outright pick on the edge tests.
 const BLEND: f32 = 12.0;
+/// A sample at or above this share of the file's white level counts as clipped. The mosaic is normalised to its white
+/// level per colour site ([`crate::RawImage::normalized`]: 1.0 for every channel), so one level serves every colour.
+/// The same share as the highlight rebuild's clip.
+const CLIP: f32 = 0.99;
+/// How far (px) a clipped sample reaches into the two candidates: the directional greens read the mosaic 2 px away,
+/// and the colour differences read the greens 1 px away.
+const REACH: usize = 3;
 
 /// `blend`: blend the two candidates where their homogeneity sums are close ([`BLEND`], process V9's
 /// [`super::Method::AhdBlend`]); false: the more homogeneous one outright, the average on ties (V1-V8).
 pub(crate) fn ahd(m: &Mosaic, blend: bool) -> Rgb32f {
+    ahd_with(m, blend, blend)
+}
+
+/// [`ahd`], with the candidates kept within their samples' range near clipped ones (`clip_aware`) or not.
+fn ahd_with(m: &Mosaic, blend: bool, clip_aware: bool) -> Rgb32f {
     let (w, h) = (m.w, m.h);
     let mut out = Rgb32f::new(w, h);
     if w == 0 || h == 0 {
@@ -42,7 +60,7 @@ pub(crate) fn ahd(m: &Mosaic, blend: bool) -> Rgb32f {
             .into_par_iter()
             .map(|tx| {
                 let (x0, tw) = (tx * TILE, TILE.min(w - tx * TILE));
-                (x0, tw, tile(m, x0, y0, tw, th, blend))
+                (x0, tw, tile(m, x0, y0, tw, th, blend, clip_aware))
             })
             .collect();
         for (x0, tw, px) in tiles {
@@ -82,7 +100,7 @@ fn cube_root(t: f32) -> f32 {
     y
 }
 
-fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool) -> Vec<[f32; 3]> {
+fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, clip_aware: bool) -> Vec<[f32; 3]> {
     let (bw, bh) = (tw + 2 * MARGIN, th + 2 * MARGIN);
     let n = bw * bh;
     let (ox, oy) = (x0 as isize - MARGIN as isize, y0 as isize - MARGIN as isize);
@@ -107,6 +125,8 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool) -> 
     }
     // flat indices of the pixels `d` or more from the buffer's edge, row by row
     let inner = |d: usize| (d..bh - d).flat_map(move |y| y * bw + d..y * bw + bw - d);
+    // process V9: the pixels whose candidates read a clipped sample (none in a tile without one)
+    let near = if clip_aware { near_clipped(&mos, bw, bh) } else { None };
     // 1. directional greens
     let mut gh = vec![0f32; n];
     let mut gv = vec![0f32; n];
@@ -141,6 +161,10 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool) -> 
             } else {
                 let p = set([0.0, gvv, 0.0], own, mos[i]);
                 set(p, 2 - own, gvv + (d(i - bw - 1) + d(i - bw + 1) + d(i + bw - 1) + d(i + bw + 1)) * 0.25)
+            };
+            let p = match &near {
+                Some(near) if near[i] => within_samples(p, own, &mos, &col, i, bw),
+                _ => p,
             };
             rgb[i] = p;
             lab_of[i] = lab(p);
@@ -200,6 +224,55 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool) -> 
     out
 }
 
+/// Which pixels of a `bw × bh` tile buffer have a clipped sample ([`CLIP`]) within [`REACH`] (a square), or `None`
+/// when the tile has no clipped sample.
+fn near_clipped(mos: &[f32], bw: usize, bh: usize) -> Option<Vec<bool>> {
+    if !mos.iter().any(|&v| v >= CLIP) {
+        return None;
+    }
+    let clipped: Vec<bool> = mos.iter().map(|&v| v >= CLIP).collect();
+    let mut rows = vec![false; mos.len()];
+    for (src, dst) in clipped.chunks_exact(bw).zip(rows.chunks_exact_mut(bw)) {
+        for (x, d) in dst.iter_mut().enumerate() {
+            *d = src.get(x.saturating_sub(REACH)..(x + REACH + 1).min(bw)).is_some_and(|s| s.contains(&true));
+        }
+    }
+    let mut near = vec![false; mos.len()];
+    for y in 0..bh {
+        for x in 0..bw {
+            let hit = (y.saturating_sub(REACH)..(y + REACH + 1).min(bh)).any(|yy| rows.get(yy * bw + x).copied().unwrap_or(false));
+            if let Some(n) = near.get_mut(y * bw + x) {
+                *n = hit;
+            }
+        }
+    }
+    Some(near)
+}
+
+/// `p` (the candidate at flat index `i` of the tile buffer, whose own colour is `own`) with each interpolated channel
+/// kept within the range of that colour's samples among the 8 neighbours.
+fn within_samples(mut p: [f32; 3], own: u8, mos: &[f32], col: &[u8], i: usize, bw: usize) -> [f32; 3] {
+    let around = [i - bw - 1, i - bw, i - bw + 1, i - 1, i + 1, i + bw - 1, i + bw, i + bw + 1];
+    for c in 0..3u8 {
+        if c == own {
+            continue;
+        }
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &j in &around {
+            if col.get(j) == Some(&c)
+                && let Some(&v) = mos.get(j)
+            {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        if let Some(v) = p.get_mut(c as usize) {
+            *v = super::clamp_between(*v, lo, hi);
+        }
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::cube_root;
@@ -219,5 +292,98 @@ mod tests {
         }
         assert_eq!(cube_root(1.0), 1.0);
         assert_eq!(cube_root(8.0), 2.0);
+    }
+
+    use super::super::{Mosaic, mosaic_from_rgb};
+    use super::{CLIP, ahd_with};
+    use crate::{Cfa, Rgb32f};
+
+    /// Branches and a lamp's rim against a light 4 stops over white: a dark textured scene with a bright disc and
+    /// thin dark bars crossing it, its colour varying, at `peak` × white for the bright parts (clipped to 1.0 in the
+    /// mosaic, as a sensor does).
+    fn branches(peak: f32) -> (Rgb32f, Cfa) {
+        let (w, h) = (96usize, 80usize);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32, y as f32);
+            let disc = (fx - 48.0).powi(2) + (fy - 40.0).powi(2) < 28.0f32.powi(2);
+            let bar = (x + y / 2) % 13 < 2 || (x * 3 + y) % 17 == 0;
+            if disc && !bar {
+                [peak * 0.9, peak, peak * 0.7]
+            } else {
+                let t = 0.5 + 0.5 * ((fx * 0.37).sin() * (fy * 0.23).cos());
+                [0.08 + 0.3 * t, 0.12 + 0.1 * t, 0.03 + 0.05 * (1.0 - t)]
+            }
+        });
+        let img = Rgb32f { data: img.data.iter().map(|p| p.map(|v| v.min(1.0))).collect(), ..img };
+        (img, Cfa::bayer("RGGB").unwrap())
+    }
+
+    /// The largest amount by which a pixel's interpolated channel lies outside its colour's 8 neighbouring samples,
+    /// over pixels within reach of a clipped sample (and their count).
+    fn overshoot(out: &Rgb32f, mos: &[f32], cfa: &Cfa, w: usize, h: usize) -> (f32, usize) {
+        let (mut worst, mut n) = (0f32, 0usize);
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                let near = (y - 2..=y + 2).any(|yy| (x - 2..=x + 2).any(|xx| mos[yy * w + xx] >= CLIP));
+                if !near {
+                    continue;
+                }
+                n += 1;
+                for c in 0..3u8 {
+                    if cfa.color_at(x, y) == c {
+                        continue;
+                    }
+                    let s: Vec<f32> = (y - 1..=y + 1)
+                        .flat_map(|yy| (x - 1..=x + 1).map(move |xx| (xx, yy)))
+                        .filter(|&(xx, yy)| (xx, yy) != (x, y) && cfa.color_at(xx, yy) == c)
+                        .map(|(xx, yy)| mos[yy * w + xx])
+                        .collect();
+                    let (lo, hi) = s.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+                    let v = out.get(x, y)[c as usize];
+                    worst = worst.max(lo - v).max(v - hi);
+                }
+            }
+        }
+        (worst, n)
+    }
+
+    /// Process V9: next to clipped samples no interpolated channel goes past its colour's samples around it (plain AHD
+    /// does here: a black speck or a neon pixel), and every pixel out of their reach is exactly plain AHD's.
+    #[test]
+    fn near_clipped_samples_the_colours_stay_within_their_samples() {
+        let (img, cfa) = branches(16.0);
+        let n = mosaic_from_rgb(&img, &cfa);
+        let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+        let (plain, aware) = (ahd_with(&m, true, false), ahd_with(&m, true, true));
+        let (before, count) = overshoot(&plain, &n.data, &cfa, n.width, n.height);
+        let (after, _) = overshoot(&aware, &n.data, &cfa, n.width, n.height);
+        assert!(count > 500, "{count} pixels near clip");
+        assert!(before > 0.05, "plain AHD overshoots its samples here: {before}");
+        assert!(after <= 1e-6, "clip-aware: {after}");
+        assert!(aware.data.iter().all(|p| p.iter().all(|v| v.is_finite() && *v >= 0.0)));
+        // out of reach (the candidates' 3 px and the homogeneity's 3 more): plain AHD, bit for bit
+        let (w, h) = (n.width, n.height);
+        let mut far = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let reach =
+                    (y.saturating_sub(6)..(y + 7).min(h)).any(|yy| (x.saturating_sub(6)..(x + 7).min(w)).any(|xx| n.data[yy * w + xx] >= CLIP));
+                if !reach {
+                    far += 1;
+                    assert_eq!(aware.get(x, y), plain.get(x, y), "({x}, {y})");
+                }
+            }
+        }
+        assert!(far > 500, "{far} pixels out of reach");
+    }
+
+    /// A frame without a clipped sample develops exactly as plain AHD.
+    #[test]
+    fn an_unclipped_frame_is_unchanged() {
+        let (img, cfa) = branches(0.95);
+        let n = mosaic_from_rgb(&img, &cfa);
+        assert!(n.data.iter().all(|&v| v < CLIP));
+        let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+        assert_eq!(ahd_with(&m, true, true).data, ahd_with(&m, true, false).data);
     }
 }
