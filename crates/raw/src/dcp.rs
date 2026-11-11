@@ -158,6 +158,9 @@ pub struct Calibrated {
     pub make: String,
     /// Every name the camera goes by, as "make model" (profile-model form, see [`matches`]).
     pub names: Vec<String>,
+    /// The lens model (Exif `LensModel`) the calibration is for; `None`: every lens (issue #1015). A photo takes its
+    /// own lens's calibration, else the lens-less one, never another lens's ([`calibrated_for_lens`]).
+    pub lens: Option<String>,
     /// `(cal:<id>, profile)`: each look as every process renders it.
     pub looks: Vec<(String, Arc<Dcp>)>,
     /// `(cal:<id>, first process number, profile)`: a look's entries for newer processes only
@@ -236,11 +239,13 @@ fn calibrated_registry() -> &'static RwLock<Vec<Arc<Calibrated>>> {
 
 /// Install the calibrated cameras. Calibrations for the same camera (fitted to different editors) pool their looks;
 /// a look id seen again is replaced by the later one, and the first default given stays the default.
+/// Calibrations for different lenses of one camera stay apart.
 pub fn install_calibrated(list: Vec<Calibrated>) {
     let mut out: Vec<Calibrated> = Vec::new();
     for c in list {
         let first = c.names.first().map(|n| key(n));
-        match out.iter_mut().find(|x| x.names.first().map(|n| key(n)) == first) {
+        let lens = c.lens.as_deref().map(lens_key);
+        match out.iter_mut().find(|x| x.names.first().map(|n| key(n)) == first && x.lens.as_deref().map(lens_key) == lens) {
             Some(x) => {
                 for name in c.names {
                     if !x.names.iter().any(|n| key(n) == key(&name)) {
@@ -274,14 +279,41 @@ pub fn calibrated() -> Vec<Arc<Calibrated>> {
     calibrated_registry().read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// The calibration for a camera (Exif make and model): one of its names [`matches`] the camera.
+/// A lens model compared without case and runs of white space.
+fn lens_key(lens: &str) -> String {
+    lens.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether two lens models (Exif `LensModel`) name the same lens: equal without case and runs of white space, and
+/// not empty.
+pub fn same_lens(a: &str, b: &str) -> bool {
+    let a = lens_key(a);
+    !a.is_empty() && a == lens_key(b)
+}
+
+/// Among the calibrations `fits` accepts, the one for `lens` (a photo's Exif lens model), else the lens-less one;
+/// never one for another lens.
+fn pick_calibrated(fits: impl Fn(&Calibrated) -> bool, lens: Option<&str>) -> Option<Arc<Calibrated>> {
+    let reg = calibrated_registry().read().unwrap_or_else(PoisonError::into_inner);
+    let own = lens.and_then(|l| reg.iter().find(|c| c.lens.as_deref().is_some_and(|x| same_lens(x, l)) && fits(c)));
+    own.or_else(|| reg.iter().find(|c| c.lens.is_none() && fits(c))).cloned()
+}
+
+/// The lens-less calibration for a camera (Exif make and model): one of its names [`matches`] the camera. Photos
+/// whose lens is known use [`calibrated_for_lens`].
 pub fn calibrated_for(make: Option<&str>, model: &str) -> Option<Arc<Calibrated>> {
-    calibrated_registry().read().unwrap_or_else(PoisonError::into_inner).iter().find(|c| c.names.iter().any(|n| matches(n, make, model))).cloned()
+    calibrated_for_lens(make, model, None)
+}
+
+/// The calibration for a camera (Exif make and model) and a photo's lens (Exif lens model): that lens's own, else
+/// the camera's lens-less one, never another lens's (issue #1015).
+pub fn calibrated_for_lens(make: Option<&str>, model: &str, lens: Option<&str>) -> Option<Arc<Calibrated>> {
+    pick_calibrated(|c| c.names.iter().any(|n| matches(n, make, model)), lens)
 }
 
 /// [`calibrated_for`] for a camera written as one string (see [`covers_camera`]).
 pub fn calibrated_for_camera(camera: &str) -> Option<Arc<Calibrated>> {
-    calibrated_registry().read().unwrap_or_else(PoisonError::into_inner).iter().find(|c| c.names.iter().any(|n| covers_model(n, camera))).cloned()
+    pick_calibrated(|c| c.names.iter().any(|n| covers_model(n, camera)), None)
 }
 
 /// Whether some installed calibration has a look with id `id` (`cal:…`).
@@ -327,23 +359,23 @@ fn user_default_for(make: Option<&str>, model: &str) -> Option<String> {
 
 /// [`resolve`] for a choice without falling back to the camera's default: a gone or foreign
 /// profile id simply leaves the app's own colour (this is the person's own choice).
-fn choice_direct(choice: &str, make: Option<&str>, model: &str) -> Option<Arc<Dcp>> {
+fn choice_direct(choice: &str, make: Option<&str>, model: &str, lens: Option<&str>) -> Option<Arc<Dcp>> {
     match choice {
         "lc" | "" => None,
         c if c.starts_with("dcp:") => library_get(c).filter(|d| matches(&d.model, make, model)),
-        c if c.starts_with("cal:") => calibrated_for(make, model).and_then(|cal| cal.looks.iter().find(|(id, _)| id == c).map(|(_, d)| d.clone())),
+        c if c.starts_with("cal:") => look_of(calibrated_for_lens(make, model, lens), c),
         _ => None,
     }
 }
 
 /// A camera's default profile: the person's choice ([`user_default_for`]) when one is set, else
 /// the person's own `.dcp` ([`for_camera`]), else its calibration's default look.
-fn default_for(make: Option<&str>, model: &str) -> Option<Arc<Dcp>> {
+fn default_for(make: Option<&str>, model: &str, lens: Option<&str>) -> Option<Arc<Dcp>> {
     if let Some(choice) = user_default_for(make, model) {
-        return choice_direct(&choice, make, model);
+        return choice_direct(&choice, make, model, lens);
     }
     for_camera(make, model).or_else(|| {
-        let c = calibrated_for(make, model)?;
+        let c = calibrated_for_lens(make, model, lens)?;
         let id = c.default.as_ref()?;
         c.looks.iter().find(|(i, _)| i == id).map(|(_, d)| d.clone())
     })
@@ -354,26 +386,37 @@ fn default_for(make: Option<&str>, model: &str) -> Option<Arc<Dcp>> {
 /// is for this camera; `cal:<id>` that calibrated look of this camera's calibration; anything else
 /// (empty, or a profile that is gone or for another camera) the camera's default: the person's own
 /// `.dcp` ([`for_camera`]), else its calibration's first look. The decoder and the catalog both decide through this.
+/// The lens is unknown here: only lens-less calibrations serve ([`resolve_lens`] for a photo whose lens is known).
 pub fn resolve(choice: &str, make: Option<&str>, model: &str) -> Option<Arc<Dcp>> {
+    resolve_lens(choice, make, model, None)
+}
+
+/// [`resolve`] for a photo taken with `lens` (its Exif lens model): calibrated looks come from that lens's
+/// calibration when there is one, else the camera's lens-less one (issue #1015).
+pub fn resolve_lens(choice: &str, make: Option<&str>, model: &str, lens: Option<&str>) -> Option<Arc<Dcp>> {
     match choice {
         "lc" => None,
-        c if c.starts_with("dcp:") => library_get(c).filter(|d| matches(&d.model, make, model)).or_else(|| default_for(make, model)),
-        c if c.starts_with("cal:") => calibrated_for(make, model)
-            .and_then(|cal| cal.looks.iter().find(|(id, _)| id == c).map(|(_, d)| d.clone()))
-            .or_else(|| default_for(make, model)),
-        _ => default_for(make, model),
+        c if c.starts_with("dcp:") => library_get(c).filter(|d| matches(&d.model, make, model)).or_else(|| default_for(make, model, lens)),
+        c if c.starts_with("cal:") => look_of(calibrated_for_lens(make, model, lens), c).or_else(|| default_for(make, model, lens)),
+        _ => default_for(make, model, lens),
     }
 }
 
-/// [`resolve`] for a photo on process `process` (its number): when the profile [`resolve`] picks is a calibrated
-/// look with entries for newer processes ([`Calibrated::gated`]), the one with the highest first process up to
-/// `process`; otherwise what [`resolve`] picks. With no gated entries installed this is [`resolve`] exactly.
-pub fn resolve_at(choice: &str, make: Option<&str>, model: &str, process: u32) -> Option<Arc<Dcp>> {
-    let picked = resolve(choice, make, model)?;
-    let Some(cal) = calibrated_for(make, model).filter(|c| !c.gated.is_empty()) else { return Some(picked) };
+/// [`resolve_lens`] for a photo on process `process` (its number): when the profile [`resolve_lens`] picks is a
+/// calibrated look with entries for newer processes ([`Calibrated::gated`]), the one with the highest first process
+/// up to `process`; otherwise what [`resolve_lens`] picks. With no gated entries installed this is [`resolve_lens`]
+/// exactly.
+pub fn resolve_at(choice: &str, make: Option<&str>, model: &str, lens: Option<&str>, process: u32) -> Option<Arc<Dcp>> {
+    let picked = resolve_lens(choice, make, model, lens)?;
+    let Some(cal) = calibrated_for_lens(make, model, lens).filter(|c| !c.gated.is_empty()) else { return Some(picked) };
     let Some(id) = cal.looks.iter().find(|(_, d)| Arc::ptr_eq(d, &picked)).map(|(i, _)| i.clone()) else { return Some(picked) };
     let newer = cal.gated.iter().filter(|(i, since, _)| *i == id && *since <= process).max_by_key(|(_, since, _)| *since);
     Some(newer.map_or(picked, |(_, _, d)| d.clone()))
+}
+
+/// The look with id `id` of a calibration.
+fn look_of(cal: Option<Arc<Calibrated>>, id: &str) -> Option<Arc<Dcp>> {
+    cal?.looks.iter().find(|(i, _)| i == id).map(|(_, d)| d.clone())
 }
 
 /// [`resolve`] for a camera written as one string (see [`covers_camera`]).
@@ -620,6 +663,7 @@ mod tests {
         install_calibrated(vec![Calibrated {
             make: "CALCAM".into(),
             names,
+            lens: None,
             looks: vec![("cal:a".into(), look("A")), ("cal:b".into(), look("B"))],
             gated: Vec::new(),
             default: Some("cal:a".into()),
@@ -646,6 +690,7 @@ mod tests {
         let other = |names: Vec<String>, id: &str, name: &str| Calibrated {
             make: "CALCAM".into(),
             names,
+            lens: None,
             looks: vec![(id.into(), look(name))],
             gated: Vec::new(),
             default: None,
@@ -654,6 +699,7 @@ mod tests {
             Calibrated {
                 make: "CALCAM".into(),
                 names: vec!["CALCAM ONE".into()],
+                lens: None,
                 looks: vec![("cal:a".into(), look("A"))],
                 gated: Vec::new(),
                 default: Some("cal:a".into()),
@@ -670,26 +716,61 @@ mod tests {
 
         // a look's entry for newer processes reaches only photos on them; without one, resolve_at is resolve
         let (model, make) = ("CALCAM ONE", Some("CALCAM"));
-        assert!(Arc::ptr_eq(&resolve_at("", make, model, 99).unwrap(), &resolve("", make, model).unwrap()));
+        assert!(Arc::ptr_eq(&resolve_at("", make, model, None, 99).unwrap(), &resolve("", make, model).unwrap()));
         install_calibrated(vec![Calibrated {
             make: "CALCAM".into(),
             names: vec!["CALCAM ONE".into()],
+            lens: None,
             looks: vec![("cal:a".into(), look("A")), ("cal:b".into(), look("B"))],
             gated: vec![("cal:a".into(), 8, look("A8")), ("cal:a".into(), 10, look("A10")), ("cal:b".into(), 9, look("B9"))],
             default: Some("cal:a".into()),
         }]);
         assert_eq!(resolve("", make, model).unwrap().name, "A", "without a process the look is as every process has it");
-        assert_eq!(resolve_at("", make, model, 7).unwrap().name, "A");
-        assert_eq!(resolve_at("", make, model, 8).unwrap().name, "A8");
-        assert_eq!(resolve_at("", make, model, 9).unwrap().name, "A8");
-        assert_eq!(resolve_at("", make, model, 12).unwrap().name, "A10", "the newest entry the process allows");
-        assert_eq!(resolve_at("cal:b", make, model, 8).unwrap().name, "B");
-        assert_eq!(resolve_at("cal:b", make, model, 9).unwrap().name, "B9");
-        assert!(resolve_at("lc", make, model, 9).is_none());
+        assert_eq!(resolve_at("", make, model, None, 7).unwrap().name, "A");
+        assert_eq!(resolve_at("", make, model, None, 8).unwrap().name, "A8");
+        assert_eq!(resolve_at("", make, model, None, 9).unwrap().name, "A8");
+        assert_eq!(resolve_at("", make, model, None, 12).unwrap().name, "A10", "the newest entry the process allows");
+        assert_eq!(resolve_at("cal:b", make, model, None, 8).unwrap().name, "B");
+        assert_eq!(resolve_at("cal:b", make, model, None, 9).unwrap().name, "B9");
+        assert!(resolve_at("lc", make, model, None, 9).is_none());
         assert_eq!(calibrated_for(make, model).unwrap().looks.len(), 2, "gated entries are not looks of their own");
         assert!(!calibrated_look_exists("cal:a8"));
         install_calibrated(Vec::new());
         assert!(!covers_camera(cam));
+
+        // calibrations per lens (issue #1015): a photo takes its lens's own, else the lens-less one, never another
+        // lens's; lens-specific ones stay apart from the lens-less one when installed
+        let lensed = |lens: Option<&str>, name: &str| Calibrated {
+            make: "LENSCAM".into(),
+            names: vec!["LENSCAM ONE".into()],
+            lens: lens.map(str::to_string),
+            looks: vec![("cal:adobe-color".into(), look(name))],
+            gated: Vec::new(),
+            default: Some("cal:adobe-color".into()),
+        };
+        install_calibrated(vec![lensed(Some("Wide 24mm"), "Wide"), lensed(None, "Any"), lensed(Some("Ultra 14mm"), "Ultra")]);
+        let (mk, md) = (Some("LENSCAM CORP"), "ONE");
+        let name = |choice: &str, lens: Option<&str>| resolve_lens(choice, mk, md, lens).map(|d| d.name.clone());
+        assert_eq!(name("", Some("Wide 24mm")).as_deref(), Some("Wide"));
+        assert_eq!(name("cal:adobe-color", Some("ULTRA  14mm")).as_deref(), Some("Ultra"));
+        assert_eq!(name("", Some("Tele 70mm")).as_deref(), Some("Any"));
+        assert_eq!(name("", None).as_deref(), Some("Any"));
+        assert_eq!(resolve("", mk, md).map(|d| d.name.clone()).as_deref(), Some("Any"));
+        assert_eq!(calibrated().len(), 3, "different lenses are not pooled");
+        install_calibrated(vec![lensed(Some("Wide 24mm"), "Wide")]);
+        assert!(name("", Some("Ultra 14mm")).is_none(), "another lens's calibration never serves");
+        assert!(name("", None).is_none());
+        // a process-gated entry belongs to its lens's calibration
+        let mut wide = lensed(Some("Wide 24mm"), "Wide");
+        wide.gated = vec![("cal:adobe-color".into(), 9, look("Wide9"))];
+        install_calibrated(vec![wide, lensed(None, "Any")]);
+        let at = |lens: Option<&str>, process: u32| resolve_at("", mk, md, lens, process).map(|d| d.name.clone());
+        assert_eq!(at(Some("Wide 24mm"), 8).as_deref(), Some("Wide"));
+        assert_eq!(at(Some("Wide 24mm"), 9).as_deref(), Some("Wide9"));
+        assert_eq!(at(None, 9).as_deref(), Some("Any"), "the lens-less calibration has no such entry");
+        install_calibrated(vec![lensed(Some("Wide 24mm"), "Wide")]);
+        assert!(!same_lens("", "") && same_lens("A  b", "a B"));
+        install_calibrated(Vec::new());
 
         // the person's default choice (issue #723) outranks the camera's active `.dcp` and its
         // calibration's default look; `lc` means the app's own colour even when a `.dcp` is

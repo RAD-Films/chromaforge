@@ -20,7 +20,7 @@ fn licence_line(m: &Value) -> String {
     let spdx = m["licence"]["spdx"].as_str().unwrap_or("");
     let summary = m["licence"]["summary"].as_str().unwrap_or("");
     match (spdx.is_empty(), summary.is_empty()) {
-        (false, false) => format!("{} ({spdx}) — {}", tr("Licence"), tr(summary)),
+        (false, false) => format!("{} ({spdx}): {}", tr("Licence"), tr(summary)),
         (false, true) => format!("{}: {spdx}", tr("Licence")),
         (true, false) => tr(summary).into(),
         (true, true) => String::new(),
@@ -104,7 +104,7 @@ pub fn models_section(app: &mut LccApp, ui: &mut egui::Ui, t: &Tokens) {
     let downloads = cached_downloads(app, &ctx);
     crate::dialog_frame::group_begin(ui, Some("Semantic search"));
     ui.label(tr(
-        "Searches the library by description (for example “moody studio portraits”) using image-text embeddings computed in the background.",
+        "Searches the catalog by description (for example “moody studio portraits”) using image-text embeddings computed in the background.",
     ));
     let mut enabled = status["enabled"].as_bool() == Some(true);
     if check(ui, "mlEnable", &mut enabled, "Index photos in the background for natural-language search") {
@@ -115,7 +115,12 @@ pub fn models_section(app: &mut LccApp, ui: &mut egui::Ui, t: &Tokens) {
     if enabled && list["selected"].is_string() {
         let indexed = status["indexedPhotos"].as_u64().unwrap_or(0);
         let unindexed = status["unindexedPhotos"].as_u64().unwrap_or(0);
-        let text = if unindexed == 0 { tr_format!("{indexed} indexed") } else { tr_format!("{indexed} indexed, {unindexed} remaining") };
+        // named as arguments: a translated arm can't capture the caller's variables
+        let text = if unindexed == 0 {
+            tr_format!("{indexed} indexed", indexed = indexed)
+        } else {
+            tr_format!("{indexed} indexed, {unindexed} remaining", indexed = indexed, unindexed = unindexed)
+        };
         ui.label(RichText::new(text).font(t.font(11.5)).color(t.text_dim));
     }
     for m in &models {

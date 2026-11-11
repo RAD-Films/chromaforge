@@ -21,21 +21,47 @@ pub mod catalog_ui;
 pub mod chart_profile;
 pub mod color_readout;
 mod command_error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod comments_ui;
+/// Review Comments needs the publish services, which the browser build doesn't have.
+#[cfg(target_arch = "wasm32")]
+pub mod comments_ui {
+    use serde_json::Value;
+
+    pub const OPEN: &str = "dialog.reviewComments";
+    pub const COMMANDS: &[crate::menus::UiCommand] = &[(OPEN, "Review Comments", None, "")];
+
+    #[derive(Default)]
+    pub struct View;
+
+    pub fn enabled(_: &crate::LccApp, id: &str) -> Option<bool> {
+        (id == OPEN).then_some(false)
+    }
+
+    pub fn run(_: &mut crate::LccApp, id: &str, _: &Value) -> Option<Result<Value, String>> {
+        (id == OPEN).then(|| Err("publish services are not available in the browser".to_string()))
+    }
+
+    pub fn show(_: &mut crate::LccApp, _: &egui::Context) {}
+}
 pub mod control;
 pub mod creations_ui;
 pub mod credits;
 pub mod cull_toast;
 pub mod date_picker;
 pub mod dialog_frame;
+pub mod dng_update_task;
 pub mod docking;
 mod drop_overlay;
 mod edit_in;
+pub mod email_photo;
 mod enhance_pump;
 pub mod enhance_ui;
 pub mod export_module;
 pub mod export_task;
 pub mod eye_strip;
 pub mod eyedropper;
+pub mod face_menu;
 mod focus_scan;
 pub mod folder_poll;
 mod frame_rate;
@@ -54,9 +80,11 @@ pub mod lightroom_destination;
 pub mod lightroom_import;
 pub mod links;
 pub mod loupe_timing;
+pub mod lrc_menus;
 pub mod machine_test;
 pub mod map;
 mod mask_thumbs;
+mod menu_choices;
 pub mod menu_level;
 pub mod menubar;
 pub mod menus;
@@ -69,6 +97,7 @@ mod modern_menu;
 pub mod modern_sheets;
 pub mod module;
 pub mod motion;
+pub mod overlay;
 pub mod panels;
 pub mod pick;
 pub mod plate;
@@ -98,16 +127,21 @@ pub mod surface_icons;
 pub mod surface_plugin;
 pub mod sync;
 pub mod tasks;
+pub mod template_browser;
 pub mod text_field;
 pub mod theme;
 pub mod timelapse_ui;
 pub mod titlebar;
 pub mod video_ui;
 pub mod video_view;
+pub mod view_state;
 pub mod web_module;
+pub mod web_templates;
 pub mod widgets;
 pub mod window_place;
 
+#[cfg(test)]
+mod i18n_scan;
 #[cfg(test)]
 mod tests_access;
 #[cfg(test)]
@@ -236,12 +270,16 @@ mod tests_histogram_modes;
 mod tests_hover_pointer;
 #[cfg(test)]
 mod tests_i18n_coverage;
+#[cfg(test)]
+mod tests_i18n_sweep;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_immich_ui;
 #[cfg(test)]
 mod tests_import_body_profiles;
 #[cfg(test)]
 mod tests_import_drives;
+#[cfg(test)]
+mod tests_import_loupe;
 #[cfg(test)]
 mod tests_import_metadata_preset;
 #[cfg(test)]
@@ -287,6 +325,8 @@ mod tests_lightroom_destination;
 #[cfg(test)]
 mod tests_loading_cell;
 #[cfg(test)]
+mod tests_lrc_menus;
+#[cfg(test)]
 mod tests_mask_effects;
 #[cfg(test)]
 mod tests_mask_landing;
@@ -302,6 +342,8 @@ mod tests_mask_tree;
 mod tests_masking;
 #[cfg(test)]
 mod tests_masking_layout;
+#[cfg(test)]
+mod tests_menu_toggles;
 #[cfg(test)]
 mod tests_menubar;
 #[cfg(test)]
@@ -416,6 +458,8 @@ mod tests_tool_row;
 mod tests_unsaved;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_update;
+#[cfg(test)]
+mod tests_view_state;
 #[cfg(test)]
 mod tests_viewperf;
 #[cfg(test)]
@@ -800,6 +844,11 @@ pub struct LccApp {
     pub(crate) pending_picks: Vec<pick::Pending>,
     /// The camera roll being listed for `file.addCameraRoll` (`camera_roll::poll`).
     pub(crate) pending_camera_roll: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// The watched camera roll's listing in flight (`camera_roll::watch_tick`), apart from
+    /// [`Self::pending_camera_roll`] so the watch and the review never fight over one.
+    pub(crate) pending_camera_roll_watch: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// When the watch last listed the roll, and for which library: a new library lists at once.
+    pub(crate) camera_roll_watch_at: Option<(web_time::Instant, std::sync::Arc<()>)>,
     /// Modifiers announced for synthetic input (held from a button down to its release).
     synthetic_mods: egui::Modifiers,
     /// Clear `synthetic_mods` on the next frame.
@@ -825,6 +874,8 @@ pub struct LccApp {
     /// Scroll offsets (points) of the photo grid (vertical) and the filmstrip (horizontal) as
     /// drawn last (`ui.inspect` → `scroll`).
     pub grid_scroll: Option<f32>,
+    /// Per-photo zoom memory and the mirror mode's pointer rects ([`view_state`]).
+    pub view_state: view_state::ViewState,
     pub film_scroll: Option<f32>,
     /// Widget registry from the last frame (automation ids → rects).
     pub widgets: Vec<(String, egui::Rect)>,
@@ -893,6 +944,8 @@ pub struct LccApp {
     pub import: Option<import::ImportTask>,
     /// The last import's XMP warnings (File ▸ More Imports ▸ Import Warnings…).
     pub import_report: Option<import_report::Report>,
+    /// Library ▸ Review Comments.
+    pub review_comments: comments_ui::View,
     /// A folder scan in progress (feeds the import review).
     pub scan: Option<import::ScanTask>,
     /// A Synchronize Folder scan in progress (feeds its dialog).
@@ -922,6 +975,8 @@ pub struct LccApp {
     /// A background Photo ▸ Render to DNG in progress, and the last one's result.
     pub render_dng: Option<render_dng_task::RenderDngTask>,
     pub last_render_dng: Option<serde_json::Value>,
+    pub dng_update: Option<dng_update_task::DngUpdateTask>,
+    pub last_dng_update: Option<serde_json::Value>,
     /// Background file-system work of other commands (Find Missing Photos, auto import…).
     pub tasks: tasks::Tasks,
     /// Create Camera Profile from Color Chart: its photos and last report.
@@ -1157,6 +1212,8 @@ impl LccApp {
             copied: None,
             pending_picks: vec![],
             pending_camera_roll: None,
+            pending_camera_roll_watch: None,
+            camera_roll_watch_at: None,
             synthetic_mods: egui::Modifiers::NONE,
             synthetic_mods_release: false,
             nav_buttons: vec![],
@@ -1170,6 +1227,7 @@ impl LccApp {
             image_rect: None,
             right_panel_rect: None,
             grid_scroll: None,
+            view_state: Default::default(),
             film_scroll: None,
             widgets: vec![],
             gesture: None,
@@ -1200,6 +1258,7 @@ impl LccApp {
             enhance: enhance_ui::EnhanceUi::default(),
             import: None,
             import_report: None,
+            review_comments: comments_ui::View::default(),
             scan: None,
             sync: None,
             sync_owns_changes: false,
@@ -1215,6 +1274,8 @@ impl LccApp {
             export: None,
             render_dng: None,
             last_render_dng: None,
+            dng_update: None,
+            last_dng_update: None,
             tasks: Default::default(),
             chart_profile: Default::default(),
             last_export_result: None,
@@ -1470,14 +1531,14 @@ impl LccApp {
             // These commands finish synchronously, so their completion would otherwise
             // be invisible once the activity stack is gone. Never show success on error.
             let completed = match id {
-                "library.compact" => Some(format!("✓ {}", i18n::tr("Compact Library"))),
+                "library.compact" => Some(format!("✓ {}", i18n::tr("Optimize Catalog"))),
                 // from File ▸ Libraries or Library Settings
-                "catalog.backup" => r.as_ref().ok().map(|v| format!("{} {}", i18n::tr("Library backed up to"), v["backup"].as_str().unwrap_or(""))),
+                "catalog.backup" => r.as_ref().ok().map(|v| format!("{} {}", i18n::tr("Catalog backed up to"), v["backup"].as_str().unwrap_or(""))),
                 "catalog.checkIntegrity" if r.as_ref().is_ok_and(|v| v["ok"] == true) => {
-                    Some(i18n::tr("The library passed the integrity test").to_string())
+                    Some(i18n::tr("The catalog passed the integrity test").to_string())
                 }
-                "catalog.checkIntegrity" => Some(i18n::tr("The library failed the integrity test: back it up and optimise it").to_string()),
-                "catalog.optimize" => Some(i18n::tr("Library optimised").to_string()),
+                "catalog.checkIntegrity" => Some(i18n::tr("The catalog failed the integrity test: back it up and optimize it").to_string()),
+                "catalog.optimize" => Some(i18n::tr("Catalog optimized").to_string()),
                 "library.clearPreviews" => Some(format!("✓ {}", i18n::tr("Discard Preview Cache"))),
                 "develop.autoSync" => Some(format!("{}: {}", i18n::tr("Auto Sync"), i18n::tr(if self.session.auto_sync { "On" } else { "Off" }))),
                 _ => None,
@@ -1529,7 +1590,11 @@ impl LccApp {
             }
             Ok(v) if matches!(id, "faces.detect" | "faces.clearAndRescan") && v["done"] == false => {
                 let n = v["photos"].as_u64().unwrap_or(0);
-                self.ui.status = if n == 1 { "Detecting faces…".to_string() } else { format!("Detecting faces in {n} photos…") };
+                self.ui.status = if n == 1 {
+                    crate::i18n::tr("Detecting faces…").to_string()
+                } else {
+                    crate::i18n::tr_format!("Detecting faces in {n} photos…", n = n)
+                };
             }
             Ok(v) if id == "faces.detect" => self.ui.status = detect_summary(v),
             Ok(v) if id == "faces.renamePerson" => {
@@ -1653,7 +1718,7 @@ impl LccApp {
                 let t = ctx.input(|i| i.time);
                 self.ui.show_toast((
                     crate::i18n::tr_format!(
-                        "{n} change{} saved in memory but not written to disk: {e} — {app} will retry",
+                        "{n} change{} saved in memory but not written to disk: {e}. {app} will retry",
                         if n == 1 { "" } else { "s" },
                         n = n,
                         e = e
@@ -1664,7 +1729,7 @@ impl LccApp {
             }
             (None, true) => {
                 self.ui.unsaved_seen = false;
-                self.toast(ctx, crate::i18n::tr("Library saved"));
+                self.toast(ctx, crate::i18n::tr("Catalog saved"));
             }
             (Some(_), true) => ctx.request_repaint_after(std::time::Duration::from_secs(2)), // retry
             (None, false) => {}
@@ -1793,7 +1858,12 @@ impl LccApp {
         if lcc_engine::segment::Segmenter::AVAILABLE && e.kind == ErrorKind::ModelMissing(AiModel::Sam3) {
             self.offer_sam_download(then);
         } else if lcc_engine::segment::Segmenter::AVAILABLE
-            && matches!(e.kind, ErrorKind::ModelMissing(AiModel::Sam2 | AiModel::Describe | AiModel::People | AiModel::FaceDetector))
+            && matches!(
+                e.kind,
+                ErrorKind::ModelMissing(
+                    AiModel::Sam2 | AiModel::Describe | AiModel::People | AiModel::FaceDetector | AiModel::Scene | AiModel::Depth
+                )
+            )
         {
             // SAM 2.1 was chosen for Object masks, Describe needs the open models, or Retouch needs the MediaPipe models: their downloads are in the
             // AI Models dialog
@@ -2203,6 +2273,7 @@ impl LccApp {
             self.drain_control(ctx);
             self.drain_midi(ctx);
             surface::tick(self, ctx);
+            view_state::track(self);
         }
         self.apply_settings(ctx);
         // input this frame: batch work leaves the editing card to the interface for a moment
@@ -2243,6 +2314,7 @@ impl LccApp {
             }
         }
         folder_poll::tick(self, ctx, focused && !self.ui.was_focused);
+        camera_roll::watch_tick(self, ctx, focused && !self.ui.was_focused);
         if let Some(url) = self.pending_link.take() {
             folder_poll::follow_link(self, ctx, &url);
         }
@@ -2250,11 +2322,11 @@ impl LccApp {
         // auto import: list the watched folder every few seconds (on a worker thread: it may be on
         // a network share), then import what's new like any import (also on a worker thread)
         // a folder that couldn't be read stops being one once another is watched (or none)
-        if self.ui.auto_import_error.as_ref().is_some_and(|(f, _)| self.session.import_defaults.auto_folder.as_ref() != Some(f)) {
+        if self.ui.auto_import_error.as_ref().is_some_and(|(f, _)| self.session.import_defaults.auto_active_folder() != Some(f)) {
             self.ui.auto_import_error = None;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(folder) = self.session.import_defaults.auto_folder.clone() {
+        if let Some(folder) = self.session.import_defaults.auto_active_folder().cloned() {
             const LABEL: &str = "Auto Import";
             let now = ctx.input(|i| i.time);
             if now - self.ui.auto_import_at >= 3.0
@@ -2264,11 +2336,14 @@ impl LccApp {
                 && !self.tasks.is_running(LABEL)
             {
                 self.ui.auto_import_at = now;
-                let listed = folder.clone();
-                let work = move || lcc_engine::cmd::library::list_auto_import_folder(&listed);
+                let scope = self.session.auto_import_scope();
+                let work = move || match scope {
+                    Some(scope) => scope.list(),
+                    None => Ok(Vec::new()),
+                };
                 let done = move |app: &mut LccApp, _ctx: &egui::Context, listing: Result<Vec<(String, u64)>, String>| {
                     // the watched folder changed while this one was listed: its result is for nothing on screen
-                    if app.session.import_defaults.auto_folder.as_ref() != Some(&folder) {
+                    if app.session.import_defaults.auto_active_folder() != Some(&folder) {
                         return;
                     }
                     let listing = match listing {
@@ -2410,7 +2485,7 @@ impl LccApp {
         if !drop.presets.is_empty() {
             // presets live in a library: with none open they would go with the session it replaces
             if panels::library_problem::holds_drops(self) {
-                self.toast(ctx, crate::i18n::tr("Open a library first, then drop the presets again"));
+                self.toast(ctx, crate::i18n::tr("Open a catalog first, then drop the presets again"));
             } else {
                 let _ = self.run("file.importPresets", serde_json::json!({"paths": drop.presets}));
             }
@@ -2617,6 +2692,7 @@ impl LccApp {
         self.take_nav_buttons(raw);
         drop_space_repeats(raw);
         modern::after_input(self, raw);
+        view_state::mirror_input(self, raw);
     }
 
     /// Take the mouse's Back / Forward button events (`Extra1` / `Extra2`) out of `raw` and keep
@@ -2804,13 +2880,17 @@ impl LccApp {
             Err(e) => log::warn!("store: {e}"),
         }
         if n > 0 {
-            let msg = crate::i18n::tr_format!("{n} presets from your other libraries were added.", n = n);
+            let msg = crate::i18n::tr_format!("{n} presets from your other catalogs were added.", n = n);
             self.toast(ctx, msg);
         }
         // an older install's presets (the app under an earlier name, on this computer) join too, once
         // each, with no step of the user's: File ▸ More Imports ▸ Import Presets from Older Installs
         // asks again
-        // (its camera profiles too, bound to the bodies the older install started with them)
+        // (its camera profiles too, bound to the bodies the older install started with them).
+        // No older install on this computer: nothing to ask, and no error at startup (issue #965).
+        if lcc_engine::app_store::older_install_stores().is_empty() {
+            return;
+        }
         if let Ok(r) = self.run("store.importOlderInstalls", serde_json::json!({})) {
             let sum = |key: &str| -> u64 { r["merged"].as_array().into_iter().flatten().map(|m| m[key].as_u64().unwrap_or(0)).sum() };
             let (n, m) = (sum("presets"), sum("cameraProfiles"));
@@ -2829,7 +2909,7 @@ impl LccApp {
     /// "<app> — <library name>" (just "<app>" for a library that isn't saved).
     pub fn window_title(&self) -> String {
         match panels::settings::open_library_name(self) {
-            Some(name) => format!("{} — {name}", lcc_brand::DISPLAY_NAME),
+            Some(name) => format!("{}: {name}", lcc_brand::DISPLAY_NAME),
             None => lcc_brand::DISPLAY_NAME.to_string(),
         }
     }
@@ -2841,7 +2921,7 @@ impl LccApp {
     pub fn page_title(&self, unsaved: bool) -> String {
         let dot = if unsaved { " •" } else { "" };
         match self.session.active().and_then(|id| self.session.catalog.photo(id)) {
-            Some(p) => format!("{}{dot} — {}", p.file_name, lcc_brand::DISPLAY_NAME),
+            Some(p) => format!("{}{dot}: {}", p.file_name, lcc_brand::DISPLAY_NAME),
             None => format!("{}{dot}", self.window_title()),
         }
     }
@@ -2934,6 +3014,7 @@ impl LccApp {
         panels::second::show(self, &ctx);
         panels::notices::show(self, &ctx);
         import_report::show(self, &ctx);
+        comments_ui::show(self, &ctx);
         panels::dialogs::show(self, &ctx);
         catalog_ui::show(self, &ctx);
         plate::show_setup(self, &ctx);
@@ -2945,6 +3026,7 @@ impl LccApp {
         #[cfg(not(target_arch = "wasm32"))]
         panels::plugins::poll(self, &ctx);
         render_dng_task::poll(self, &ctx);
+        dng_update_task::poll(self, &ctx);
         machine_test::poll(self, &ctx);
         slideshow_export::poll(self, &ctx);
         panels::activity::show(self, &ctx);

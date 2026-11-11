@@ -13,7 +13,10 @@ use crate::LccApp;
 #[path = "keymap_classic.rs"]
 mod classic;
 pub(crate) use classic::tab_bound;
-pub use classic::{CLASSIC, KeymapSet, active_set, choose_set, default_in, export_file, import_file, import_value, keymap_file, set_active};
+pub use classic::{
+    CLASSIC, KeymapSet, active_set, choose_set, classic_extra_keys, default_in, export_file, import_file, import_value, keymap_file, module_keys_of,
+    set_active,
+};
 
 /// The user's changes to the keymap: command id → shortcut (`""` = no shortcut). Saved with the
 /// app settings (`ui.json`); commands not listed keep their declared shortcut.
@@ -42,7 +45,8 @@ pub fn bindable() -> &'static [Bindable] {
     let fixed = FIXED.get_or_init(|| {
         let mut v: Vec<Bindable> = Vec::new();
         for (id, label, sc, _) in crate::menus::ui_commands() {
-            if !v.iter().any(|b| b.id == *id) {
+            // a greyed "Coming soon" menu item can't take a key: it never runs
+            if !v.iter().any(|b| b.id == *id) && !crate::lrc_menus::is_coming_soon(id) {
                 v.push(Bindable { id, label, default: *sc });
             }
         }
@@ -157,8 +161,14 @@ pub fn shortcut_of<'a>(keymap: &'a Keymap, id: &str) -> Option<&'a str> {
 
 /// Engine commands that intentionally share a key and are disambiguated by context in [`handle`]:
 /// the X pair by the Crop panel, A by whether it is open (Visualize Spots everywhere, the aspect
-/// lock under the Crop panel).
-pub const CONTEXTUAL: &[(&str, &str)] = &[("photo.reject", "crop.rotateAspect"), ("view.visualizeSpots", "crop.lockAspect")];
+/// lock under the Crop panel), Shift+O by whether a face is chosen (Edit Name, else the crop overlay), ⌥⌘R by the
+/// module (Refine Photos in the Library, Reset Crop elsewhere).
+pub const CONTEXTUAL: &[(&str, &str)] = &[
+    ("photo.reject", "crop.rotateAspect"),
+    ("view.visualizeSpots", "crop.lockAspect"),
+    ("view.cropOverlay", "face.editName"),
+    ("library.refine", "crop.reset"),
+];
 
 /// Commands other than `id` whose shortcut is the key `sc` (contextual partners excepted).
 pub fn conflicts(keymap: &Keymap, id: &str, sc: &str) -> Vec<&'static str> {
@@ -593,6 +603,7 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context) {
         // an unmodified H no assignment has claimed (the Masking panel's pin toggle, below)
         h_press = matches(i, Modifiers::NONE, Key::H) && !native("H") && !taken.contains(&(Modifiers::NONE, Key::H));
         classic::module_key_presses(i, module_keys, keymap, &mut consumed, &mut aliased);
+        classic::module_key_presses(i, classic_extra_keys(), keymap, &mut consumed, &mut aliased);
         // Enter opens the active grid photo; widgets, popups and custom bindings keep the key.
         if grid
             && app.session.active().is_some()
@@ -899,6 +910,11 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context) {
                 }
                 continue;
             }
+            // ⌥⌘R is Refine Photos in the Library and Reset Crop in the other modules
+            if (f == "library.refine") != (app.ui.module == crate::module::ModuleId::Library) && matches!(f.as_str(), "library.refine" | "crop.reset")
+            {
+                continue;
+            }
             // X is both reject (library) and swap crop aspect (crop tool). When both bindings fire,
             // swap once: twice would put the crop straight back (issue #1866).
             if f == "photo.reject" && app.ui.right == crate::state::RightPanel::Crop {
@@ -924,9 +940,16 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context) {
             if f == "crop.lockAspect" && app.ui.right != crate::state::RightPanel::Crop {
                 continue;
             }
-            // / refreshes the selected spot's source in the Remove tool (the filmstrip elsewhere)
-            if f == "view.filmstrip" && app.ui.right == crate::state::RightPanel::Remove && app.session.active_spot.is_some() {
+            // / refreshes the selected spot's source in the Remove tool (Deselect Active Photo elsewhere)
+            if f == "library.deselectActive" && app.ui.right == crate::state::RightPanel::Remove && app.session.active_spot.is_some() {
                 let _ = app.run("spot.refreshSource", json!({}));
+                continue;
+            }
+            // Shift+O is Edit Name while a face is chosen (Photo > People), the overlay cycle otherwise
+            if f == "face.editName" && !crate::menus::ui_enabled(app, "face.editName") {
+                continue;
+            }
+            if f == "view.cropOverlay" && crate::menus::ui_enabled(app, "face.editName") {
                 continue;
             }
             // Shift+O cycles the mask overlay colour while masking (the crop overlay elsewhere)

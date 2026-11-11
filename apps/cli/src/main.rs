@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 
 /// `--help` text; `{cli}`, `{bin}`, `{app}` and `{P}` are filled by [`usage`].
 const USAGE: &str = "\
-{cli} — headless {app} (photo library + raw developer)
+{cli}: headless {app} (photo library + raw developer)
 
 USAGE:
   {cli} run [OPTIONS] COMMAND [key=value | '{json}']… [COMMAND …]…
@@ -149,17 +149,19 @@ USAGE:
       take their colour from the profile and only their tone from their own JPEG.
   {cli} calibrate-lightroom preset -o FILE.xmp
       Write the baseline Lightroom preset to apply (on virtual copies) before exporting for a fit.
-  {cli} calibrate-lightroom fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME] [--dry-run]
-      [--base FILE [--replace-looks] [--since-process N]] [--hold-out NAME,…]
+  {cli} calibrate-lightroom fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME]
+          [--lens MODEL] [--dry-run] [--base FILE [--replace-looks] [--since-process N]] [--hold-out NAME,…]
       Fit a camera's colour model and looks to Lightroom's exports of your own raws (16-bit TIFF, one export
       folder per Lightroom profile). Writes <Make>_<Model>.json (the file to send: numbers only, no images) and
-      one .dcp per look for your own testing. --dry-run pairs and reports coverage without fitting.
+      one .dcp per look for your own testing. --lens: the fit is for that lens only (Exif lens model, e.g. one
+      of a phone's cameras). --dry-run pairs and reports coverage without fitting.
       --base FILE keeps that calibration's camera model and looks and fits only the other looks the exports name
       (--replace-looks refits one it has too; --since-process N adds them as entries for process N and newer only,
       so older edits keep the file's looks); --hold-out NAME,… holds out the raws whose file names contain a name.
-  {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME]
+  {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME] [--lens MODEL] [--replace]
       Developers: validate a contributed calibration, write it to crates/camdb/data/calibrations/ and add its
-      assets/ATTRIBUTION.md row (DIR: the repository root, default .).
+      assets/ATTRIBUTION.md row (DIR: the repository root, default .). A calibration already there for the
+      same camera, lens and editor is kept unless --replace.
   {cli} calibrate-lightroom list
       The calibrations built into this binary, with their looks and held-out colour error.
   {cli} calibrate-lightroom verify --raws DIR… --exports DIR… [--report DIR] [--json] [--size N] [--max N]

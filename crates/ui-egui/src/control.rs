@@ -87,6 +87,12 @@ fn wrap(r: Result<Value, String>) -> Outcome {
     }
 }
 
+/// Labels are source keys with `{app}` / `{upstream}` placeholders (the UI translates them by key); a listing for
+/// an agent reports them as the user sees them.
+fn brand_filled(listing: Value) -> Value {
+    serde_json::from_str(&lcc_brand::fill(&listing.to_string())).unwrap_or(listing)
+}
+
 pub fn all_commands(app: &LccApp) -> Value {
     let keymap = &app.ui.settings.keymap;
     let mut v: Vec<Value> = app
@@ -278,13 +284,12 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             ctx.request_repaint();
             wrap(r)
         }
-        "engine.commands" => ok(all_commands(app)),
-        "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default()),
+        "engine.commands" => ok(brand_filled(all_commands(app))),
+        "ui.menu.list" => ok(brand_filled(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default())),
         "ui.menu.tree" => {
             let tree =
                 Value::Array(crate::menubar::menu_bar(app).into_iter().map(|(title, items)| json!({"label": title, "children": items})).collect());
-            // labels are source keys with `{app}` placeholders; report them as the user sees them
-            ok(serde_json::from_str(&lcc_brand::fill(&tree.to_string())).unwrap_or(tree))
+            ok(brand_filled(tree))
         }
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.widgets" => {
@@ -522,7 +527,10 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
         "ui.dialog.cancel" => {
             app.ui.dialog = None;
             #[cfg(not(target_arch = "wasm32"))]
-            if matches!(app.catalog_ui.dialog, Some(crate::catalog_ui::CatalogDialog::XmpConflict { .. })) {
+            if matches!(
+                app.catalog_ui.dialog,
+                Some(crate::catalog_ui::CatalogDialog::XmpConflict { .. } | crate::catalog_ui::CatalogDialog::Refine { .. })
+            ) {
                 app.catalog_ui.dialog = None;
             }
             ok(Value::Null)
@@ -634,6 +642,7 @@ pub(crate) fn confirm_dialog(app: &mut LccApp) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         None => match app.catalog_ui.dialog.take() {
             Some(crate::catalog_ui::CatalogDialog::XmpConflict { command, ids, .. }) => app.run(&command, json!({"ids": ids, "confirmed": true})),
+            Some(crate::catalog_ui::CatalogDialog::Refine { .. }) => app.run("library.refine", json!({"confirmed": true})),
             other => {
                 app.catalog_ui.dialog = other;
                 Err("no dialog open".into())
@@ -741,6 +750,7 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
     } else {
         let w = app.services.write.as_mut().ok_or("no writer")?;
         let files = export_batch(&mut app.session, &ids, &opts, &to, &mut |path, bytes| w(path, bytes), &|path| std::path::Path::new(path).exists())?;
+        lcc_engine::export::mark_exported(&mut app.session, &files);
         // plug-in export hooks and destination, as after a background export
         #[cfg(not(target_arch = "wasm32"))]
         let plugins = lcc_engine::cmd::plugins::after_export(&mut app.session, &files, p.get("pluginDestination"));

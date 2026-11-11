@@ -464,6 +464,8 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
             ifd.set_image(ImageData::Tiles { tile_width: tile as u32, tile_height: tile as u32, tiles });
         }
         (RawData::U16(v), _) => {
+            // what Library ▸ Validate DNG Files checks the stored samples against (DNG spec: `RawImageDigest`)
+            ifd.set(crate::dngdigest::RAW_IMAGE_DIGEST, Value::Byte(crate::dngdigest::raw_image_digest(&raw.data).0.to_vec()));
             // a dark frame may never reach the sensor's white level, which must still fit (upstream #3429)
             let maxv = u32::from(v.iter().copied().max().unwrap_or(0)).max(max_white);
             let bits = (32 - maxv.leading_zeros()).max(raw.bits).clamp(2, 16) as u8;
