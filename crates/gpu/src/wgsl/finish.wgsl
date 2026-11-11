@@ -1237,7 +1237,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var d = vec3<f32>(0.0);
     if (pu(F_TONE_PC) != 0u) {
         let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
-        d = mul3(mat_at(F_TONE_PC_FROM), tone_keeping_hue(q));
+        d = mul3(mat_at(F_TONE_PC_FROM), near_white(tone_keeping_hue(q), pf(F_PEAK)));
         o = lum2020(d);
     } else {
         let yl = lum2020(c);
@@ -1564,6 +1564,28 @@ fn tone_keeping_hue(p: vec3<f32>) -> vec3<f32> {
         t[mid] = t[lo] + (t[hi] - t[lo]) * share;
     }
     return t;
+}
+
+// `finish::NEAR_WHITE` (largest pull; brightest channel over which it comes in, times the peak; luminance share)
+const NEAR_WHITE_A: f32 = 0.035;
+const NEAR_WHITE_K: vec2<f32> = vec2<f32>(0.8, 1.0);
+const NEAR_WHITE_Y: vec2<f32> = vec2<f32>(0.28, 0.4);
+// `finish::PROPHOTO_Y`
+const PROPHOTO_Y: vec3<f32> = vec3<f32>(0.2880402, 0.7118741, 0.0000857);
+
+// `finish::near_white`: a colour toned per channel pulled toward its own brightest channel as that nears white
+fn near_white(p: vec3<f32>, peak: f32) -> vec3<f32> {
+    let hi = max(p.x, max(p.y, p.z));
+    let finite = all(p == p) && all(abs(p) <= vec3<f32>(3.4e38)) && peak == peak && peak <= 3.4e38;
+    if (!finite || !(peak > 0.0) || !(hi > 0.0)) {
+        return p;
+    }
+    let t = NEAR_WHITE_A * sstep(NEAR_WHITE_K.x * peak, NEAR_WHITE_K.y * peak, hi)
+        * sstep(NEAR_WHITE_Y.x, NEAR_WHITE_Y.y, dot(PROPHOTO_Y, p) / hi);
+    if (!(t > 0.0)) {
+        return p;
+    }
+    return p + (vec3<f32>(min(hi, peak)) - p) * t;
 }
 
 // `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V9)

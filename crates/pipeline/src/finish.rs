@@ -602,6 +602,14 @@ fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option
     Some([to.to_f32(), to.inverse()?.to_f32()])
 }
 
+/// Prototype (magenta near the clip): for a render toned per ProPhoto channel, the white-balance stage clips the
+/// scene colour at zero in linear ProPhoto instead of Rec.2020. Straight from the raw (the profile's matrix), a
+/// saturated magenta light has a negative ProPhoto green (−0.05 to −0.16 of its brightest channel); Lightroom Classic
+/// renders that green as exactly 0, while a clip in the narrower Rec.2020 left it 0.01–0.35 of the brightest channel.
+pub(crate) fn prophoto_floor(s: &DevelopSettings, info: &SourceInfo) -> Option<[[[f32; 3]; 3]; 2]> {
+    tone_per_channel(s, info, 1.0)
+}
+
 /// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
 /// ([`ToneMap::hdr_from_sdr`] of V9's SDR tone map); `false` keeps V9's own curves at `peak`.
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
@@ -1030,7 +1038,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             // --- tone map on luminance (or per ProPhoto channel), highlight desaturation
             let (o, mut d) = match &fp.tone_per_channel {
                 Some([to, from]) => {
-                    let d = mul3(from, tone_keeping_hue(mul3(to, c), |v| tone.apply(v)));
+                    let d = mul3(from, near_white(tone_keeping_hue(mul3(to, c), |v| tone.apply(v)), peak));
                     (luminance_2020(d), d)
                 }
                 None => {
@@ -1449,6 +1457,36 @@ pub(crate) fn tone_keeping_hue(p: [f32; 3], tone: impl Fn(f32) -> f32) -> [f32; 
     t
 }
 
+/// [`near_white`]: the largest pull, the brightest toned channel (relative to the peak) over which it comes in, and
+/// the colour's luminance as a share of that channel over which it comes in. Fitted on Lightroom Classic exports with
+/// the same matrix profile: 16 R5 C chart frames under amber, red, warm and magenta light (two bodies) and 92 real
+/// frames (one body), pixel pairs against our render.
+pub const NEAR_WHITE: [f32; 5] = [0.035, 0.8, 1.0, 0.28, 0.4];
+
+/// ProPhoto's luminance weights (D50 Y of its primaries).
+const PROPHOTO_Y: [f32; 3] = [0.288_040_2, 0.711_874_1, 0.000_085_7];
+
+/// A colour toned per channel in linear ProPhoto (`p`, after [`tone_keeping_hue`]) pulled toward its own brightest
+/// channel as that channel nears white: Lightroom Classic lifts the other two there (lighter and a little less
+/// saturated, hue kept), where ours stayed up to 8 C* more saturated and 2 L* darker. Colours below
+/// [`NEAR_WHITE`]'s start are unchanged, and so are colours whose luminance is small for their brightest channel
+/// (blue- and magenta-led): Lightroom keeps those as saturated as ours or more.
+#[inline]
+pub(crate) fn near_white(p: [f32; 3], peak: f32) -> [f32; 3] {
+    let hi = p[0].max(p[1]).max(p[2]);
+    if !p.iter().all(|v| v.is_finite()) || !peak.is_finite() || peak <= 0.0 || hi <= 0.0 {
+        return p;
+    }
+    let [a, k0, k1, y0, y1] = NEAR_WHITE;
+    let y = PROPHOTO_Y[0] * p[0] + PROPHOTO_Y[1] * p[1] + PROPHOTO_Y[2] * p[2];
+    let t = a * smooth(k0 * peak, k1 * peak, hi) * smooth(y0, y1, y / hi);
+    if t <= 0.0 {
+        return p;
+    }
+    let top = hi.min(peak);
+    p.map(|v| v + (top - v) * t)
+}
+
 fn over_range(d: [f32; 3], o: f32, peak: f32, hue_clip: bool) -> [f32; 3] {
     let mx = d[0].max(d[1]).max(d[2]);
     if mx <= peak {
@@ -1678,6 +1716,39 @@ mod tests {
         assert!(rolloff.apply(g) < 0.3, "the roll-off's grey is far darker: {}", rolloff.apply(g));
         let jpeg = SourceInfo { raw: false, ..dng };
         assert!((base_tone(&v9, &jpeg, 1.0).apply(g) - lrc).abs() > 0.05, "a JPEG keeps its display tone");
+    }
+
+    #[test]
+    fn near_white_lifts_the_other_channels_of_a_colour_near_white_only() {
+        // below the start: unchanged
+        assert_eq!(near_white([0.7, 0.3, 0.05], 1.0), [0.7, 0.3, 0.05]);
+        // at white: the other two pulled toward the brightest by the full share, the brightest kept
+        let [a, ..] = NEAR_WHITE;
+        let r = near_white([1.0, 0.4, 0.1], 1.0);
+        assert!((r[0] - 1.0).abs() < 1e-6 && (r[1] - (0.4 + 0.6 * a)).abs() < 1e-6 && (r[2] - (0.1 + 0.9 * a)).abs() < 1e-6);
+        // over white: toward the peak, never above the brightest
+        let r = near_white([1.4, 0.5, 0.2], 1.0);
+        assert!(r[1] > 0.5 && r[1] < 1.0 && r[0] < 1.4);
+        assert_eq!(near_white([f32::NAN, 0.1, 0.2], 1.0)[1], 0.1);
+        // blue-led (little luminance for its brightest channel): unchanged
+        assert_eq!(near_white([0.3, 0.05, 1.0], 1.0), [0.3, 0.05, 1.0]);
+        // a raised peak moves the start with it
+        assert_eq!(near_white([1.0, 0.4, 0.1], 2.0), [1.0, 0.4, 0.1]);
+    }
+
+    #[test]
+    fn near_white_spares_magenta_and_blue_led_colours() {
+        // the pull on a warm colour at white, against magenta at the same brightest channel
+        let pull = |p: [f32; 3]| near_white(p, 1.0)[1] - p[1];
+        let warm = pull([1.0, 0.5, 0.0]);
+        assert!((warm - 0.5 * NEAR_WHITE[0]).abs() < 1e-6, "{warm}");
+        // red-led magenta: luminance just over the gate's start, a sliver of the pull at most
+        let magenta = pull([1.0, 0.0, 0.6]);
+        assert!((0.0..0.05 * warm).contains(&magenta), "{magenta} vs {warm}");
+        // blue-led magenta and purple: under the gate, unchanged
+        for p in [[0.8, 0.0, 1.0], [0.5, 0.05, 1.0], [0.6, 0.1, 1.2]] {
+            assert_eq!(near_white(p, 1.0), p);
+        }
     }
 
     /// The brightest and darkest channel take the curve and the middle one keeps its place between them: on each
