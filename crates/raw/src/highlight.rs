@@ -104,6 +104,12 @@ const COLOUR_FADE_LAST: f32 = 0.1;
 /// white balance sets apart, so left alone warm light goes too red at the clip (hue 59–66°, Lightroom Classic 77–84° on
 /// an R5 C frame; 80–90° at this share).
 const WARM_CONVERGE: f32 = 0.4;
+/// With red and green both clipped and blue below them, red's excess over green (relative to the white) is set to this
+/// many times green's over blue, so the pixel keeps one warm hue however far blue lies below its clip. Left to the rim
+/// colour and the fade, a pale one came out with red at green (hue 100–117°, an olive band around warm highlights) and a
+/// rich one too red; Lightroom Classic shows 77–85° on R5 C frames of both bodies. Chosen on four frames of one body
+/// (77–83° at 1.3), checked on four of the other (72–82°).
+const WARM_RED: f32 = 1.3;
 /// Stops below clip over which a partly clipped pixel's brightness joins the fully clipped level.
 const LEVEL_TO_FULL: f32 = 0.25;
 /// Share of the neutral level its unclipped channels imply that a clipped channel is lifted to in [`own_colour`]. Measured:
@@ -657,6 +663,16 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 let v = lv + (full - lv) * (1.0 - smoothstep(0.0, LEVEL_TO_FULL, stops));
                 let scale = if level > 1e-9 { (lv / level).min(1.0) } else { 1.0 };
                 out = std::array::from_fn(|c| white[c] * v + (out[c] - white[c] * level) * (1.0 - t) * scale);
+                // red and green clipped, blue below: one warm hue ([`WARM_RED`]); nothing changes as either clips
+                let w = (1.0 - side) * bound(p, cl, clip, 0) * bound(p, cl, clip, 1);
+                if w > 0.0 {
+                    let u = [0, 1, 2].map(|c| out[c] / white[c].max(1e-6));
+                    let red = u[1] + WARM_RED * (u[1] - u[2]).max(0.0);
+                    let red = u[0] + (red - u[0]) * w.min(1.0);
+                    if red.is_finite() {
+                        out[0] = white[0] * red;
+                    }
+                }
             } else if t_colour > 0.0 {
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
@@ -1072,6 +1088,22 @@ mod tests {
         let got = warm_converged([2.0, 1.0, 0.5], [1.0; 3], 0.4);
         assert!((got[0] - 1.8).abs() < 1e-5 && (got[1] - 1.2).abs() < 1e-5 && got[2] == 0.5, "{got:?}");
         assert_eq!(warm_converged([1.0, 2.0, 0.5], [1.0; 3], 0.4), [1.0, 2.0, 0.5]);
+    }
+
+    /// Warm light with red and green clipped keeps one warm hue whether blue lies just below its clip or well below: red
+    /// stays above green by [`WARM_RED`] times green's lead over blue, where the pale part used to come out olive.
+    #[test]
+    fn red_and_green_clipped_keep_one_warm_hue() {
+        for blue in [0.62f32, 0.5, 0.3] {
+            let img = Rgb32f::from_fn(96, 96, |_, y| if y < 24 { sensor([1.25, 0.8, 0.5]) } else { [1.0, 1.0, blue] });
+            let mut out = img.clone();
+            reconstruct_how(&mut out, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+            let q = balanced(out.get(48, 80));
+            let lead = q[1] - q[2];
+            assert!(lead > 0.0, "blue {blue}: {q:?}");
+            let excess = (q[0] - q[1]) / lead;
+            assert!((excess - WARM_RED).abs() < 0.05, "blue {blue}: red over green is {excess} of green over blue ({q:?})");
+        }
     }
 
     /// With every channel order and rim colour, nothing jumps where the last channel clips: all that's left is the
