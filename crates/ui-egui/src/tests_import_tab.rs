@@ -692,3 +692,24 @@ fn local_shows_a_library_folders_photos_after_show_not_imported() {
     assert_eq!(h.app.session.visible().len(), 2, "the library photos show");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Import from checks its remembered folders (Recent) and cards on a worker thread, never in a frame: a
+/// remembered folder on a sleeping NAS, a dropped share or a drive spinning up held the window for seconds while
+/// the Import tab drew. So a folder deleted on disk stays in Recent until the next background check (at most 5 s
+/// later), then goes.
+#[test]
+fn import_from_checks_its_recent_folders_off_the_ui_thread() {
+    let (a, b) = (folder("recentA", 1), folder("recentB", 1));
+    let mut h = app([1400.0, 900.0], "classic");
+    hide_home_places(&mut h);
+    h.settle(SETTLE);
+    exec(&mut h, "library.browse", json!({"path": a.to_string_lossy()}));
+    exec(&mut h, "library.browse", json!({"path": b.to_string_lossy()}));
+    let rows = |h: &Headless| h.app.widgets.iter().filter(|(w, _)| w.starts_with("button:importRecent-")).count();
+    assert!(h.step_until(T, |h| rows(h) == 2), "both remembered folders in Recent: {}", rows(&h));
+    std::fs::remove_dir_all(&a).unwrap();
+    h.step();
+    assert_eq!(rows(&h), 2, "the frame didn't look at the disk: the deleted folder stays until the background check");
+    assert!(h.step_until(SETTLE, |h| rows(h) == 1), "the background check drops it: {}", rows(&h));
+    let _ = std::fs::remove_dir_all(&b);
+}
