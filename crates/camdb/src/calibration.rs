@@ -534,7 +534,14 @@ impl Calibration {
         let gated = self.looks.iter().filter_map(|l| Some((look_id(&l.name), l.since_process?, std::sync::Arc::new(self.look_dcp(l))))).collect();
         // only a Lightroom calibration gives the camera a default look; other editors' looks are chosen per photo
         let default = (self.editor == Editor::Lightroom).then(|| self.default_look().map(|l| look_id(&l.name))).flatten();
-        lcc_raw::dcp::Calibrated { make: super::brand(&self.make), names, lens: self.lens.as_ref().map(|l| l.trim().to_string()), looks, gated, default }
+        lcc_raw::dcp::Calibrated {
+            make: super::brand(&self.make),
+            names,
+            lens: self.lens.as_ref().map(|l| l.trim().to_string()),
+            looks,
+            gated,
+            default,
+        }
     }
 
     /// The file name a calibration is kept under: `<Make>_<Model>.json` for Lightroom, `<Make>_<Model>_<editor>.json`
