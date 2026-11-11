@@ -97,7 +97,7 @@ fn edge_at(x: u32, y: u32, shift: f32, own: f32) -> f32 {
         if (guided) {
             z = min(abs((aux[wo + idx[k]] + shift - own) / pf(F_EDGE_READ_TONE)), 8.0);
         }
-        var v = bil[k] * exp(-0.5 * z * z);
+        var v = bil[k] * (exp(-0.5 * z * z) + pf(F_EDGE_READ_FLOOR));
         v = select(0.0, v, v == v);
         w[k] = v;
         sum += v;

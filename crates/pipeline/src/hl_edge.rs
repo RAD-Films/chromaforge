@@ -60,6 +60,10 @@ const MAX_BINS: usize = 48;
 /// Reading the planes back, a grid cell counts less the further its surroundings' tone lies from the pixel's own: by a
 /// Gaussian with this sigma (EV), half the grid's tone bin, so that cells across a step the grid keeps apart don't mix.
 pub const READ_TONE: f32 = RANGE * 0.5;
+/// …plus this much of its plain nearness (the Gaussian four sigmas out), so that where no cell's tone is near the
+/// pixel's own (an edge pixel between a dark beam and the sky) the read falls back to nearness instead of letting the
+/// least-far cell (the sky) win outright: that gave whole grid cells of edge pixels the sky's pull, black squares.
+pub const READ_FLOOR: f32 = 3.354_626e-4;
 
 /// The local part of one photo's Highlights pull: planes over the whole output frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,14 +86,14 @@ impl EdgePull {
     /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV and whose own
     /// base tone (EV over grey, exposure and `shift` included) is `own`. The four nearest grid cells count by how near
     /// they are and by how close their surroundings' tone is to `own` ([`READ_TONE`]), so a pixel beside a much
-    /// brighter area (a clipped one) takes the pull of its own side.
+    /// brighter area (a clipped one) takes the pull of its own side; when none is close, by nearness ([`READ_FLOOR`]).
     pub fn at(&self, x: usize, y: usize, shift: f32, own: f32) -> f32 {
         let Some(cells) = self.cells(x, y) else { return 0.0 };
         let wide_at = |i: usize| self.wide.data.get(i).copied().unwrap_or(0.0);
         let guided = !self.wide.data.is_empty() && own.is_finite();
         let tone = cells.map(|(i, b)| {
             let z = if guided { ((wide_at(i) + shift - own) / READ_TONE).abs().min(8.0) } else { 0.0 };
-            let v = b * (-0.5 * z * z).exp();
+            let v = b * ((-0.5 * z * z).exp() + READ_FLOOR);
             if v.is_finite() { v } else { 0.0 }
         });
         let sum: f32 = tone.iter().sum();
@@ -141,7 +145,9 @@ fn unit_plane(img: &Rgb32f, ev: f32, white: f32, ppl: f64) -> Plane {
 /// [`unit_plane`] (zero without a `white`) and the surroundings' base tone (EV over grey, exposure `ev` added).
 fn unit_planes(img: &Rgb32f, ev: f32, white: Option<f32>, ppl: f64) -> (Plane, Plane) {
     let log_l = img.map(log_lum);
-    let wide = bilateral(&log_l, WIDE * ppl as f32, RANGE).map(|v| if (v + ev).is_finite() { v + ev } else { 0.0 });
+    // the surroundings without lone pixels (a pixel at the edge of a clipped area that colour reconstruction left at
+    // or below black, −20 EV): the grid kept each as surroundings of its own, and edge pixels read them
+    let wide = bilateral(&crate::local::median_hv(&log_l, 1), WIDE * ppl as f32, RANGE).map(|v| if (v + ev).is_finite() { v + ev } else { 0.0 });
     let mut plane = Plane::new(img.width, img.height);
     let Some(white) = white else { return (plane, wide) };
     let mut clipped = Plane::new(img.width, img.height);
@@ -349,6 +355,37 @@ mod tests {
         assert!(e.at(2, 0, 0.0, -1.0).abs() < 0.01, "dark pixel: {}", e.at(2, 0, 0.0, -1.0));
         assert!((e.at(2, 0, 0.0, 3.0) + 1.5).abs() < 0.01, "bright pixel: {}", e.at(2, 0, 0.0, 3.0));
         assert!(e.at(2, 0, 0.0, f32::NAN).is_finite());
+    }
+
+    /// An edge pixel (−1.5 EV) whose four cells are a dark beam (−20.8 and −7.1 EV, far below it) and the clipped sky
+    /// (2.5 and 2.8 EV, far above it) has no cell near its tone: it gets about no pull, where taking the least-far
+    /// cell's (the sky's, −1.3 EV) gave whole grid cells along the edge black squares. A pixel as bright as the sky
+    /// still takes the sky's pull.
+    #[test]
+    fn an_edge_pixel_with_no_cell_near_its_tone_takes_no_sky_pull() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let mut wide = Plane::new(2, 2);
+        wide.data = vec![-20.8, -7.1, 2.5, 2.8];
+        let e =
+            EdgePull { plane: Arc::new(Plane::new(2, 2)), wide: Arc::new(wide), pull: Arc::new(pull), gain: 1.0, scale: (0.5, 0.5), origin: (0, 0) };
+        // output pixel (1, 1) sits in the middle of the four cells
+        assert!(e.at(1, 1, 0.0, -1.5) > -0.1, "edge pixel: {}", e.at(1, 1, 0.0, -1.5));
+        assert!((e.at(1, 1, 0.0, 2.65) + 1.32).abs() < 0.05, "sky pixel: {}", e.at(1, 1, 0.0, 2.65));
+    }
+
+    /// A lone pixel far below its neighbours (one colour reconstruction left at black beside a clipped area) is no
+    /// surroundings of its own: the plane there holds its neighbours' tone.
+    #[test]
+    fn a_lone_black_pixel_is_no_surroundings_of_its_own() {
+        let mut img = Rgb32f::new(64, 64);
+        img.data.fill([0.1, 0.1, 0.1]);
+        if let Some(p) = img.data.get_mut(32 * 64 + 32) {
+            *p = [0.0, 0.0, 0.0];
+        }
+        let (_, wide) = unit_planes(&img, 0.0, None, 64.0);
+        let at = |x: usize, y: usize| wide.data.get(y * 64 + x).copied().unwrap_or(f32::NAN);
+        assert!((at(32, 32) - at(10, 10)).abs() < 0.1, "lone pixel {} vs field {}", at(32, 32), at(10, 10));
     }
 
     /// The bilateral base merges tones a little apart (clouds in a sky) and keeps a large step (sky against ground)

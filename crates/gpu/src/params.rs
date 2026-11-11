@@ -67,6 +67,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_TABLE_OFF", 1),
     // …whose cells count by how close their tone is to the pixel's own, by a Gaussian of this sigma (EV)
     ("EDGE_READ_TONE", 1),
+    // …plus this much of plain nearness, so a pixel with no cell near its tone doesn't take the least-far cell's
+    ("EDGE_READ_FLOOR", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -584,6 +586,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("EDGE_WIDE_OFF", wide_off as u32);
         p.u("EDGE_TABLE_OFF", table_off as u32);
         p.f("EDGE_READ_TONE", lcc_pipeline::hl_edge::READ_TONE);
+        p.f("EDGE_READ_FLOOR", lcc_pipeline::hl_edge::READ_FLOOR);
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {
