@@ -94,7 +94,9 @@ const COLOUR_FADE_ONSET: f32 = 0.15;
 /// With [`Rebuild::rim_hue`], a partly clipped pixel's brightness follows its surviving channels instead of what the rim's
 /// colour implies: at most the fully clipped level, less this many stops per stop that its lowest unclipped channel lies
 /// below clip. The rim of a sky implies far too much light in a cloud in front of it, which capped every pixel there at
-/// the same level, with the cloud's shape left in its red channel. Measured on Lightroom Classic exports.
+/// the same level, with the cloud's shape left in its red channel. Measured on Lightroom Classic exports. Not for warm
+/// light with red and green clipped ([`WARM_RED`]): blue's distance below its clip is its colour, not a sign of less
+/// light, and the cap put a lamp glow's clipped green under its own clip, the glow 4–8 L* darker than its rim at −3 EV.
 const LEVEL_SLOPE: f32 = 0.5;
 /// Over this many stops below clip the last unclipped channel stops needing [`COLOUR_FADE_ONSET`]: a pixel about to clip
 /// fully goes to the clipped neutral whatever its rebuilt channels do. Without it, warm light whose red clips last kept
@@ -109,7 +111,10 @@ const WARM_CONVERGE: f32 = 0.4;
 /// colour and the fade, a pale one came out with red at green (hue 100–117°, an olive band around warm highlights) and a
 /// rich one too red; Lightroom Classic shows 77–85° on R5 C frames of both bodies. With the middle channel toned in
 /// its place (the V9 tone under a profile without a curve), 1.0 gives the hue Lightroom Classic shows: within 1° on
-/// nine frames of one body, where it was chosen, and 1–3° on ten of the other (1.3 gave 6–12° too red).
+/// nine frames of one body, where it was chosen, and 1–3° on ten of the other (1.3 gave 6–12° too red). Only where both
+/// are clipped: phased in as green neared its clip, it set the red of the band where only red clipped from green's lead
+/// over blue, often under red's own clip, and with the engine's near-clip colour on that band's unclipped green drew a
+/// yellow line along the green clip of a lamp glow.
 const WARM_RED: f32 = 1.0;
 /// Stops below clip over which a partly clipped pixel's brightness joins the fully clipped level.
 const LEVEL_TO_FULL: f32 = 0.25;
@@ -240,8 +245,16 @@ fn sources(img: &Rgb32f, wb: [f32; 3], clip: f32, clipped: &impl Clipped) -> (Le
 /// The quarter-resolution rim level of `img`: every `4 × 4` block's white-balanced RGB of its unclipped pixels
 /// above [`RIM_LO`] of the clip level, weighted (steeply) towards the clip, as densities. Pixels next to clipped
 /// ones (`margin`, by half-resolution cell) are left out, like the colour sources: they were demosaiced partly from
-/// clipped samples, and lens fringes along clipped content would pass for its colour.
-fn rim(img: &Rgb32f, wb: [f32; 3], clip: f32, clipped: &impl Clipped, margin: &(dyn Fn(usize, usize) -> bool + Sync)) -> Level<4> {
+/// clipped samples, and lens fringes along clipped content would pass for its colour. `colour` gives a rim pixel's
+/// colour (its weight stays its own): see [`reconstruct_how_rim`].
+fn rim(
+    img: &Rgb32f,
+    wb: [f32; 3],
+    clip: f32,
+    clipped: &impl Clipped,
+    margin: &(dyn Fn(usize, usize) -> bool + Sync),
+    colour: Option<RimColour<'_>>,
+) -> Level<4> {
     let (w, h) = (img.width, img.height);
     let (cw, ch) = (w.div_ceil(4), h.div_ceil(4));
     let mut cells = vec![[0f32; 4]; cw * ch];
@@ -256,8 +269,9 @@ fn rim(img: &Rgb32f, wb: [f32; 3], clip: f32, clipped: &impl Clipped, margin: &(
                         continue;
                     }
                     let k = ((top - RIM_LO) / (1.0 - RIM_LO)).powi(4);
+                    let v = colour.map_or(*p, |f| f(*p));
                     for c in 0..3 {
-                        a[c] += k * p[c] * wb[c];
+                        a[c] += k * v[c] * wb[c];
                     }
                     a[3] += k;
                 }
@@ -447,13 +461,39 @@ pub struct Rebuild {
 /// [`reconstruct_brighter`] / [`reconstruct_masked_brighter`] with every option: `mask` as for
 /// [`reconstruct_masked`] (`None`, or one of the wrong length: clipping told by the values alone).
 pub fn reconstruct_how(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], how: Rebuild, mask: Option<&[u8]>) -> usize {
+    reconstruct_how_rim(img, wb, clip, white, how, mask, None)
+}
+
+/// A colour change for the rim pixels a rebuild reads ([`reconstruct_how_rim`]): sensor values in, sensor values out.
+pub type RimColour<'a> = &'a (dyn Fn([f32; 3]) -> [f32; 3] + Sync);
+
+/// [`reconstruct_how`], with each rim pixel's colour ([`Rebuild::rim_hue`]) as `rim_colour` changes it: the colour the
+/// unclipped pixels around a clipped area will have after a later per-pixel step (process V9's near-clip colour), so
+/// the rebuilt area meets them in that colour instead of in the one they had before it.
+pub fn reconstruct_how_rim(
+    img: &mut Rgb32f,
+    wb: [f32; 3],
+    clip: f32,
+    white: [f32; 3],
+    how: Rebuild,
+    mask: Option<&[u8]>,
+    rim_colour: Option<RimColour<'_>>,
+) -> usize {
     match mask.filter(|m| m.len() == img.data.len()) {
-        None => rebuild_clipped(img, wb, clip, white, how, &|_, p| by_value(p, clip)),
-        Some(mask) => rebuild_clipped(img, wb, clip, white, how, &|i, p| {
-            let m = mask.get(i).copied().unwrap_or(0);
-            let v = by_value(p, clip);
-            [v[0] || m & CLIPPED_R != 0, v[1] || m & CLIPPED_G != 0, v[2] || m & CLIPPED_B != 0]
-        }),
+        None => rebuild_clipped(img, wb, clip, white, how, &|_, p| by_value(p, clip), rim_colour),
+        Some(mask) => rebuild_clipped(
+            img,
+            wb,
+            clip,
+            white,
+            how,
+            &|i, p| {
+                let m = mask.get(i).copied().unwrap_or(0);
+                let v = by_value(p, clip);
+                [v[0] || m & CLIPPED_R != 0, v[1] || m & CLIPPED_G != 0, v[2] || m & CLIPPED_B != 0]
+            },
+            rim_colour,
+        ),
     }
 }
 
@@ -489,8 +529,16 @@ fn by_value(p: &[f32; 3], clip: f32) -> [bool; 3] {
     [p[0] >= clip, p[1] >= clip, p[2] >= clip]
 }
 
-/// [`reconstruct_with`], with `clipped` telling the clipped channels.
-fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], how: Rebuild, clipped: &impl Clipped) -> usize {
+/// [`reconstruct_with`], with `clipped` telling the clipped channels and `rim_colour` as [`reconstruct_how_rim`].
+fn rebuild_clipped(
+    img: &mut Rgb32f,
+    wb: [f32; 3],
+    clip: f32,
+    white: [f32; 3],
+    how: Rebuild,
+    clipped: &impl Clipped,
+    rim_colour: Option<RimColour<'_>>,
+) -> usize {
     let Rebuild { headroom, rim_hue } = how;
     let (w, h) = (img.width, img.height);
     let count = img.data.par_iter().enumerate().filter(|(i, p)| clipped(*i, p).iter().any(|&c| c)).count();
@@ -542,7 +590,7 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
     let Some(field) = levels.first() else { return count };
     // the rim (level 0 of its pyramid holds the estimate), if there is one anywhere at all
     let rims = {
-        let mut levels = vec![rim(img, wb, clip, clipped, &needed)];
+        let mut levels = vec![rim(img, wb, clip, clipped, &needed, rim_colour)];
         while let Some(l) = levels.last().filter(|l| l.w > 1 || l.h > 1) {
             let next = pull(l);
             levels.push(next);
@@ -660,12 +708,14 @@ fn rebuild_clipped(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3], h
                 let stops = if left { below } else { 0.0 };
                 let level = (out[0] + out[1] + out[2]) / total;
                 let full = q.iter().cloned().fold(0.0f32, f32::max).max(max_level);
-                let lv = level.min(full * (-LEVEL_SLOPE * stops).exp2());
+                // not for warm pixels with red and green clipped: their colour is blue's distance below its clip
+                let warm = ((1.0 - side) * bound(p, cl, clip, 0) * bound(p, cl, clip, 1)).clamp(0.0, 1.0);
+                let lv = level.min(full * (-LEVEL_SLOPE * stops * (1.0 - warm)).exp2());
                 let v = lv + (full - lv) * (1.0 - smoothstep(0.0, LEVEL_TO_FULL, stops));
                 let scale = if level > 1e-9 { (lv / level).min(1.0) } else { 1.0 };
                 out = std::array::from_fn(|c| white[c] * v + (out[c] - white[c] * level) * (1.0 - t) * scale);
-                // red and green clipped, blue below: one warm hue ([`WARM_RED`]); nothing changes as either clips
-                let w = (1.0 - side) * bound(p, cl, clip, 0) * bound(p, cl, clip, 1);
+                // red and green clipped, blue below: one warm hue ([`WARM_RED`])
+                let w = if cl[0] && cl[1] { 1.0 - side } else { 0.0 };
                 if w > 0.0 {
                     let u = [0, 1, 2].map(|c| out[c] / white[c].max(1e-6));
                     let red = u[1] + WARM_RED * (u[1] - u[2]).max(0.0);
@@ -1105,6 +1155,54 @@ mod tests {
             let excess = (q[0] - q[1]) / lead;
             assert!((excess - WARM_RED).abs() < 0.05, "blue {blue}: red over green is {excess} of green over blue ({q:?})");
         }
+    }
+
+    /// A warm glow, red and green clipped and blue two stops under its clip inside a warm rim, keeps the brightness its
+    /// rim's colour gives it from blue: its clipped green never comes out under its clip. The cap a cloud front needs
+    /// ([`LEVEL_SLOPE`]) put it at 0.9 of its clip, and the inside of a lamp glow came out 4–8 L* darker than its rim at
+    /// −3 EV, where Lightroom Classic shows it as bright as the rim.
+    #[test]
+    fn with_rim_hue_a_warm_glow_keeps_its_clipped_green_at_least_at_its_clip() {
+        let img = Rgb32f::from_fn(96, 96, |_, y| if y < 24 { [0.95, 0.85, 0.19] } else { [1.0, 1.0, 0.25] });
+        let mut out = img.clone();
+        reconstruct_how(&mut out, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let q = balanced(out.get(48, 80));
+        assert!(q[1] >= 0.99 * WB[1] - 1e-4, "green under its clip: {q:?}");
+        assert!(q[0] > q[1] && q[1] > q[2], "warm: {q:?}");
+    }
+
+    /// A pixel with only red clipped takes its red from its rim, not from [`WARM_RED`] (green's lead over blue): phased in
+    /// as green neared its clip, that rule put this pixel's clipped red at 0.66, under its own clip, and with the engine's
+    /// near-clip colour drew a yellow line along the green clip of a lamp glow at −3 EV.
+    #[test]
+    fn with_rim_hue_only_red_clipped_keeps_its_rims_red() {
+        let img = Rgb32f::from_fn(96, 96, |_, y| if y < 24 { [0.95, 0.85, 0.19] } else { [1.0, 0.97, 0.2] });
+        let mut out = img.clone();
+        reconstruct_how(&mut out, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let p = out.get(48, 80);
+        // the rim's red over green (0.95 / 0.85) carried to green 0.97: above its clip, where green's lead over blue
+        // would put it under
+        assert!(p[0] > 1.02, "red from green's lead over blue: {p:?}");
+        assert!((p[1] - 0.97).abs() < 1e-5 && (p[2] - 0.2).abs() < 1e-5, "the unclipped channels stay: {p:?}");
+    }
+
+    /// The rim a rebuild reads can be shown in the colour a later step gives it ([`reconstruct_how_rim`]): the rebuilt
+    /// area follows that colour, and a step that changes nothing changes nothing.
+    #[test]
+    fn a_rim_colour_step_reaches_the_rebuilt_area() {
+        let img = Rgb32f::from_fn(96, 96, |_, y| if y < 24 { [0.95, 0.85, 0.19] } else { [1.0, 0.97, 0.2] });
+        let how = Rebuild { headroom: 0.0, rim_hue: true };
+        let mut plain = img.clone();
+        reconstruct_how(&mut plain, WB, 0.99, [1.0; 3], how, None);
+        let mut same = img.clone();
+        let identity = |p: [f32; 3]| p;
+        reconstruct_how_rim(&mut same, WB, 0.99, [1.0; 3], how, None, Some(&identity));
+        assert_eq!(same, plain);
+        let mut redder = img.clone();
+        let step = |p: [f32; 3]| [p[0] * 1.05, p[1], p[2]];
+        reconstruct_how_rim(&mut redder, WB, 0.99, [1.0; 3], how, None, Some(&step));
+        let (a, b) = (plain.get(48, 80), redder.get(48, 80));
+        assert!(b[0] > a[0] + 0.02, "the rebuilt red follows the redder rim: {a:?} -> {b:?}");
     }
 
     /// With every channel order and rim colour, nothing jumps where the last channel clips: all that's left is the

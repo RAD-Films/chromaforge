@@ -463,6 +463,41 @@ impl CameraColourModel<'_> {
         lcc_raw::highlight::reconstruct_how(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, Some(mask));
     }
 
+    /// [`Self::rebuild_highlights`] (or [`Self::rebuild_highlights_masked`] with a `mask`) followed by process V9's
+    /// colour near the clip ([`NearClip`]), whose rims the rebuild reads in their moved colour: a clipped area meets its
+    /// unclipped surroundings in the colour they end up with. A pixel with only red clipped keeps its rebuilt red while
+    /// green and blue move as an unclipped neighbour's do, so the band where only red clips joins the wall around it
+    /// (left alone it stayed 10–14 degrees redder at −3 EV: a hard orange line). Every other clipped pixel keeps what the
+    /// rebuild gave it: moving the blue of warm pixels with only green clipped turned them 10 degrees too red.
+    pub fn rebuild_highlights_near_clip(&self, img: &mut Rgb32f, mask: Option<&[u8]>, how: lcc_raw::highlight::Rebuild, nc: &NearClip) {
+        use lcc_raw::highlight::CLIPPED_R;
+        use rayon::prelude::*;
+        let clipped = Self::clipped_channels(img, mask);
+        let colour = |p: [f32; 3]| nc.pixel(p, [false; 3]);
+        lcc_raw::highlight::reconstruct_how_rim(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, mask, Some(&colour));
+        img.data.par_iter_mut().zip(clipped.par_iter()).for_each(|(p, &bits)| match bits {
+            0 => *p = nc.pixel(*p, [false; 3]),
+            CLIPPED_R => *p = nc.pixel(*p, [true, false, false]),
+            _ => {}
+        });
+    }
+
+    /// Per pixel, its clipped channels ([`lcc_raw::highlight::CLIPPED_R`] etc.): by value, and as a binned image's
+    /// `mask` says (ignored unless one entry per pixel).
+    pub fn clipped_channels(img: &Rgb32f, mask: Option<&[u8]>) -> Vec<u8> {
+        use lcc_raw::highlight::{CLIPPED_B, CLIPPED_G, CLIPPED_R};
+        let mask = mask.filter(|m| m.len() == img.data.len());
+        img.data
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let m = mask.and_then(|m| m.get(i)).copied().unwrap_or(0) & (CLIPPED_R | CLIPPED_G | CLIPPED_B);
+                let v = |c: usize, bit: u8| if p[c] >= HIGHLIGHT_CLIP { bit } else { 0 };
+                m | v(0, CLIPPED_R) | v(1, CLIPPED_G) | v(2, CLIPPED_B)
+            })
+            .collect()
+    }
+
     /// White balance, matrix, tables and baseline exposure, in place.
     pub fn apply(&self, img: &mut Rgb32f) {
         let (wb, m, gain) = (self.wb, self.matrix.to_f32(), self.gain);
@@ -503,6 +538,222 @@ impl CameraColourModel<'_> {
             None => rgb.map(|v| v * gain),
         };
         finite(self.hue_sat.map_or(rgb, |h| h.apply(rgb)))
+    }
+}
+
+/// [`NearClip`]: the share of the way to the brightest channel a channel moves at the clip (0.6–0.7 fit about as
+/// well; at 0.6 frame 3228 at Highlights −100 came out 0.5 dE further from Lightroom in L* 60–75, its pull reading the
+/// brighter glow)…
+const NEAR_CLIP_AMOUNT: f32 = 0.5;
+/// …the raw level (share of the white level) where the move starts…
+const NEAR_CLIP_ONSET: f32 = 0.338;
+/// …and the shape of its ramp between them.
+const NEAR_CLIP_POWER: f32 = 1.175;
+
+/// Lightroom Classic's colour near the sensor's clip (process V9), on warm light (red the brightest white-balanced
+/// channel): as a raw channel nears the clip, LrC moves the colour toward its brightest channel, by the raw level and
+/// the same at every Exposure. Each linear ProPhoto channel (the space of V9's tone) other than the brightest moves
+/// toward it by [`NEAR_CLIP_AMOUNT`] × ((raw − [`NEAR_CLIP_ONSET`]) / (1 − [`NEAR_CLIP_ONSET`]))^[`NEAR_CLIP_POWER`],
+/// `raw` the lower of the matching camera channel's level and red's (1 = the file's white level), so nothing under the
+/// onset changes. Fitted on Lightroom Classic exports of 68 R5 C frames, each raw at two to four Exposures from +1 to
+/// −3, at the white balance the exports record: a warm wall whose green lies 0.2 stops under the clip turns about 10
+/// degrees yellower. The same move on
+/// white-balanced camera RGB lowered blue through the camera matrix and gave bright warm colours 4–10 C* more than LrC
+/// at Exposure 0 and +1 (frame 3228's band L* 85–92 went from 4.4 to 5.0 dE); skies and foliage near the clip came
+/// out worse with it, so they are left alone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NearClip {
+    wb: [f32; 3],
+    /// White-balanced camera RGB → linear ProPhoto, and back.
+    to_pp: [[f32; 3]; 3],
+    from_pp: [[f32; 3]; 3],
+}
+
+impl NearClip {
+    /// For a colour model's white balance and matrix (white-balanced camera RGB → linear Rec.2020); `None` when the
+    /// white balance isn't positive or the matrix can't be inverted.
+    pub fn new(wb: [f32; 3], matrix: &lcc_color::Mat3) -> Option<NearClip> {
+        if !wb.iter().all(|v| v.is_finite() && *v > 0.0) {
+            return None;
+        }
+        let rec2020_to_pp =
+            lcc_color::PROPHOTO.from_xyz().mul(&lcc_color::bradford(lcc_color::D65, lcc_color::D50)).mul(&lcc_color::REC2020.to_xyz());
+        let to = rec2020_to_pp.mul(matrix);
+        let (to_pp, from_pp) = (to.to_f32(), to.inverse()?.to_f32());
+        let finite = to_pp.iter().chain(from_pp.iter()).flatten().all(|v| v.is_finite());
+        finite.then_some(NearClip { wb, to_pp, from_pp })
+    }
+
+    /// One pixel of camera RGB (1 = the white level); the channels `keep` marks (clipped before the rebuild) keep their
+    /// value. A pixel that isn't warm light, lies under the onset or isn't a valid colour comes back bit for bit.
+    pub fn pixel(&self, p: [f32; 3], keep: [bool; 3]) -> [f32; 3] {
+        let (amount, onset, power) = (NEAR_CLIP_AMOUNT, NEAR_CLIP_ONSET, NEAR_CLIP_POWER);
+        let wb = self.wb;
+        if !p.iter().all(|v| v.is_finite() && *v >= 0.0) {
+            return p;
+        }
+        let c = [p[0] * wb[0], p[1] * wb[1], p[2] * wb[2]];
+        if c[0] < c[1] || c[0] < c[2] {
+            return p;
+        }
+        let w: [f32; 3] = std::array::from_fn(|i| {
+            let t = ((p[i].min(p[0]) - onset) / (1.0 - onset)).clamp(0.0, 1.0);
+            if i == 0 || keep[i] || t <= 0.0 { 0.0 } else { amount * t.powf(power) }
+        });
+        if w[1] <= 0.0 && w[2] <= 0.0 {
+            return p;
+        }
+        let mul = |m: &[[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]) };
+        let q = mul(&self.to_pp, c);
+        let top = q[0].max(q[1]).max(q[2]);
+        let moved = mul(&self.from_pp, std::array::from_fn(|i| q[i] + w[i] * (top - q[i])));
+        let out: [f32; 3] = std::array::from_fn(|i| if keep[i] { p[i] } else { moved[i] / wb[i] });
+        if out.iter().all(|v| v.is_finite()) { out } else { p }
+    }
+}
+
+#[cfg(test)]
+mod near_clip_tests {
+    use super::*;
+    use lcc_raw::highlight::{CLIPPED_G, CLIPPED_R};
+
+    /// The R5 C brackets' as-shot multipliers (red 2020, green 1024, blue 1811).
+    const WB: [f32; 3] = [2020.0 / 1024.0, 1.0, 1811.0 / 1024.0];
+
+    fn model() -> CameraColourModel<'static> {
+        CameraColourModel { wb: WB, matrix: lcc_color::Mat3::IDENTITY, gain: 1.0, tables: None, hue_sat: None }
+    }
+
+    fn near() -> NearClip {
+        NearClip::new(WB, &lcc_color::Mat3::IDENTITY).expect("an invertible model")
+    }
+
+    /// Where white-balanced green lies between blue (0) and red (1): higher = yellower for a warm colour.
+    fn yellowness(p: [f32; 3]) -> f32 {
+        let c = [p[0] * WB[0], p[1] * WB[1], p[2] * WB[2]];
+        (c[1] - c[2]) / (c[0] - c[2])
+    }
+
+    fn same_bits(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// A warm wall 0.15 stops under the clip turns yellower and brighter, never past its brightest channel; the same
+    /// colour two stops darker is left alone.
+    #[test]
+    fn a_warm_wall_near_the_clip_turns_yellower_and_far_from_it_stays() {
+        let wall = [0.95, 0.86, 0.18];
+        let out = near().pixel(wall, [false; 3]);
+        assert!(yellowness(out) > yellowness(wall) + 0.03, "{wall:?} -> {out:?}");
+        assert!(yellowness(out) < 1.0, "never past the brightest channel: {out:?}");
+        assert!(out[1] > wall[1], "green comes up: {out:?}");
+        let far = wall.map(|v| v / 4.0);
+        assert!(same_bits(near().pixel(far, [false; 3]), far));
+    }
+
+    /// Every pixel whose raw channels all lie under the onset, every pixel that isn't warm light (a pale sky, foliage)
+    /// and every broken one comes back bit for bit: the move only ever touches warm light near the clip.
+    #[test]
+    fn under_the_onset_off_warm_light_and_broken_pixels_are_bit_identical() {
+        let nc = near();
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10_000) as f32 / 10_000.0
+        };
+        for _ in 0..10_000 {
+            let p = [next() * 0.337, next() * 0.337, next() * 0.337];
+            assert!(same_bits(nc.pixel(p, [false; 3]), p), "{p:?}");
+        }
+        for p in [[0.4, 0.97, 0.6], [0.3, 0.6, 0.9], [0.3, 0.9, 0.4], [f32::INFINITY, 0.9, 0.2], [0.9, -0.1, 0.2], [f32::NAN, 0.9, 0.2]] {
+            assert!(same_bits(nc.pixel(p, [false; 3]), p), "{p:?}");
+        }
+    }
+
+    /// A white balance that isn't positive, or a matrix that can't be inverted, gets no move instead of a broken one.
+    #[test]
+    fn a_broken_colour_model_gets_no_move() {
+        let id = lcc_color::Mat3::IDENTITY;
+        assert!(NearClip::new([0.0, 1.0, 1.0], &id).is_none());
+        assert!(NearClip::new([f32::NAN, 1.0, 1.0], &id).is_none());
+        assert!(NearClip::new(WB, &lcc_color::Mat3([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]])).is_none());
+    }
+
+    /// After the rebuild a pixel with only red clipped moves green and blue as an unclipped neighbour does (left alone,
+    /// the band where only red clipped stayed 10–14 degrees redder than the wall around it at −3 EV: a hard orange line)
+    /// and keeps its rebuilt red. Every other clipped pixel keeps the rebuild's colour: two clipped channels (their rim's,
+    /// already moved), and warm light with only green clipped, whose blue moved toward red turned 10 degrees too red.
+    #[test]
+    fn only_red_clipped_moves_its_other_channels_and_other_clipped_pixels_keep_the_rebuild() {
+        let nc = near();
+        let band = [1.05, 0.9, 0.2];
+        let moved = nc.pixel(band, [true, false, false]);
+        assert_eq!(moved[0], band[0], "the rebuilt red stays");
+        assert!(moved[1] > band[1], "green moves as the wall's does: {moved:?}");
+        // the wall just outside, red 0.98 and unclipped, moves its green about as far
+        let wall = nc.pixel([0.98, 0.9, 0.2], [false; 3]);
+        assert!(wall[1] > 0.9 && moved[1] - band[1] > 0.5 * (wall[1] - 0.9), "{moved:?} {wall:?}");
+        // through the whole step: red and green clipped (x 32-47), only green clipped (x 48-63), a wall (x < 32)
+        let raw = Rgb32f::from_fn(64, 64, |x, _| match x {
+            0..32 => [0.9, 0.82, 0.2],
+            32..48 => [1.0, 1.0, 0.25],
+            _ => [0.8, 1.0, 0.5],
+        });
+        let how = lcc_raw::highlight::Rebuild { headroom: 0.0, rim_hue: true };
+        let mut ours = raw.clone();
+        model().rebuild_highlights_near_clip(&mut ours, None, how, &nc);
+        let mut rebuilt = raw.clone();
+        let colour = |p: [f32; 3]| nc.pixel(p, [false; 3]);
+        lcc_raw::highlight::reconstruct_how_rim(
+            &mut rebuilt,
+            WB,
+            HIGHLIGHT_CLIP,
+            clipped_white(&lcc_color::Mat3::IDENTITY),
+            how,
+            None,
+            Some(&colour),
+        );
+        assert_eq!(ours.get(40, 32), rebuilt.get(40, 32), "red and green clipped: the rebuild's");
+        assert_eq!(ours.get(56, 32), rebuilt.get(56, 32), "only green clipped: the rebuild's");
+        assert!(ours.get(8, 32)[1] > raw.get(8, 32)[1], "the unclipped wall moves");
+    }
+
+    /// Pixels whose raw channels all lie under the onset come out of the whole step (rebuild included) bit for bit as
+    /// they did before the near-clip colour existed, clipped areas next to them or not.
+    #[test]
+    fn under_the_onset_the_step_changes_nothing_anywhere_in_the_picture() {
+        let raw = Rgb32f::from_fn(96, 64, |x, y| match (x / 24, y % 3) {
+            (0, _) => [0.3, 0.2, 0.1],
+            (1, k) => [0.1 + 0.07 * k as f32, 0.33, 0.2],
+            (2, _) => [0.95, 0.88, 0.2],
+            _ => [1.0, 1.0, 0.3],
+        });
+        let how = lcc_raw::highlight::Rebuild { headroom: 0.0, rim_hue: true };
+        let mut before = raw.clone();
+        model().rebuild_highlights(&mut before, how);
+        let mut after = raw.clone();
+        model().rebuild_highlights_near_clip(&mut after, None, how, &near());
+        let mut low = 0;
+        for ((r, b), a) in raw.data.iter().zip(&before.data).zip(&after.data) {
+            if r.iter().all(|&v| v < 0.338) {
+                low += 1;
+                assert!(same_bits(*a, *b), "{r:?}: {b:?} -> {a:?}");
+            }
+        }
+        assert_eq!(low, 48 * 64);
+        // warm light near the clip does move
+        assert_ne!(after.get(60, 10), before.get(60, 10));
+    }
+
+    #[test]
+    fn clipped_channels_read_values_and_the_mask() {
+        let img = Rgb32f::from_fn(3, 1, |x, _| [[0.5, 0.5, 0.5], [0.995, 0.995, 0.5], [0.5, 0.5, 0.5]][x]);
+        assert_eq!(CameraColourModel::clipped_channels(&img, None), vec![0, CLIPPED_R | CLIPPED_G, 0]);
+        assert_eq!(CameraColourModel::clipped_channels(&img, Some(&[0, 0, CLIPPED_G])), vec![0, CLIPPED_R | CLIPPED_G, CLIPPED_G]);
+        // a mask of the wrong length is ignored
+        assert_eq!(CameraColourModel::clipped_channels(&img, Some(&[1])), vec![0, CLIPPED_R | CLIPPED_G, 0]);
     }
 }
 
@@ -892,9 +1143,12 @@ fn load_bytes_now(
         let finish = |mut img: Rgb32f| {
             let mut stages = vec![("develop", t0.elapsed())];
             stages.push(("transform", t0.elapsed()));
-            match &clip_mask {
-                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask, rebuild_of(&options)),
-                None => colour.rebuild_highlights(&mut img, rebuild_of(&options)),
+            // process V9: Lightroom Classic's colour near the clip, with the clipped highlights rebuilt to meet it
+            let near = options.highlight_headroom.then(|| NearClip::new(colour.wb, &colour.matrix)).flatten();
+            match (&near, &clip_mask) {
+                (Some(nc), mask) => colour.rebuild_highlights_near_clip(&mut img, mask.as_deref(), rebuild_of(&options), nc),
+                (None, Some(mask)) => colour.rebuild_highlights_masked(&mut img, mask, rebuild_of(&options)),
+                (None, None) => colour.rebuild_highlights(&mut img, rebuild_of(&options)),
             }
             stages.push(("highlights", t0.elapsed()));
             colour.apply(&mut img);
