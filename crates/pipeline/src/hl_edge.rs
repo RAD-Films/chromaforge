@@ -16,7 +16,9 @@
 //! a light rim around the clouds, while pixels 60 px away matched: Lightroom pulls bright tones near clipped areas
 //! further, following the areas' outlines. The clipped areas (brightest channel past the camera curve's white)
 //! are spread edge-aware, guided by log luminance, over a few hundredths of the frame, and bright tones within
-//! [`GATE`] EV of white get up to [`AMOUNT`] EV more pull where the spread is.
+//! [`GATE`] EV of white get up to [`AMOUNT`] EV more pull where the spread is, as far as their brightest channel has
+//! reached white ([`AT_WHITE`]). Unclipped sky beside a clipped core doesn't take it: it left the rings 3–48 px from
+//! the core 3–5 L* under Lightroom's −100, a blend that ended too soon, while partly clipped pixels need it.
 //!
 //! Both are taken once per photo on a fixed-size render of the whole frame ([`EDGE`] px long), so previews,
 //! zoomed windows and exports agree, and read back bilinearly at each output pixel.
@@ -43,6 +45,9 @@ const LEAK: f32 = 0.1;
 const FULL_AT: f32 = 0.5;
 /// Tones from `GATE + 1` EV under white (none) to `GATE` EV under it (all) get the pull.
 const GATE: f32 = 2.5;
+/// The pull next to clipped areas reaches pixels whose brightest channel lies within this many EV of white (none) to
+/// white (all).
+const AT_WHITE: f32 = 0.5;
 /// The surroundings' base: a bilateral grid this share of the long edge across (its Gaussian's sigma)…
 const WIDE: f32 = 0.03;
 /// …that merges tones within about this many EV (the width of its tone bins) and keeps larger steps apart.
@@ -127,8 +132,9 @@ fn unit_planes(img: &Rgb32f, ev: f32, white: Option<f32>, ppl: f64) -> (Plane, P
         *o = if log_lum([m, m, m]) + ev >= white { 1.0 } else { 0.0 };
     }
     let near = crate::masks::guided_cross(&log_l, &clipped, (RADIUS * ppl as f32).max(1.0), LEAK);
-    for ((o, n), l) in plane.data.iter_mut().zip(&near.data).zip(&log_l.data) {
-        let w = (n / FULL_AT).clamp(0.0, 1.0);
+    for (((o, n), l), c) in plane.data.iter_mut().zip(&near.data).zip(&log_l.data).zip(&img.data) {
+        let top = c[0].max(c[1]).max(c[2]);
+        let w = (n / FULL_AT).clamp(0.0, 1.0) * smooth(white - AT_WHITE, white, log_lum([top, top, top]) + ev);
         let v = -AMOUNT * w * smooth(white - GATE - 1.0, white - GATE, l + ev);
         *o = if v.is_finite() { v } else { 0.0 };
     }
@@ -264,6 +270,19 @@ mod tests {
         assert!(at(20, 40) > -0.1 * AMOUNT, "far from it: {}", at(20, 40));
         assert!(at(330, 120) == 0.0, "dark ground: {}", at(330, 120));
         assert!(p.data.iter().all(|v| v.is_finite() && *v <= 0.0 && *v >= -AMOUNT));
+    }
+
+    /// Sky a full stop under white right beside a clipped area takes none of the pull next to it: that pull made the
+    /// recovered rings around a clipped core too dark, so the blend ended too soon.
+    #[test]
+    fn unclipped_tones_beside_a_clipped_area_get_no_extra_pull() {
+        let (w, h) = (512usize, 128usize);
+        let white = 2.0f32;
+        let img = Rgb32f::from_fn(w, h, |x, _| [GREY * (if x < 256 { white - 1.0 } else { white + 1.0 }).exp2(); 3]);
+        let p = unit_plane(&img, 0.0, white, w as f64);
+        let at = |x: usize| p.data[64 * w + x];
+        assert_eq!(at(250), 0.0, "beside the clip: {}", at(250));
+        assert!(at(262) < -0.5 * AMOUNT, "in the clip: {}", at(262));
     }
 
     #[test]
