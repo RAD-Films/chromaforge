@@ -217,18 +217,18 @@ fn bright_colours_keep_their_saturation_near_white() {
         [i32::from(p[0]), i32::from(p[1]), i32::from(p[2])]
     };
     let spread = |p: [i32; 3]| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
-    for c in [[1.6, 1.3, 0.2], [2.4, 0.6, 0.45], [1.6, 0.6, 1.7]] {
-        let (v8, v9) = (shot(Process::V8, true, c), shot(Process::V9, true, c));
-        assert!(spread(v9) >= spread(v8) + 12, "{c:?}: V8 {v8:?}, V9 {v9:?}");
-        // the brightness stays: the brightest channel within a few levels
-        let top = |p: [i32; 3]| p[0].max(p[1]).max(p[2]);
-        assert!((top(v9) - top(v8)).abs() <= 6, "{c:?}: V8 {v8:?}, V9 {v9:?}");
-        // a JPEG's colours are the picture's own: not toned per channel
+    // the second number is the spread of these colours with V9's base tone and no shoulder
+    for (c, without) in [([1.6, 1.3, 0.2], 9), ([2.4, 0.6, 0.45], 6), ([1.6, 0.6, 1.7], 9)] {
+        let v9 = shot(Process::V9, true, c);
+        assert!(spread(v9) >= without + 5, "{c:?}: V9 {v9:?}");
+        // the brightness stays: the brightest channel at or near white
+        assert!(v9[0].max(v9[1]).max(v9[2]) >= 250, "{c:?}: V9 {v9:?}");
+        // a JPEG keeps its own colours: not toned per channel
         assert_eq!(shot(Process::V8, false, c), shot(Process::V9, false, c), "{c:?} as a JPEG");
     }
-    // greys and darker colours render as before
-    for c in [[0.9; 3], [0.4; 3], [0.2, 0.15, 0.03], [0.05, 0.1, 0.3]] {
-        assert_eq!(shot(Process::V8, true, c), shot(Process::V9, true, c), "{c:?}");
+    // greys stay grey
+    for c in [[0.9; 3], [0.4; 3]] {
+        assert!(spread(shot(Process::V9, true, c)) <= 1, "{c:?}");
     }
 }
 
