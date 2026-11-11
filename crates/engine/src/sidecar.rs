@@ -1411,7 +1411,7 @@ impl Session {
     fn sidecar_paths(&self, id: PhotoId, owners: &StemOwners) -> Result<(PathBuf, Vec<PathBuf>)> {
         let p = self.catalog.photo(id).ok_or(lcc_catalog::CatalogError::NoPhoto(id))?;
         if p.copy_of.is_some() {
-            return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the library", p.file_name)));
+            return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the catalog", p.file_name)));
         }
         let orig = file_path(p).ok_or_else(|| EngineError::Other(format!("{} is not a file on disk", p.file_name)))?;
         // A relative path would be taken from the working directory.
@@ -2015,6 +2015,7 @@ mod tests {
         list.push(lcc_raw::dcp::Calibrated {
             make: "LOOKTEST".into(),
             names: vec!["LOOKTEST ONE".into()],
+            lens: None,
             looks: vec![("cal:adobe-vivid".into(), dcp)],
             gated: Vec::new(),
             default: Some("cal:adobe-vivid".into()),

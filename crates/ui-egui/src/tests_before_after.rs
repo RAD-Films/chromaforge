@@ -235,10 +235,14 @@ fn both_before_after_panes_use_the_animated_rect_top_bottom() {
 }
 
 fn mean_around(shot: &egui::ColorImage, at: egui::Pos2) -> [f32; 3] {
+    mean_in(shot, at, 20, 20)
+}
+
+fn mean_in(shot: &egui::ColorImage, at: egui::Pos2, half_w: usize, half_h: usize) -> [f32; 3] {
     let mut sum = [0.0f32; 3];
     let mut n = 0.0;
-    for y in (at.y as usize - 20)..=(at.y as usize + 20) {
-        for x in (at.x as usize - 20)..=(at.x as usize + 20) {
+    for y in (at.y as usize - half_h)..=(at.y as usize + half_h) {
+        for x in (at.x as usize - half_w)..=(at.x as usize + half_w) {
             let c = shot[(x, y)];
             sum[0] += f32::from(c.r());
             sum[1] += f32::from(c.g());
@@ -289,7 +293,9 @@ fn zoomed_in_the_after_side_shows_the_edits() {
                 assert!((luma(a) - luma(e)).abs() < 6.0, "{mode:?} {zoom:?}: the After side {a:?} is the edited photo {e:?}");
                 assert!((luma(b) - luma(o)).abs() < 6.0, "{mode:?} {zoom:?}: the Before side {b:?} is the original {o:?}");
             } else {
-                // two views of the same point of the photo: the After one is the brighter
+                // two views of the same part of the photo: the After one is the brighter (a wide patch: under process
+                // V9's base tone a small one can sit on near-white sky, where more exposure barely shows)
+                let (a, b) = (mean_in(&s, after, 100, 70), mean_in(&s, before, 100, 70));
                 assert!(luma(a) > luma(b) + 30.0, "{mode:?} {zoom:?}: the After {a:?} is the edited photo, brighter than the Before {b:?}");
             }
         }

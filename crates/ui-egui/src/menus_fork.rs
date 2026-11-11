@@ -19,12 +19,16 @@ pub(super) fn commands() -> impl Iterator<Item = &'static UiCommand> {
         .chain(crate::creations_ui::COMMANDS)
         .chain(PLUGIN_COMMANDS)
         .chain(crate::timelapse_ui::COMMANDS)
+        .chain(crate::email_photo::COMMANDS)
         .chain(crate::panels::filterbar::COMMANDS)
         .chain(crate::import_report::COMMANDS)
+        .chain(crate::comments_ui::COMMANDS)
+        .chain(crate::face_menu::COMMANDS)
         .chain(crate::modern::COMMANDS)
         .chain(crate::modern_library::COMMANDS)
         .chain(crate::modern_sheets::COMMANDS)
         .chain(GRADING_COMMANDS)
+        .chain(crate::lrc_menus::SOON_COMMANDS.iter())
 }
 
 /// The Edit panel's grading modes: Eboda, the Lightroom Classic panels (the default), and
@@ -54,12 +58,17 @@ const PLUGIN_COMMANDS: &[UiCommand] = &[
     ("plugins.runItem", "Run Plug-in Command", None, ""),
     ("plugins.page", "Plug-in Settings", None, ""),
     ("plugins.showFolder", "Show Plug-ins Folder", None, ""),
+    ("plugins.openLink", "Open Plug-in Link", None, ""),
 ];
 #[cfg(target_arch = "wasm32")]
 const PLUGIN_COMMANDS: &[UiCommand] = &[];
 
 /// The fork's modules' commands, then the fork's own UI command arms.
 pub(super) fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
+    // a greyed "Coming soon" menu item never runs anything
+    if let Some(c) = crate::lrc_menus::coming_soon(id) {
+        return Some(Err(format!("{} is coming soon", c.label)));
+    }
     if let Some(r) = crate::module::run(app, id, p) {
         return Some(r);
     }
@@ -86,10 +95,19 @@ pub(super) fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value,
     if let Some(r) = crate::timelapse_ui::run(app, id, p) {
         return Some(r);
     }
+    if let Some(r) = crate::email_photo::run(app, id, p) {
+        return Some(r);
+    }
     if let Some(r) = crate::panels::filterbar::run(app, id, p) {
         return Some(r);
     }
+    if let Some(r) = crate::face_menu::run(app, id, p) {
+        return Some(r);
+    }
     if let Some(r) = crate::import_report::run(app, id, p) {
+        return Some(r);
+    }
+    if let Some(r) = crate::comments_ui::run(app, id, p) {
         return Some(r);
     }
     if let Some(r) = crate::libtools::run(app, id, p) {
@@ -252,8 +270,14 @@ pub(super) fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value,
 
 /// Enabled state of the fork's modules' commands.
 pub(super) fn enabled(app: &LccApp, id: &str) -> Option<bool> {
+    if crate::lrc_menus::is_coming_soon(id) {
+        return Some(false);
+    }
     crate::module::enabled(app, id)
         .or_else(|| crate::catalog_ui::enabled(app, id))
         .or_else(|| crate::timelapse_ui::enabled(app, id))
+        .or_else(|| crate::email_photo::enabled(app, id))
         .or_else(|| crate::import_report::enabled(app, id))
+        .or_else(|| crate::comments_ui::enabled(app, id))
+        .or_else(|| crate::face_menu::enabled(app, id))
 }

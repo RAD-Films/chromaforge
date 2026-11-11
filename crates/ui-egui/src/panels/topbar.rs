@@ -70,7 +70,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
             let mut cx = bar.center().x;
             if !app.native_menu {
                 // leave room for the in-window menus left of the (centred) search field
-                let menus_right = full.left() + 140.0 + crate::menubar::bar_width(ui) + 24.0;
+                let menus_right = full.left() + 140.0 + crate::menubar::bar_width(ui, app.ui.module) + 24.0;
                 sw = sw.min(2.0 * (cx - menus_right)).max(190.0);
                 // the Import | Library tabs leave the menus no room beside a centred field: the
                 // field moves right of them, while it still fits before the icons
@@ -225,7 +225,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                 ui.painter().text(c, Align2::CENTER_CENTER, active.to_string(), t.semibold(9.5), t.canvas);
             }
             let fresp = fresp.on_hover_text(if active > 0 {
-                crate::i18n::tr_format!("Filter bar — {active} active filter{}", if active == 1 { "" } else { "s" }, active = active)
+                crate::i18n::tr_format!("Filter bar: {active} active filter{}", if active == 1 { "" } else { "s" }, active = active)
             } else {
                 crate::i18n::tr("Filter bar").into()
             });

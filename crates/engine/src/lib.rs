@@ -45,8 +45,11 @@ pub mod desktop;
 pub mod devices;
 pub mod disk_delete;
 pub mod display;
+pub mod dng_update;
+pub mod dng_validate;
 pub mod doc_path;
 pub mod dust_map;
+pub mod email;
 pub mod enhance;
 mod errors;
 pub mod export;
@@ -140,6 +143,7 @@ pub mod smart_masks;
 pub mod source_report;
 pub mod sync;
 mod sync_same;
+pub mod template_folders;
 pub mod text;
 pub mod timelapse;
 #[cfg(not(target_arch = "wasm32"))]
@@ -183,7 +187,7 @@ pub enum EngineError {
     /// The folder (or file) asked for is a Lightroom Classic catalog or part of one, not a
     /// library of the app (issue #891): nothing was created or opened. `catalog`: the `.lrcat`
     /// to import with `library.importLightroom`, when one was found.
-    #[error("{} is a Lightroom Classic catalog, not a library of the app; import it into a library with File ▸ Import Lightroom Catalog…{}", path.display(), catalog.as_ref().map_or(String::new(), |c| format!(" ({})", c.display())))]
+    #[error("{} is a Lightroom Classic catalog, not a catalog of the app; import it into one with File ▸ Import Lightroom Catalog…{}", path.display(), catalog.as_ref().map_or(String::new(), |c| format!(" ({})", c.display())))]
     LightroomCatalog { path: std::path::PathBuf, catalog: Option<std::path::PathBuf> },
     /// The work was cancelled (by the person, an agent or a newer request): not a failure.
     #[error("{0}")]
@@ -311,6 +315,8 @@ pub struct Session {
     pub auto_applied: std::collections::HashMap<PhotoId, [f64; 8]>,
     pub catalog: Catalog,
     pub source: LibrarySource,
+    /// The sources `library.source` showed, for Go Back / Go Forward (`library.sourceBack`); not saved.
+    pub(crate) source_history: view::SourceHistory,
     pub filter: Filter,
     /// The filter `library.toggleFilters` put aside (Library > Enable Filters off); not persisted.
     pub(crate) shelved_filter: Option<Filter>,
@@ -450,6 +456,14 @@ pub struct Session {
     /// Whether the [`LibrarySource::LibraryFolder`] view also shows the photos of the folders
     /// inside the chosen one (Show Photos in Subfolders, on by default).
     pub folder_subfolders: bool,
+    /// Lock Filters (on by default): the filter bar's filter stays when another source is chosen.
+    /// Off, choosing a source starts from the filter that source had (see `remember_filters`) or none.
+    pub lock_filters: bool,
+    /// Remember Each Source's Filters Separately: with `lock_filters` off, each source gets back
+    /// the filter it had when it was left.
+    pub remember_filters: bool,
+    /// The filter each source had when it was left (key: [`Session::source_key`]); not saved.
+    pub source_filters: std::collections::HashMap<String, Filter>,
     /// Copied metadata (`photo.copyMetadata`): photo.setMeta params.
     pub meta_clipboard: Option<Value>,
     /// The photo that was active before the current one (Paste Settings from Previous).
@@ -555,6 +569,9 @@ pub struct Session {
     pub print: print::template::PrintSettings,
     /// Saved print templates (`print.template.*`), persisted in prefs.json.
     pub print_templates: Vec<print::template::PrintTemplate>,
+    /// The Template Browser's folders besides [`template_folders::DEFAULT_FOLDER`], sorted by name
+    /// (`print.template.folder.*`), persisted in prefs.json.
+    pub print_template_folders: Vec<String>,
     /// Metadata presets (`metadata.*`), persisted in prefs.json.
     pub metadata_presets: Vec<cmd::metadata::MetadataPreset>,
     /// Import presets: named sets of the Import tab's settings (persisted in prefs.json).
@@ -714,6 +731,16 @@ impl Default for Session {
 }
 
 impl Session {
+    /// What the next Auto Import listing looks at (`None`: no active watched folder).
+    pub fn auto_import_scope(&self) -> Option<cmd::library::AutoImportScope> {
+        let folder = self.import_defaults.auto_active_folder()?.clone();
+        Some(cmd::library::AutoImportScope {
+            folder,
+            subfolders: self.import_defaults.auto_options.subfolders,
+            skip: self.library.as_ref().map(|l| l.dir.clone()),
+        })
+    }
+
     pub fn library_generation(&self) -> u64 {
         self.library_generation
     }
@@ -740,6 +767,7 @@ impl Session {
             auto_applied: Default::default(),
             catalog: Catalog::new(),
             source: LibrarySource::All,
+            source_history: Default::default(),
             filter: Filter::default(),
             shelved_filter: None,
             sort: Sort::default(),
@@ -811,6 +839,9 @@ impl Session {
             browse: None,
             library_folder: None,
             folder_subfolders: true,
+            lock_filters: true,
+            remember_filters: false,
+            source_filters: Default::default(),
             previous_active: None,
             dialogs: Default::default(),
             preset_undo: None,
@@ -853,6 +884,7 @@ impl Session {
             export_presets: Vec::new(),
             print: Default::default(),
             print_templates: Vec::new(),
+            print_template_folders: Vec::new(),
             metadata_presets: Vec::new(),
             import_presets: Vec::new(),
             filter_presets: Vec::new(),
@@ -2374,6 +2406,39 @@ impl Session {
     /// one, or nothing when the view is empty. A view never keeps an active photo it doesn't show
     /// (issue #1447: a Local folder kept a library photo active, so Detail and the info showed a
     /// photo the grid didn't).
+    /// Names the shown source for [`Session::source_filters`] (a folder or collection by its id/path).
+    pub(crate) fn source_key(&self) -> String {
+        match self.source {
+            LibrarySource::LibraryFolder => format!("folder:{}", lcc_catalog::query::folder_key(self.library_folder.as_deref().unwrap_or_default())),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// After the source changed from `left` (key, filter it had): with Lock Filters off, a new source
+    /// starts unfiltered, or with the filter it had when last left when remembering per source.
+    pub(crate) fn switch_source_filter(&mut self, left_key: String, left_filter: Filter) {
+        if self.lock_filters {
+            return;
+        }
+        let key = self.source_key();
+        if key == left_key {
+            return;
+        }
+        if self.remember_filters {
+            // (bounded: one entry per source ever left, folders can be many)
+            if self.source_filters.len() < 10_000 || self.source_filters.contains_key(&left_key) {
+                self.source_filters.insert(left_key, left_filter);
+            }
+        }
+        self.filter = if self.remember_filters { self.source_filters.get(&key).cloned().unwrap_or_default() } else { Filter::default() };
+        // one folder / collection at a time, as `library.source` does
+        self.filter.album = None;
+        if self.source == LibrarySource::LibraryFolder {
+            self.filter.library_folder = None;
+        }
+        self.shelved_filter = None;
+    }
+
     pub fn keep_active_in_view(&mut self) {
         let active = self.selection.active;
         let vis = self.visible();
@@ -2527,6 +2592,8 @@ mod tests_albums_local;
 #[cfg(test)]
 mod tests_app_store;
 #[cfg(test)]
+mod tests_auto_import;
+#[cfg(test)]
 mod tests_auto_mask_range;
 #[cfg(test)]
 mod tests_autosync;
@@ -2567,10 +2634,17 @@ mod tests_crop_aspect;
 #[cfg(test)]
 mod tests_crop_aspects;
 #[cfg(test)]
+mod tests_crop_same;
+#[cfg(test)]
 mod tests_denoise;
 #[cfg(test)]
 #[cfg(feature = "denoise")]
 mod tests_denoise_own;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_dng_update;
+#[cfg(test)]
+mod tests_dng_validate;
 #[cfg(test)]
 mod tests_edit_in;
 #[cfg(test)]
@@ -2711,6 +2785,8 @@ mod tests_retouch;
 #[cfg(test)]
 mod tests_segment;
 #[cfg(test)]
+mod tests_select_menu;
+#[cfg(test)]
 mod tests_sensor;
 #[cfg(test)]
 mod tests_settings_files;
@@ -2724,6 +2800,8 @@ mod tests_source_report;
 mod tests_spots;
 #[cfg(test)]
 mod tests_sync;
+#[cfg(test)]
+mod tests_sync_copies;
 #[cfg(test)]
 mod tests_target_params;
 #[cfg(test)]

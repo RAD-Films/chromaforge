@@ -371,9 +371,9 @@ fn merge_calibrations(
     mut list: Vec<lcc_camdb::calibration::Calibration>,
     dev: Vec<lcc_camdb::calibration::Calibration>,
 ) -> Vec<lcc_camdb::calibration::Calibration> {
-    // a development calibration replaces the bundled one for the same camera and editor; other editors' stay
+    // a development calibration replaces the bundled one for the same camera, lens and editor; the others stay
     for c in dev {
-        list.retain(|b| !(b.editor == c.editor && b.matches(Some(&c.make), &c.model)));
+        list.retain(|b| !b.same_slot(&c));
         list.push(c);
     }
     list
@@ -414,7 +414,7 @@ pub(crate) fn profile_for_at(
     if lcc_raw::color::is_rendered_rgb(color) {
         return None;
     }
-    lcc_raw::dcp::resolve_at(choice, meta.make.as_deref(), meta.model.as_deref()?, process)
+    lcc_raw::dcp::resolve_at(choice, meta.make.as_deref(), meta.model.as_deref()?, meta.lens_model.as_deref(), process)
 }
 
 /// Whether `id` names a camera-profile choice (`profile.camera`) rather than a look: `lc` (the app's own colour),
@@ -541,6 +541,7 @@ mod tests {
             make: "TESTMAKE".into(),
             model: model.into(),
             aliases: vec![],
+            lens: None,
             editor: c::Editor::Lightroom,
             method: c::METHOD.into(),
             tool_version: "1".into(),

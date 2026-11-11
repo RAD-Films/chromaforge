@@ -487,17 +487,34 @@ const DEVELOP_RIGHT: &[PanelId] = &[PanelId::Edit, PanelId::Crop, PanelId::Remov
 /// Library: (`[` / `]` rate in the grids, see `shortcuts::grid_bracket_command`); `\` the filter bar (in a loupe
 /// it stays Show Original, see `shortcuts::handle`); Home / End the first and last photo. `=` / `-`
 /// (thumbnail size) are the grids' `view.thumbSizeUp` / `view.thumbSizeDown`, not module keys.
-pub const LIBRARY_KEYS: &[ModuleKey] =
-    &[("\\", "view.filterBar", "{}"), ("Home", "library.first", "{}"), ("End", "library.last", "{}"), crate::help_overlay::KEY];
+/// As in Lightroom Classic's Library: ⇧⌘U Auto White Balance, O the People view, ⌘← / ⌘→ the
+/// previous / next selected photo.
+pub const LIBRARY_KEYS: &[ModuleKey] = &[
+    ("\\", "view.filterBar", "{}"),
+    ("Home", "library.first", "{}"),
+    ("End", "library.last", "{}"),
+    ("Cmd+Shift+U", "develop.wb", r#"{"mode": "auto"}"#),
+    ("O", "view.people", "{}"),
+    ("Cmd+Left", "library.previous", "{}"),
+    ("Cmd+Right", "library.next", "{}"),
+    crate::help_overlay::KEY,
+];
 
-/// Develop: ⌘U Auto (tone), ⇧⌘U Auto white balance, ⇧Q cycles the selected spot's mode
+/// Develop: ⌘U Auto (tone), ⇧⌘U Auto white balance, ⌥⇧Q cycles the selected spot's mode
 /// (Remove → Heal → Clone), Home / End the first and last photo.
 pub const DEVELOP_KEYS: &[ModuleKey] = &[
     ("Cmd+U", "develop.auto", "{}"),
     ("Cmd+Shift+U", "develop.wb", r#"{"mode": "auto"}"#),
-    ("Shift+Q", "spot.cycleMode", "{}"),
+    ("Alt+Shift+Q", "spot.cycleMode", "{}"),
     ("Home", "library.first", "{}"),
     ("End", "library.last", "{}"),
+    // Lightroom Classic's Develop menu: ⌘N New Snapshot, ⇧⌘N New Preset, ⌘← / ⌘→ the previous /
+    // next photo; Tools ▸ Tool Overlay ▸ Always Show
+    ("Cmd+N", "version.create", "{}"),
+    ("Cmd+Shift+N", "dialog.createPreset", "{}"),
+    ("Cmd+Left", "library.previous", "{}"),
+    ("Cmd+Right", "library.next", "{}"),
+    ("Cmd+Shift+H", "view.toolOverlay", r#"{"mode": "always"}"#),
     crate::help_overlay::KEY,
 ];
 
@@ -601,14 +618,15 @@ fn views(ui: &mut egui::Ui, app: &mut LccApp) {
     // the originals the view keeps decoded (the loupe's even over budget), as the docked centre does
     panels::compare::prepare(app);
     panels::alternatives::show(app, ui);
-    match app.ui.view {
+    let rect = ui.available_rect_before_wrap();
+    crate::view_state::around(app, ui, rect, |app, ui| match app.ui.view {
         ViewMode::PhotoGrid | ViewMode::SquareGrid => panels::grid::show(app, ui),
         ViewMode::Detail => panels::detail::show(app, ui),
         ViewMode::Compare => panels::compare::show_compare(app, ui),
         ViewMode::Survey => panels::compare::show_survey(app, ui),
         ViewMode::Reference => panels::compare::show_reference(app, ui),
         ViewMode::People => panels::people::show(app, ui),
-    }
+    })
 }
 
 /// The module the view, the right panel and the module in use imply (Library or Develop).
@@ -730,7 +748,7 @@ pub fn switch(app: &mut LccApp, to: ModuleId) -> Result<Value, String> {
             if app.session.active().is_none() {
                 // Develop needs a photo: take the first one shown
                 let first = app.session.visible().first().copied();
-                let Some(first) = first else { return Err("Develop needs a photo: the library is empty".into()) };
+                let Some(first) = first else { return Err("Develop needs a photo: the catalog is empty".into()) };
                 app.run("library.select", json!({"ids": [first.0]}))?;
             }
             swap(app, to, true);
@@ -756,6 +774,18 @@ pub fn switch(app: &mut LccApp, to: ModuleId) -> Result<Value, String> {
             app.ui.tool.clear();
         }
         _ => {
+            // Export and Print act on the selection, but from Develop the photo to act on is the
+            // one open on screen: there the filmstrip selection can hold several photos (stepping
+            // through a selection keeps it), and exporting that stale selection instead of the
+            // photo being edited surprises. Lightroom exports the photo Develop shows, so the
+            // open photo becomes the selection; a selection made in another module is kept.
+            if matches!(to, ModuleId::Export | ModuleId::Print)
+                && app.ui.module == ModuleId::Develop
+                && let Some(active) = app.session.active()
+                && !(app.session.selection.ids.as_slice() == [active])
+            {
+                let _ = app.run("library.select", json!({ "ids": [active.0] }));
+            }
             swap(app, to, true);
             app.ui.placeholder_from = Some((app.ui.view, app.ui.right));
         }
@@ -845,10 +875,15 @@ pub const SHELL_COMMANDS: &[crate::menus::UiCommand] = &[
     // the Slideshow module (crate::slideshow_ui)
     ("slideshow.get", "Slideshow Settings", None, ""),
     ("slideshow.set", "Set Slideshow Settings", None, ""),
+    ("slideshow.toggleGuides", "Show Guides", None, ""),
     ("slideshow.reset", "Reset Slideshow Settings", None, ""),
     ("slideshow.applyTemplate", "Apply Slideshow Template", None, ""),
     ("slideshow.saveTemplate", "Save Slideshow Template", None, "Slideshow"),
     ("slideshow.deleteTemplate", "Delete Slideshow Template", None, ""),
+    ("slideshow.createTemplateFolder", "New Slideshow Template Folder", None, ""),
+    ("slideshow.renameTemplateFolder", "Rename Slideshow Template Folder", None, ""),
+    ("slideshow.deleteTemplateFolder", "Delete Slideshow Template Folder", None, ""),
+    ("slideshow.moveTemplate", "Move Slideshow Template to Folder", None, ""),
     ("slideshow.saveSlideshow", "Create Saved Slideshow", None, "Slideshow"),
     ("slideshow.openSaved", "Open Saved Slideshow", None, ""),
     ("slideshow.closeSaved", "Close Saved Slideshow", None, ""),
@@ -870,9 +905,19 @@ pub const SHELL_COMMANDS: &[crate::menus::UiCommand] = &[
     ("webui.shareImmich", "Share Web Gallery via Immich", None, ""),
     ("webui.reload", "Reload Preview", None, "Web"),
     ("webui.previewInBrowser", "Preview in Browser…", None, "Web"),
+    ("webui.applyTemplate", "Apply Web Template", None, ""),
+    ("webui.saveTemplate", "Save Web Template", None, "Web"),
+    ("webui.deleteTemplate", "Delete Web Template", None, ""),
+    ("webui.createTemplateFolder", "New Web Template Folder", None, ""),
+    ("webui.renameTemplateFolder", "Rename Web Template Folder", None, ""),
+    ("webui.deleteTemplateFolder", "Delete Web Template Folder", None, ""),
+    ("webui.moveTemplate", "Move Web Template to Folder", None, ""),
+    ("webui.templates", "Web Templates", None, ""),
+    ("webui.guides", "Show Web Guides", None, "Web"),
     // the Book module (crate::book)
     ("book.new", "New Book", None, ""),
     ("book.get", "Book Document", None, ""),
+    ("book.preferences", "Book Preferences", None, ""),
     ("book.autoLayout", "Auto Layout", None, ""),
     ("book.clearLayout", "Clear Layout", None, ""),
     ("book.addPage", "Add Page", None, ""),
@@ -885,6 +930,8 @@ pub const SHELL_COMMANDS: &[crate::menus::UiCommand] = &[
     ("book.pageText", "Page Text", None, ""),
     ("book.textPreset", "Text Style Preset", None, ""),
     ("book.guides", "Guides", None, ""),
+    ("book.toggleGuides", "Show Guides", None, ""),
+    ("book.refreshCaptions", "Update Metadata Based Captions", None, ""),
     ("book.favorite", "Favorite Template", None, ""),
     ("book.templates", "Page Templates", None, ""),
     ("book.presets", "Auto Layout Presets", None, ""),
@@ -898,6 +945,8 @@ pub const SHELL_COMMANDS: &[crate::menus::UiCommand] = &[
     ("book.redo", "Redo Book Edit", None, ""),
     ("book.view", "Book View", None, ""),
     ("book.go", "Go to Book Page", None, ""),
+    ("book.headerBar", "Show Header Bar", None, ""),
+    ("book.infoOverlay", "Show Info Overlay", None, ""),
     ("book.select", "Select Book Cell", None, ""),
     ("book.export", "Export Book…", None, ""),
     ("book.exportStatus", "Book Export Status", None, ""),
@@ -946,6 +995,9 @@ fn run_inner(app: &mut LccApp, id: &str, p: &Value) -> Result<Value, String> {
         return r;
     }
     if let Some(r) = crate::web_module::run(app, id, p) {
+        return r;
+    }
+    if let Some(r) = crate::web_templates::run(app, id, p) {
         return r;
     }
     if id == crate::help_overlay::COMMAND {
