@@ -22,6 +22,10 @@
 //! ([`NegEvLift::new`]), at the scene tone the pixel's luminance has under the Exposure: a saturated colour's luminance
 //! lies below its brightest channel (the gap, [`GAP_STEP`]), on a steeper part of the curve, so it takes less EV for the
 //! same L*. Pixels past the clip (rebuilt highlights, headroom < 0) take the clip's lift.
+//!
+//! **Deeper Exposures and Highlights.** From −2 EV the middle headrooms (0.1..2.5 EV) get less ([`DEEP_DIP`]), and a
+//! negative Highlights takes the lift off in proportion, all of it at −100 ([`highlights_share`]): Lightroom Classic
+//! lifts nothing near the clip at Exposure −1 with Highlights −100 (Nikon Z6III frames, Nov 2026).
 
 use crate::tone::{GREY, ToneMap};
 
@@ -46,16 +50,46 @@ pub struct NegEvLift {
     pub table: Vec<f32>,
 }
 
-/// The lift in L* at `headroom` EV under white ([`TARGET`]).
-fn target(headroom: f32) -> f32 {
-    let h = headroom.max(0.0);
-    for w in TARGET.windows(2) {
+/// What a deeper Exposure takes off the lift (L*) by headroom, fully from −2 EV (in proportion from −1).
+///
+/// **Measured.** At −2 and −3 EV, with [`TARGET`] alone, our render came out lighter than Lightroom Classic between
+/// about 0.1 and 1.5 EV of headroom while it matched at the clip: R5 C (16 frames at −3, 3 at −2) by 0.2..0.6 L*,
+/// Nikon Z6III (7 frames at −2) by 0.3..1.1; most between 0.25 and 1 EV. At −1 EV the R5 C frames matched across every headroom, so nothing
+/// changes there.
+const DEEP_DIP: [(f32, f32); 6] = [(0.0, 0.0), (0.25, 0.4), (0.5, 0.5), (1.0, 0.4), (1.5, 0.15), (2.5, 0.0)];
+
+/// How much of the lift a negative Highlights leaves: all of it at 0 and above, none at −100.
+///
+/// **Measured.** Nikon Z6III, 7 frames exported at Exposure −1 with Highlights −100: Lightroom Classic lifts
+/// nothing near the clip there (our render without the lift is already 3..4 L* lighter than its export between 0.1
+/// and 1 EV of headroom, and the lift added 2.3..2.6 more), against +1..+2 L* lifted at Highlights 0 on the same frames.
+/// Between the two it is taken in proportion; a positive Highlights keeps the whole lift (not measured).
+fn highlights_share(highlights: f32) -> f32 {
+    if highlights.is_finite() { (1.0 + highlights.min(0.0) / 100.0).clamp(0.0, 1.0) } else { 1.0 }
+}
+
+/// `points`, linear between them and held past the ends, at `x` (from 0).
+fn lerp_table(points: &[(f32, f32)], x: f32) -> f32 {
+    let h = x.max(0.0);
+    for w in points.windows(2) {
         let ((h0, l0), (h1, l1)) = (w[0], w[1]);
         if h <= h1 {
             return l0 + (l1 - l0) * ((h - h0) / (h1 - h0)).clamp(0.0, 1.0);
         }
     }
-    0.0
+    points.last().map_or(0.0, |p| p.1)
+}
+
+/// The lift in L* at `headroom` EV under white for Exposure `ev` (negative) and Highlights `highlights`.
+fn lift_lstar(headroom: f32, ev: f32, highlights: f32) -> f32 {
+    let strength = (-ev).clamp(0.0, 1.0);
+    let deep = (-ev - 1.0).clamp(0.0, 1.0);
+    ((strength * target(headroom) - deep * lerp_table(&DEEP_DIP, headroom)).max(0.0)) * highlights_share(highlights)
+}
+
+/// The lift in L* at `headroom` EV under white ([`TARGET`]).
+fn target(headroom: f32) -> f32 {
+    lerp_table(&TARGET, headroom)
 }
 
 /// CIE L* of a display-linear luminance (1 = white).
@@ -80,20 +114,19 @@ pub fn keep_colour(plain: [f32; 3], lifted: [f32; 3]) -> [f32; 3] {
 }
 
 impl NegEvLift {
-    /// The lift for Exposure `ev` on the base tone map `tone`; `None` at Exposure 0 and above, without a white, or
-    /// when the table has nothing to add.
-    pub fn new(tone: &ToneMap, ev: f32) -> Option<NegEvLift> {
+    /// The lift for Exposure `ev` and Highlights `highlights` (−100..100) on the base tone map `tone`; `None` at
+    /// Exposure 0 and above, without a white, or when the table has nothing to add (Highlights −100).
+    pub fn new(tone: &ToneMap, ev: f32, highlights: f32) -> Option<NegEvLift> {
         if !ev.is_finite() || ev >= 0.0 {
             return None;
         }
         let white = crate::hl_edge::white_of(tone)?;
-        let strength = (-ev).min(1.0);
         let shown = |t: f32| lstar(tone.apply(GREY * t.exp2()));
         let table: Vec<f32> = (0..N * GAPS)
             .map(|k| {
                 let h = (k / GAPS) as f32 * STEP;
                 let gap = (k % GAPS) as f32 * GAP_STEP;
-                let want = strength * target(h);
+                let want = lift_lstar(h, ev, highlights);
                 // the scene tone of the luminance of a pixel with this headroom and gap under the Exposure
                 let t = white - h - gap + ev;
                 let l0 = shown(t);
@@ -153,24 +186,25 @@ mod tests {
     fn nothing_at_exposure_zero_and_above() {
         let t = tone();
         for ev in [0.0, 0.01, 1.0, 3.0, f32::NAN, f32::INFINITY] {
-            assert!(NegEvLift::new(&t, ev).is_none(), "{ev}");
+            assert!(NegEvLift::new(&t, ev, 0.0).is_none(), "{ev}");
         }
     }
 
     /// At −1 and −3 EV the lift raises L* by the measured amount at each headroom (a neutral pixel), and at −0.5 EV by
-    /// half of it.
+    /// half of it; from −2 EV less between 0.1 and 2.5 EV of headroom, the same at the clip and deep down.
     #[test]
     fn the_lift_reaches_the_measured_lightness() {
         let t = tone();
-        for (ev, share) in [(-1.0f32, 1.0f32), (-3.0, 1.0), (-0.5, 0.5)] {
-            let l = NegEvLift::new(&t, ev).expect("a lift below Exposure 0");
+        for ev in [-1.0f32, -3.0, -0.5] {
+            let l = NegEvLift::new(&t, ev, 0.0).expect("a lift below Exposure 0");
+            assert!((lift_lstar(0.0, ev, 0.0) - (-ev).min(1.0) * target(0.0)).abs() < 1e-6, "the clip's full share");
             for h in [0.0f32, 0.5, 1.0, 2.0, 3.5] {
                 let m = GREY * (l.white - h).exp2();
                 let lift = l.at([m; 3]);
                 let tone_at = |x: f32| lstar(t.apply(GREY * x.exp2()));
                 let s = l.white - h + ev;
                 let got = tone_at(s + lift) - tone_at(s);
-                assert!((got - share * target(h)).abs() < 0.05, "ev {ev} headroom {h}: {got} L*");
+                assert!((got - lift_lstar(h, ev, 0.0)).abs() < 0.05, "ev {ev} headroom {h}: {got} L*");
             }
             assert_eq!(l.at([GREY * (l.white - 5.0).exp2(); 3]), 0.0, "deep tones keep their place");
             // past the clip: the clip's lift; not a colour: none
@@ -180,6 +214,39 @@ mod tests {
                 assert!(v.is_finite() && v >= 0.0, "{bad:?}: {v}");
             }
         }
+    }
+
+    /// A deeper Exposure than −1 takes the measured dip off the lift between the clip and 2.5 EV of headroom only.
+    #[test]
+    fn a_deeper_exposure_lifts_the_middle_headroom_less() {
+        for h in [0.0f32, 3.0, 4.0] {
+            assert!((lift_lstar(h, -3.0, 0.0) - target(h)).abs() < 1e-6, "{h}");
+        }
+        for h in [0.5f32, 1.0] {
+            assert!((lift_lstar(h, -1.0, 0.0) - target(h)).abs() < 1e-6);
+            let dip = lerp_table(&DEEP_DIP, h);
+            assert!(dip > 0.3 && (target(h) - lift_lstar(h, -2.0, 0.0) - dip).abs() < 1e-6, "{h}");
+            assert_eq!(lift_lstar(h, -2.0, 0.0), lift_lstar(h, -4.0, 0.0));
+            let half = lift_lstar(h, -1.5, 0.0);
+            assert!((half - (target(h) - 0.5 * dip)).abs() < 1e-6, "{h}: {half}");
+        }
+    }
+
+    /// A negative Highlights takes the lift off in proportion, all of it at −100; a positive one keeps it all.
+    #[test]
+    fn a_negative_highlights_backs_the_lift_off() {
+        let t = tone();
+        assert!(NegEvLift::new(&t, -1.0, -100.0).is_none(), "nothing left to lift at Highlights -100");
+        let full = NegEvLift::new(&t, -1.0, 0.0).expect("a lift");
+        assert_eq!(NegEvLift::new(&t, -1.0, 60.0).as_ref(), Some(&full), "a positive Highlights keeps it");
+        assert_eq!(NegEvLift::new(&t, -1.0, f32::NAN).as_ref(), Some(&full), "a bad Highlights keeps it");
+        for h in [0.0f32, 0.5, 2.0] {
+            assert!((lift_lstar(h, -1.0, -50.0) - 0.5 * target(h)).abs() < 1e-6, "{h}");
+            assert_eq!(lift_lstar(h, -3.0, -100.0), 0.0);
+        }
+        let half = NegEvLift::new(&t, -1.0, -50.0).expect("half a lift");
+        let m = [GREY * full.white.exp2(); 3];
+        assert!(half.at(m) > 0.0 && half.at(m) < full.at(m), "{} vs {}", half.at(m), full.at(m));
     }
 
     /// Only a process-V9 raw rendered for SDR under a negative Exposure carries the lift; everything else renders
@@ -234,7 +301,7 @@ mod tests {
     /// headroom and takes more lift.
     #[test]
     fn the_lift_follows_the_brightest_channel() {
-        let l = NegEvLift::new(&tone(), -2.0).expect("a lift");
+        let l = NegEvLift::new(&tone(), -2.0, 0.0).expect("a lift");
         let m = GREY * (l.white - 0.25).exp2();
         assert!(l.at([m; 3]) > l.at([0.25 * m; 3]), "less headroom, more lift");
         // the same luminance (the neutral at 0.25 m) with red near the clip
@@ -250,7 +317,7 @@ mod tests {
     fn a_saturated_colour_is_lifted_on_its_luminance() {
         let t = tone();
         let ev = -2.0f32;
-        let l = NegEvLift::new(&t, ev).expect("a lift");
+        let l = NegEvLift::new(&t, ev, 0.0).expect("a lift");
         let m = GREY * (l.white - 0.25).exp2();
         // luminance exactly one stop under red (on the table's gap grid)
         let warm = [m, (0.5 - lcc_color::LUMA_2020[0] - 0.12 * lcc_color::LUMA_2020[2]) / lcc_color::LUMA_2020[1] * m, 0.12 * m];
@@ -259,6 +326,6 @@ mod tests {
         let s = (y / GREY).log2() + ev;
         let shown = |x: f32| lstar(t.apply(GREY * x.exp2()));
         let got = shown(s + l.at(warm)) - shown(s);
-        assert!((got - target(0.25)).abs() < 0.1, "{got} L*");
+        assert!((got - lift_lstar(0.25, ev, 0.0)).abs() < 0.1, "{got} L*");
     }
 }

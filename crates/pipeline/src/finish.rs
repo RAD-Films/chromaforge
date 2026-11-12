@@ -487,7 +487,7 @@ impl FinishParams {
         let per_channel = tone_per_channel(s, info, peak);
         let tone = base_tone(s, info, peak);
         let negev_lift = (s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info) && peak <= 1.0)
-            .then(|| crate::negev_lift::NegEvLift::new(&tone, ev))
+            .then(|| crate::negev_lift::NegEvLift::new(&tone, ev, s.light.highlights as f32))
             .flatten()
             .map(std::sync::Arc::new);
         FinishParams {

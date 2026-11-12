@@ -1110,7 +1110,8 @@ fn v9_highlights_pull_next_to_clipped_areas_matches() {
 }
 
 /// Process V9's highlight lift under a negative Exposure (`lcc_pipeline::negev_lift`): the GPU lifts the same pixels
-/// by the same table as the CPU, at −0.5, −1 and −3 EV, on the whole frame, a window and under a mask's Exposure.
+/// by the same table as the CPU, at −0.5, −1, −2 and −3 EV, at Highlights 0 and −50, on the whole frame, a window and
+/// under a mask's Exposure.
 #[test]
 fn v9_negative_exposure_highlight_lift_matches() {
     if !gpu() {
@@ -1128,14 +1129,15 @@ fn v9_negative_exposure_highlight_lift_matches() {
     }));
     let info = SourceInfo { raw: true, ..Default::default() };
     let win = lcc_pipeline::PixelWindow { x: 200, y: 60, w: 240, h: 180 };
-    for ev in [-0.5, -1.0, -3.0] {
+    for (ev, hl) in [(-0.5, 0.0), (-1.0, 0.0), (-2.0, 0.0), (-3.0, 0.0), (-1.0, -50.0), (-3.0, -50.0)] {
         let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
         s.light.exposure = ev;
+        s.light.highlights = hl;
         let tone = lcc_pipeline::finish::base_tone(&s, &info, 1.0);
-        assert!(lcc_pipeline::negev_lift::NegEvLift::new(&tone, ev as f32).is_some(), "Exposure {ev}: the lift is on");
+        assert!(lcc_pipeline::negev_lift::NegEvLift::new(&tone, ev as f32, hl as f32).is_some(), "Exposure {ev}: the lift is on");
         let req = RenderRequest::fit(w, h);
-        check(&format!("V9 negative-Exposure lift {ev}"), &src, &info, &s, &req);
-        check(&format!("V9 negative-Exposure lift {ev} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl}"), &src, &info, &s, &req);
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
         s.masks = vec![Mask {
             components: vec![MaskComponent {
                 anchor: None,
@@ -1147,7 +1149,7 @@ fn v9_negative_exposure_highlight_lift_matches() {
             adjust: lcc_develop::LocalAdjustments { exposure: 0.5, ..Default::default() },
             ..Default::default()
         }];
-        check(&format!("V9 negative-Exposure lift {ev} with a mask"), &src, &info, &s, &req);
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl} with a mask"), &src, &info, &s, &req);
     }
 }
 
