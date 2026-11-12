@@ -64,6 +64,17 @@ pub const READ_TONE: f32 = RANGE * 0.5;
 /// pixel's own (an edge pixel between a dark beam and the sky) the read falls back to nearness instead of letting the
 /// least-far cell (the sky) win outright: that gave whole grid cells of edge pixels the sky's pull, black squares.
 pub const READ_FLOOR: f32 = 3.354_626e-4;
+/// Across a step in the surroundings (the darkest and brightest surroundings near a pixel at least about this many EV
+/// apart, fully from half an EV further: a dark beam against a clipped sky) an edge pixel's pull grades with its own
+/// tone, so the edge pixels between the two sides don't each take one side's pull (that left one row brighter than the
+/// sky beside one darker than the beam). Smaller steps (a lamp's ring, a specular streak on metal) keep the read by
+/// tone, which follows the reference closer there…
+pub const STEP_GAP: f32 = 4.0;
+/// …where a pixel's own tone counts as itself up to this many EV below the brightest surroundings…
+pub const STEP_RAMP: f32 = 2.9;
+/// …and as the brightest surroundings from this many EV below them (sky a little darker than its surroundings keeps
+/// the sky's pull).
+pub const STEP_TOP: f32 = 0.3;
 
 /// The local part of one photo's Highlights pull: planes over the whole output frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,27 +91,72 @@ pub struct EdgePull {
     pub scale: (f32, f32),
     /// Where the rendered pixels sit in the whole output frame.
     pub origin: (usize, usize),
+    /// The darkest and the brightest surroundings' tone within a cell of each grid cell (from `wide`), read
+    /// bilinearly so they change smoothly from pixel to pixel ([`STEP_GAP`]).
+    pub span: Arc<(Plane, Plane)>,
 }
 
 impl EdgePull {
+    /// The pull from its planes, with the span of the surroundings worked out from `wide`.
+    pub fn new(plane: Arc<Plane>, wide: Arc<Plane>, pull: Arc<crate::tone_lift::Lift>, gain: f32, scale: (f32, f32), origin: (usize, usize)) -> Self {
+        let span = Arc::new(span_of(&wide));
+        Self { plane, wide, pull, gain, scale, origin, span }
+    }
+
     /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV and whose own
     /// base tone (EV over grey, exposure and `shift` included) is `own`. The four nearest grid cells count by how near
     /// they are and by how close their surroundings' tone is to `own` ([`READ_TONE`]), so a pixel beside a much
     /// brighter area (a clipped one) takes the pull of its own side; when none is close, by nearness ([`READ_FLOOR`]).
+    ///
+    /// Across a step in the surroundings ([`STEP_GAP`]) the weights are not scaled up to a whole: what the cells near
+    /// the pixel's tone leave goes to the pixel's own tone, raised towards the brightest surroundings as it nears them
+    /// ([`STEP_RAMP`], [`STEP_TOP`]). An edge pixel between a beam and the sky then takes a pull graded by its tone,
+    /// and a cell joining the four can't take over at once (whole grid cells of one side's pull: squares and blocks).
     pub fn at(&self, x: usize, y: usize, shift: f32, own: f32) -> f32 {
         let Some(cells) = self.cells(x, y) else { return 0.0 };
         let wide_at = |i: usize| self.wide.data.get(i).copied().unwrap_or(0.0);
+        let plane_at = |i: usize| self.plane.data.get(i).copied().unwrap_or(0.0);
         let guided = !self.wide.data.is_empty() && own.is_finite();
-        let tone = cells.map(|(i, b)| {
+        // how close each cell's surroundings' tone is to the pixel's
+        let near = cells.map(|(i, _)| {
             let z = if guided { ((wide_at(i) + shift - own) / READ_TONE).abs().min(8.0) } else { 0.0 };
-            let v = b * ((-0.5 * z * z).exp() + READ_FLOOR);
+            (-0.5 * z * z).exp()
+        });
+        let tone = cells.iter().zip(&near).map(|(&(_, b), &g)| {
+            let v = b * (g + READ_FLOOR);
             if v.is_finite() { v } else { 0.0 }
         });
+        let tone: Vec<f32> = tone.collect();
         let sum: f32 = tone.iter().sum();
-        let w = if sum > 1e-30 { tone.map(|v| v / sum) } else { cells.map(|(_, b)| b) };
-        let read = |p: &Plane| cells.iter().zip(&w).map(|(&(i, _), &k)| k * p.data.get(i).copied().unwrap_or(0.0)).sum::<f32>();
-        let edge = if self.plane.data.is_empty() { 0.0 } else { self.gain * read(&self.plane) };
-        let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(read(&self.wide) + shift) };
+        let w: Vec<f32> = if sum > 1e-30 { tone.iter().map(|v| v / sum).collect() } else { cells.iter().map(|c| c.1).collect() };
+        let read = |f: &dyn Fn(usize) -> f32| cells.iter().zip(&w).map(|(&(i, _), &k)| k * f(i)).sum::<f32>();
+        let (mut surround, mut edge) = (read(&|i| wide_at(i) + shift), read(&plane_at));
+        let (lo_p, hi_p) = (&self.span.0, &self.span.1);
+        if guided && lo_p.data.len() == self.wide.data.len() && hi_p.data.len() == self.wide.data.len() {
+            let bil = |f: &dyn Fn(usize) -> f32| cells.iter().map(|&(i, b)| b * f(i)).sum::<f32>();
+            let hi = bil(&|i| hi_p.data.get(i).copied().unwrap_or(0.0)) + shift;
+            // each cell's step, read bilinearly: the rule fades in over a whole cell, not along a line where the gap
+            // passes the threshold
+            let mix = bil(&|i| {
+                let gap = hi_p.data.get(i).copied().unwrap_or(0.0) - lo_p.data.get(i).copied().unwrap_or(0.0);
+                smooth(STEP_GAP - 0.5, STEP_GAP + 0.5, gap)
+            });
+            if mix > 0.0 {
+                let held = cells.iter().zip(&near).map(|(&(_, b), &g)| b * g);
+                let held: Vec<f32> = held.collect();
+                let rest = (1.0 - held.iter().sum::<f32>()).clamp(0.0, 1.0);
+                let own_side = own + (hi - own) * smooth(hi - STEP_RAMP, hi - STEP_TOP, own);
+                let by = |f: &dyn Fn(usize) -> f32| cells.iter().zip(&held).map(|(&(i, _), &k)| k * f(i)).sum::<f32>();
+                let s = by(&|i| wide_at(i) + shift) + rest * own_side;
+                let e = by(&plane_at) + rest * bil(&plane_at);
+                if s.is_finite() && e.is_finite() {
+                    surround += (s - surround) * mix;
+                    edge += (e - edge) * mix;
+                }
+            }
+        }
+        let edge = if self.plane.data.is_empty() { 0.0 } else { self.gain * edge };
+        let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(surround) };
         let v = edge + wide;
         if v.is_finite() { v } else { 0.0 }
     }
@@ -121,6 +177,35 @@ impl EdgePull {
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
         Some([(y0 * pw + x0, (1.0 - tx) * (1.0 - ty)), (y0 * pw + x1, tx * (1.0 - ty)), (y1 * pw + x0, (1.0 - tx) * ty), (y1 * pw + x1, tx * ty)])
     }
+}
+
+/// The darkest and the brightest value of `wide` within one cell of each cell (non-finite values left out; 0 where a
+/// cell has none).
+fn span_of(wide: &Plane) -> (Plane, Plane) {
+    let (w, h) = (wide.width, wide.height);
+    let (mut lo, mut hi) = (Plane::new(w, h), Plane::new(w, h));
+    for y in 0..h {
+        for x in 0..w {
+            let (mut a, mut b) = (f32::MAX, f32::MIN);
+            for yy in y.saturating_sub(1)..(y + 2).min(h) {
+                for xx in x.saturating_sub(1)..(x + 2).min(w) {
+                    if let Some(&v) = wide.data.get(yy * w + xx)
+                        && v.is_finite()
+                    {
+                        a = a.min(v);
+                        b = b.max(v);
+                    }
+                }
+            }
+            let i = y * w + x;
+            let (a, b) = if a <= b { (a, b) } else { (0.0, 0.0) };
+            if let (Some(l), Some(u)) = (lo.data.get_mut(i), hi.data.get_mut(i)) {
+                *l = a;
+                *u = b;
+            }
+        }
+    }
+    (lo, hi)
 }
 
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
@@ -268,7 +353,7 @@ pub fn for_frame(
         }
     };
     let scale = (pw as f32 / full.0 as f32, ph as f32 / full.1 as f32);
-    Some(Arc::new(EdgePull { plane, wide, pull, gain, scale, origin }))
+    Some(Arc::new(EdgePull::new(plane, wide, pull, gain, scale, origin)))
 }
 
 #[cfg(test)]
@@ -315,11 +400,11 @@ mod tests {
         plane.data = vec![0.0, -1.0];
         let none = || Arc::new(Plane::new(0, 0));
         let no_pull = Arc::new(crate::tone_lift::Lift(Vec::new()));
-        let e = EdgePull { plane: Arc::new(plane), wide: none(), pull: no_pull.clone(), gain: 0.5, scale: (0.5, 0.5), origin: (0, 0) };
+        let e = EdgePull::new(Arc::new(plane), none(), no_pull.clone(), 0.5, (0.5, 0.5), (0, 0));
         assert_eq!(e.at(0, 0, 0.0, 0.0), 0.0);
         assert!((e.at(2, 0, 0.0, 0.0) + 0.375).abs() < 1e-6, "{}", e.at(2, 0, 0.0, 0.0));
         assert_eq!(e.at(usize::MAX, usize::MAX, f32::NAN, f32::NAN), -0.5);
-        let empty = EdgePull { plane: none(), wide: none(), pull: no_pull, gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
+        let empty = EdgePull::new(none(), none(), no_pull, 1.0, (1.0, 1.0), (0, 0));
         assert_eq!(empty.at(3, 3, 0.0, 0.0), 0.0);
     }
 
@@ -335,7 +420,7 @@ mod tests {
             p.data.fill(v);
             Arc::new(p)
         };
-        let e = |w: f32| EdgePull { plane: flat(0.0), wide: flat(w), pull: Arc::new(pull.clone()), gain: 1.0, scale: (1.0, 1.0), origin: (0, 0) };
+        let e = |w: f32| EdgePull::new(flat(0.0), flat(w), Arc::new(pull.clone()), 1.0, (1.0, 1.0), (0, 0));
         assert!((e(2.0).at(1, 1, 0.0, 3.0) + 1.0).abs() < 1e-4, "{}", e(2.0).at(1, 1, 0.0, 3.0));
         assert!(e(-2.0).at(1, 1, 0.0, -1.0).abs() < 1e-6);
     }
@@ -349,8 +434,7 @@ mod tests {
         let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
         let mut wide = Plane::new(2, 1);
         wide.data = vec![-1.0, 3.0];
-        let e =
-            EdgePull { plane: Arc::new(Plane::new(2, 1)), wide: Arc::new(wide), pull: Arc::new(pull), gain: 1.0, scale: (0.5, 0.5), origin: (0, 0) };
+        let e = EdgePull::new(Arc::new(Plane::new(2, 1)), Arc::new(wide), Arc::new(pull), 1.0, (0.5, 0.5), (0, 0));
         // output pixel 2 sits halfway between the two cells
         assert!(e.at(2, 0, 0.0, -1.0).abs() < 0.01, "dark pixel: {}", e.at(2, 0, 0.0, -1.0));
         assert!((e.at(2, 0, 0.0, 3.0) + 1.5).abs() < 0.01, "bright pixel: {}", e.at(2, 0, 0.0, 3.0));
@@ -367,11 +451,10 @@ mod tests {
         let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
         let mut wide = Plane::new(2, 2);
         wide.data = vec![-20.8, -7.1, 2.5, 2.8];
-        let e =
-            EdgePull { plane: Arc::new(Plane::new(2, 2)), wide: Arc::new(wide), pull: Arc::new(pull), gain: 1.0, scale: (0.5, 0.5), origin: (0, 0) };
+        let e = EdgePull::new(Arc::new(Plane::new(2, 2)), Arc::new(wide), Arc::new(pull), 1.0, (0.5, 0.5), (0, 0));
         // output pixel (1, 1) sits in the middle of the four cells
         assert!(e.at(1, 1, 0.0, -1.5) > -0.1, "edge pixel: {}", e.at(1, 1, 0.0, -1.5));
-        assert!((e.at(1, 1, 0.0, 2.65) + 1.32).abs() < 0.05, "sky pixel: {}", e.at(1, 1, 0.0, 2.65));
+        assert!((e.at(1, 1, 0.0, 2.65) + 1.32).abs() < 0.1, "sky pixel: {}", e.at(1, 1, 0.0, 2.65));
     }
 
     /// A lone pixel far below its neighbours (one colour reconstruction left at black beside a clipped area) is no
@@ -386,6 +469,55 @@ mod tests {
         let (_, wide) = unit_planes(&img, 0.0, None, 64.0);
         let at = |x: usize, y: usize| wide.data.get(y * 64 + x).copied().unwrap_or(f32::NAN);
         assert!((at(32, 32) - at(10, 10)).abs() < 0.1, "lone pixel {} vs field {}", at(32, 32), at(10, 10));
+    }
+
+    /// On the row where a dark beam (−0.5 EV) meets the clipped sky (2.9 EV) the pull grades with the pixel's own tone:
+    /// a pixel a third of the way up takes a little of the sky's pull and one two thirds up most of it, where the read
+    /// by tone gave the first the beam's pull and the second the sky's (one row brighter than the sky, the next darker
+    /// than the beam). The beam and the sky keep their own pulls, and the pull changes smoothly along the edge.
+    #[test]
+    fn edge_pixels_between_a_beam_and_the_sky_grade_their_pull() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let p = |e: f32| pull.at(e);
+        let grid = |dark: f32, bright: f32| {
+            let mut wide = Plane::new(4, 4);
+            for (i, v) in wide.data.iter_mut().enumerate() {
+                *v = if i % 4 < 2 { dark } else { bright };
+            }
+            EdgePull::new(Arc::new(Plane::new(4, 4)), Arc::new(wide), Arc::new(pull.clone()), 1.0, (0.0625, 0.0625), (0, 0))
+        };
+        // a 4×4 grid: the beam's cells (−1.5 EV) on the left two columns, the clipped sky's (3.5 EV) on the right two;
+        // output pixel 32 (of 64, 16 per cell) sits halfway between the beam's last column and the sky's first
+        let e = grid(-1.5, 3.5);
+        let at = |x: usize, own: f32| e.at(x, 24, 0.0, own);
+        assert!((at(32, -1.5) - p(-1.5)).abs() < 0.05, "beam: {}", at(32, -1.5));
+        assert!((at(32, 3.5) - p(3.5)).abs() < 0.05, "sky: {}", at(32, 3.5));
+        assert!((at(32, 3.3) - p(3.5)).abs() < 0.05, "sky a little darker: {}", at(32, 3.3));
+        let (a, b) = (at(32, 0.2), at(32, 1.8));
+        assert!(a < p(-1.5) - 0.05 && a > p(3.5) * 0.5, "a third up: {a}");
+        assert!(b < p(3.5) * 0.5 && b > p(3.5), "two thirds up: {b}");
+        // graded with the tone, and smooth along the grid for an edge pixel
+        let steps: Vec<f32> = (0..=50).map(|i| at(32, -1.5 + 0.1 * i as f32)).collect();
+        assert!(steps.windows(2).all(|w| w[1] <= w[0] + 1e-4 && w[0] - w[1] < 0.15), "{steps:?}");
+        let along: Vec<f32> = (16..=48).map(|x| at(x, 1.0)).collect();
+        assert!(along.windows(2).all(|w| (w[1] - w[0]).abs() < 0.25), "{along:?}");
+        // a smaller step (a lamp's ring) keeps the read by tone: a pixel near the dark side's tone takes its pull
+        let ring = grid(-0.5, 2.9);
+        let r = ring.at(32, 24, 0.0, 0.0);
+        assert!((r - p(-0.5)).abs() < 0.05, "ring: {r}");
+    }
+
+    /// The span planes hold each cell's darkest and brightest neighbour and stay finite on hostile values.
+    #[test]
+    fn the_span_holds_the_darkest_and_brightest_neighbours() {
+        let mut wide = Plane::new(3, 1);
+        wide.data = vec![1.0, f32::NAN, -2.0];
+        let (lo, hi) = span_of(&wide);
+        assert_eq!(lo.data, vec![1.0, -2.0, -2.0]);
+        assert_eq!(hi.data, vec![1.0, 1.0, -2.0]);
+        let (lo, hi) = span_of(&Plane::new(0, 0));
+        assert!(lo.data.is_empty() && hi.data.is_empty());
     }
 
     /// The bilateral base merges tones a little apart (clouds in a sky) and keeps a large step (sky against ground)

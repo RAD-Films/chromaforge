@@ -69,6 +69,11 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_READ_TONE", 1),
     // …plus this much of plain nearness, so a pixel with no cell near its tone doesn't take the least-far cell's
     ("EDGE_READ_FLOOR", 1),
+    // across a step in the surroundings: the span planes (0 = none) and the grading by own tone
+    ("EDGE_SPAN_OFF", 1),
+    ("EDGE_STEP_GAP", 1),
+    ("EDGE_STEP_RAMP", 1),
+    ("EDGE_STEP_TOP", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -361,6 +366,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         aux.extend_from_slice(&e.wide.data);
         aux.extend_from_slice(&e.pull.0);
     }
+    // the surroundings' darkest and brightest near each cell, one plane after the other
+    let span = lean.filter(|e| e.span.0.data.len() == e.wide.data.len() && e.span.1.data.len() == e.wide.data.len());
+    let span_off = if span.is_some() { aux.len() } else { 0 };
+    if let Some(e) = span {
+        aux.extend_from_slice(&e.span.0.data);
+        aux.extend_from_slice(&e.span.1.data);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -587,6 +599,10 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("EDGE_TABLE_OFF", table_off as u32);
         p.f("EDGE_READ_TONE", lcc_pipeline::hl_edge::READ_TONE);
         p.f("EDGE_READ_FLOOR", lcc_pipeline::hl_edge::READ_FLOOR);
+        p.u("EDGE_SPAN_OFF", span_off as u32);
+        p.f("EDGE_STEP_GAP", lcc_pipeline::hl_edge::STEP_GAP);
+        p.f("EDGE_STEP_RAMP", lcc_pipeline::hl_edge::STEP_RAMP);
+        p.f("EDGE_STEP_TOP", lcc_pipeline::hl_edge::STEP_TOP);
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {
