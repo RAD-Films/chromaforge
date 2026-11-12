@@ -121,8 +121,26 @@ const LEVEL_TO_FULL: f32 = 0.25;
 /// Share of the neutral level its unclipped channels imply that a clipped channel is lifted to in [`own_colour`]. Measured:
 /// below 0.8 the clip's own level rules (pink clouds), 1.0 turns those clouds green.
 const OWN_LEVEL: f32 = 0.95;
-/// From this share of its clip, a channel counts as clipped for the magenta exception in the colour fade.
-const MAGENTA_CLIP_LO: f32 = 0.95;
+/// With [`Rebuild::rim_hue`], under magenta light (green the lowest white-balanced channel, red or blue clipped) a pixel
+/// keeps its colour only while green lies at least `.1` stops under its clip, and fades to the clipped neutral within
+/// `.0` stops of it, whichever unclipped channel is lowest. On round24's magenta chart at +3.35 EV Lightroom Classic
+/// keeps the patches with red clipped and green 1.2–1.6 stops under its clip at full chroma (C* 156–160) and shows the
+/// one with red and blue clipped and green 0.1 stops under white. Kept magenta until green itself clipped, as before,
+/// that white patch came out pink with white speckle where green's noise crossed its clip, and magenta behind the clip
+/// at ProPhoto's edge. A pixel with only blue clipped keeps its own colour instead, until red nears its clip
+/// ([`MAGENTA_OWN`]).
+const MAGENTA_GREEN: (f32, f32) = (0.7, 1.15);
+/// Over this many stops of the lower of red and blue over green a pixel goes over to magenta light ([`MAGENTA_GREEN`]).
+const MAGENTA_SIDE: f32 = 0.3;
+/// With [`Rebuild::rim_hue`], under magenta light a pixel with only blue clipped keeps its own colour, blue at the clip,
+/// instead of the rebuild's, and goes over to the rebuild as red rises from this share of its clip to the clip. On
+/// round24's magenta charts Lightroom Classic renders all eight such patches (green 0.28–0.55 of its clip, their light
+/// 0.2–0.7 stops over blue's clip) as their own colour, blue at the clip, moved 0.15 of the way to the neutral (the
+/// engine's near-clip move for magenta light): the four pale ones come out within dE00 2.5–5.0 of it and the deep
+/// violets within 9–10 (unclipped violets lie 6–7 off). Rebuilt, blue rose up to 0.5 stops over its clip where a
+/// patch's light fell off (frame 4941 at +1.33 EV), and the patch came out white with magenta speckle (dE00 14), or
+/// deep magenta without the colour fade (31).
+const MAGENTA_OWN: f32 = 0.9;
 
 /// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
 /// `OWN_HUE.0` to `OWN_HUE.1` stops (a small coloured object inside a pale clipped area, such as orange roof caps
@@ -697,13 +715,14 @@ fn rebuild_clipped(
                 let width = COLOUR_FADE.1 + (COLOUR_FADE.0 - COLOUR_FADE.1) * side;
                 let left = lowest < clip;
                 let keep = smoothstep(0.0, width, if left { below } else { 0.0 });
-                // red and blue clipped with green well below (magenta light) keep their colour: on chart brackets those
-                // patches kept their hue within 1 degree without the fade and lost all chroma with it
-                let at_clip = [0, 1, 2].map(|c| if cl[c] { 1.0 } else { smoothstep(MAGENTA_CLIP_LO, 1.0, p[c] / clip) });
-                let magenta = at_clip[0].min(at_clip[2]) * (1.0 - at_clip[1]);
+                // magenta light (green unclipped and the lowest): the colour stays by green's distance under its clip
+                // ([`MAGENTA_GREEN`]); a clipped green is only a lower bound and says nothing about the light
+                let magenta = if !cl[1] && (cl[0] || cl[2]) { smoothstep(0.0, MAGENTA_SIDE, (q[0].min(q[2]) / q[1].max(1e-9)).log2()) } else { 0.0 };
+                let green_below = if cl[1] { 0.0 } else { (clip / p[1].max(1e-6)).log2().max(0.0) };
+                let keep = keep + (smoothstep(MAGENTA_GREEN.0, MAGENTA_GREEN.1, green_below) - keep) * magenta;
                 let onset = smoothstep(0.0, COLOUR_FADE_ONSET, if left { above } else { 1.0 });
                 let last = 1.0 - smoothstep(0.0, COLOUR_FADE_LAST, if left { below } else { 0.0 });
-                let t = (1.0 - keep) * (onset + (1.0 - onset) * last) * (1.0 - magenta);
+                let t = (1.0 - keep) * (onset + (1.0 - onset) * last);
                 out = warm_converged(out, white, WARM_CONVERGE * t * (1.0 - side) * bound(p, cl, clip, 0) * bound(p, cl, clip, 1));
                 let stops = if left { below } else { 0.0 };
                 let level = (out[0] + out[1] + out[2]) / total;
@@ -723,6 +742,14 @@ fn rebuild_clipped(
                     if red.is_finite() {
                         out[0] = white[0] * red;
                     }
+                }
+                // magenta light with only blue clipped: its own colour, blue at the clip ([`MAGENTA_OWN`])
+                let own = if cl == [false, false, true] { magenta * (1.0 - smoothstep(MAGENTA_OWN, 1.0, p[0] / clip)) } else { 0.0 };
+                if own >= 1.0 {
+                    continue;
+                }
+                if own > 0.0 {
+                    out = std::array::from_fn(|c| out[c] + (q[c] - out[c]) * own);
                 }
             } else if t_colour > 0.0 {
                 let level = (out[0] + out[1] + out[2]) / total;
@@ -1079,12 +1106,12 @@ mod tests {
         (hue, step)
     }
 
-    /// Chart patches under magenta light, red and blue clipped and green not: with [`Rebuild::rim_hue`] the patch keeps
-    /// its magenta rim's chroma (the two-channel fade only takes pairs with green).
+    /// Chart patches under magenta light, red and blue clipped and green 1.7 stops under its clip: with
+    /// [`Rebuild::rim_hue`] the patch keeps its magenta rim's chroma (the two-channel fade only takes pairs with green).
     #[test]
     fn with_rim_hue_a_red_and_blue_clipped_patch_keeps_its_magenta() {
         let rim = [1.2, 0.24, 1.2];
-        let core = [3.0, 0.6, 3.0];
+        let core = [3.0, 0.3, 3.0];
         let mut img = Rgb32f::from_fn(64, 64, |x, y| sensor(if (16..48).contains(&x) && (16..48).contains(&y) { core } else { rim }));
         let cl = by_value(&img.get(32, 32), 0.99);
         assert_eq!(cl, [true, false, true], "the patch clips in red and blue");
@@ -1092,6 +1119,82 @@ mod tests {
         let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
         let (got, want) = (away(balanced(img.get(32, 32))), away(rim));
         assert!(got >= 0.8 * want, "chroma {got} against the rim's {want}");
+    }
+
+    /// A light patch under magenta light with red and blue clipped and green 0.4 stops under its clip: with
+    /// [`Rebuild::rim_hue`] its colour fades by green's distance ([`MAGENTA_GREEN`]), on the way to the white Lightroom
+    /// Classic shows with green 0.1 stops under. Faded by the lowest unclipped channel's distance alone it kept much of
+    /// its rim's colour, and magenta behind the clip at ProPhoto's edge.
+    #[test]
+    fn with_rim_hue_magenta_light_fades_by_green() {
+        let rim = [2.2, 0.5, 1.5];
+        let core = [3.0, 0.75, 3.0];
+        let mut img = Rgb32f::from_fn(64, 64, |x, y| sensor(if (16..48).contains(&x) && (16..48).contains(&y) { core } else { rim }));
+        assert_eq!(by_value(&img.get(32, 32), 0.99), [true, false, true], "the patch clips in red and blue");
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
+        let (got, rim_away) = (away(balanced(img.get(32, 32))), away(rim));
+        assert!(got < 0.3 * rim_away, "chroma {got} against the rim's {rim_away}");
+    }
+
+    /// A lilac patch under magenta light with only blue clipped, red 1.2 stops under its clip and green 0.4: with
+    /// [`Rebuild::rim_hue`] it keeps its own colour bit for bit, blue at the clip ([`MAGENTA_OWN`]), whatever the rim's
+    /// colour says its blue is; with red near its own clip it goes over to the rebuild.
+    #[test]
+    fn with_rim_hue_magenta_light_with_only_blue_clipped_keeps_its_own_colour() {
+        for (core, own) in [([1.1, 0.75, 3.0], true), ([2.4, 0.75, 3.0], false)] {
+            let rim = [0.75 * core[0], 0.5, 1.5];
+            let mut img = Rgb32f::from_fn(64, 64, |x, y| sensor(if (16..48).contains(&x) && (16..48).contains(&y) { core } else { rim }));
+            let p = img.get(32, 32);
+            assert_eq!(by_value(&p, 0.99), [false, false, true], "the patch clips in blue only");
+            reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+            let got = img.get(32, 32);
+            let same = got.iter().zip(&p).all(|(a, b)| a.to_bits() == b.to_bits());
+            assert_eq!(same, own, "{core:?}: {p:?} -> {got:?}");
+        }
+    }
+
+    /// A sky with green and blue clipped and red 0.7 stops under its clip is not magenta light, though its clipped green
+    /// reads lower than red and blue: a clipped channel is only a lower bound. Taken for magenta light it went to the
+    /// clipped neutral (frame 6731 at -3 EV, band L* 75-85: 6.4 -> 7.7 dE, C* 11 -> 5).
+    #[test]
+    fn with_rim_hue_a_sky_with_green_clipped_is_not_magenta_light() {
+        let rim = [0.6, 0.85, 1.45];
+        let core = [1.5, 3.0, 3.0];
+        let mut img = Rgb32f::from_fn(64, 64, |x, y| sensor(if (16..48).contains(&x) && (16..48).contains(&y) { core } else { rim }));
+        assert_eq!(by_value(&img.get(32, 32), 0.99), [false, true, true], "green and blue clip");
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
+        let (got, rim_away) = (away(balanced(img.get(32, 32))), away(rim));
+        assert!(got > 0.3 * rim_away, "chroma {got} against the rim's {rim_away}");
+    }
+
+    /// A white patch under the same magenta light: red and blue clipped, green 0.09 stops under its clip and noisy,
+    /// some of it clipped too. With [`Rebuild::rim_hue`] it goes white everywhere, as Lightroom Classic shows it: kept
+    /// magenta until green clipped, it came out pink with white speckle where green's noise reached its clip.
+    #[test]
+    fn with_rim_hue_a_white_patch_under_magenta_light_goes_white_without_speckle() {
+        let rim = [1.2, 0.24, 1.2];
+        let mut seed = 0x9e37_79b9_u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 1000) as f32 / 1000.0 - 0.5
+        };
+        let mut img = Rgb32f::from_fn(64, 64, |_, _| sensor(rim));
+        for y in 16..48 {
+            for x in 16..48 {
+                // green 0.94 of its clip, +-0.06: some of the patch reaches it
+                img.data[y * 64 + x] = [1.0, (0.94 + 0.12 * noise()).min(1.0), 1.0];
+            }
+        }
+        reconstruct_how(&mut img, WB, 0.99, [1.0; 3], Rebuild { headroom: 0.0, rim_hue: true }, None);
+        let away = |q: [f32; 3]| chroma(q).iter().map(|v| (v - 1.0 / 3.0).abs()).fold(0.0f32, f32::max);
+        let patch: Vec<f32> = (20..44).flat_map(|y| (20..44).map(move |x| (x, y))).map(|(x, y)| away(balanced(img.get(x, y)))).collect();
+        let (most, least) = (patch.iter().cloned().fold(0.0f32, f32::max), patch.iter().cloned().fold(1.0f32, f32::min));
+        assert!(most < 0.08, "a pixel kept {most} of chroma (the rim has {})", away(rim));
+        assert!(most - least < 0.05, "chroma speckles from {least} to {most}");
     }
 
     /// A sky with green clipped and blue rising through its own clip: with [`Rebuild::rim_hue`] the colour depends on
