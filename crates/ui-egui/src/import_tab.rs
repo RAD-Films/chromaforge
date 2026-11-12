@@ -640,8 +640,7 @@ fn sources(app: &mut LccApp, ui: &mut egui::Ui) {
             heading(ui, "Cards and Cameras");
             for (i, (name, path)) in cards.iter().enumerate() {
                 // a card opens at its DCIM folder
-                let dcim = std::path::Path::new(path).join("DCIM");
-                let open_at = if dcim.is_dir() { dcim.to_string_lossy().to_string() } else { path.clone() };
+                let open_at = card_folder(ui, path);
                 let on = current.as_deref().is_some_and(|c| crate::panels::left::same_folder(c, &open_at));
                 source_row(app, ui, &format!("importCard-{i}"), name, &open_at, on);
             }
@@ -663,7 +662,7 @@ fn sources(app: &mut LccApp, ui: &mut egui::Ui) {
         // the folders browsed lately, newest first
         let mut recent: Vec<(String, String)> = app.session.catalog.browsed_folders().iter().map(|(f, at)| (at.clone(), f.clone())).collect();
         recent.sort_by(|a, b| b.cmp(a));
-        let recent: Vec<String> = recent.into_iter().map(|(_, f)| f).filter(|f| std::path::Path::new(f).is_dir()).take(6).collect();
+        let recent = recent_folders(ui, recent.into_iter().map(|(_, f)| f));
         if !recent.is_empty() {
             heading(ui, "Recent");
             for (i, f) in recent.iter().enumerate() {
@@ -683,6 +682,37 @@ fn sources(app: &mut LccApp, ui: &mut egui::Ui) {
         });
         ui.add_space(16.0);
     });
+}
+
+/// Folders the Import tab checks on disk are checked on a worker thread ([`crate::panels::left::fs_cached`],
+/// at most every [`FOLDER_CHECK_EVERY`] s), never in a frame: a remembered folder on a sleeping NAS, a dropped
+/// share or a drive spinning up held the window for seconds (5.4 s seen) while the Import tab drew.
+const FOLDER_CHECK_EVERY: f64 = 5.0;
+
+/// The most remembered folders checked for the Recent list: it shows [`RECENT_SHOWN`], the newest that are still
+/// there, and the check of each runs on a thread of its own.
+const RECENT_CHECKED: usize = 24;
+const RECENT_SHOWN: usize = 6;
+
+fn is_folder(p: &str) -> bool {
+    std::path::Path::new(p).is_dir()
+}
+
+/// Whether `path` is a folder, from the last background check (`None` before the first answer).
+fn folder_known(ui: &egui::Ui, path: &str) -> Option<bool> {
+    crate::panels::left::fs_cached(ui, "is-dir", path, FOLDER_CHECK_EVERY, is_folder)
+}
+
+/// Where a card opens: its DCIM folder once the background check has found one, else the card.
+fn card_folder(ui: &egui::Ui, card: &str) -> String {
+    let dcim = std::path::Path::new(card).join("DCIM").to_string_lossy().to_string();
+    if folder_known(ui, &dcim) == Some(true) { dcim } else { card.to_string() }
+}
+
+/// The Recent list from the remembered folders, newest first: those the background check found still there
+/// (one missing or not yet checked is left out until its answer comes).
+fn recent_folders(ui: &egui::Ui, newest_first: impl Iterator<Item = String>) -> Vec<String> {
+    newest_first.take(RECENT_CHECKED).filter(|f| folder_known(ui, f) == Some(true)).take(RECENT_SHOWN).collect()
 }
 
 /// The bar over the photos: where they come from, what the big button takes and the button. On a
@@ -1012,8 +1042,7 @@ fn choose_source(app: &mut LccApp, ui: &mut egui::Ui) {
         browse(app, child.ctx(), &f);
     }
     for (i, (name, path)) in crate::import_screen::devices(child.ctx()).iter().enumerate() {
-        let dcim = std::path::Path::new(path).join("DCIM");
-        let open_at = if dcim.is_dir() { dcim.to_string_lossy().to_string() } else { path.clone() };
+        let open_at = card_folder(&child, path);
         if crate::button::Button::new(name).widget(format!("importCardBig-{i}")).show(&mut child).clicked() {
             browse(app, child.ctx(), &open_at);
         }
