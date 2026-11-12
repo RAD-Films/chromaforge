@@ -1386,8 +1386,8 @@ fn proxies(
     let mut clipped = clip_mask(&sensor, sensor_clip(raw));
     // the sensor as recorded, for the check below of how much of the vignetting correction the camera JPEG shows
     // (processes V1 to V8 keep the fit of LOOK_VERSION 22: the whole correction, unmeasured)
-    let vignetted = (fit_gen() == FitGen::Current && raw.format != RawFormat::Cr3 && embedded.is_some_and(|l| l.vignette.is_some()))
-        .then(|| sensor.clone());
+    let vignetted =
+        (fit_gen() == FitGen::Current && raw.format != RawFormat::Cr3 && embedded.is_some_and(|l| l.vignette.is_some())).then(|| sensor.clone());
     correct_vignetting(&mut sensor, embedded, raw.orientation);
     // The camera may have corrected its JPEG with the lens warp the file carries (Nikon Z lenses always, at up to 9 %
     // zoom; other cameras when their correction setting is on): the sensor moved into that geometry is a candidate,
