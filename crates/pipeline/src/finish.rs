@@ -1462,6 +1462,16 @@ pub(crate) fn tone_keeping_hue(p: [f32; 3], tone: impl Fn(f32) -> f32) -> [f32; 
 /// the same matrix profile: 16 R5 C chart frames under amber, red, warm and magenta light (two bodies) and 92 real
 /// frames (one body), pixel pairs against our render.
 pub const NEAR_WHITE: [f32; 5] = [0.035, 0.8, 1.0, 0.28, 0.4];
+/// [`near_white`] spares magenta-led colours by their blue over green (stops, toned linear ProPhoto): none of them at
+/// `.0`, all at `.1`. The luminance gate let a bright magenta-red through (round24's magenta chart at +3.35 EV, patch
+/// 18: luminance 0.40 of its red, blue 2.2 stops over green), which Lightroom Classic keeps more saturated (C* 118; the
+/// pull left ours at 108). The pull also put its green on sRGB's edge, where noise came out as pale specks through the
+/// per-channel output clip (78 % of its pixels under sRGB green 0 and 22 % over, Lightroom's all under); spared, it
+/// comes out at C* 114 with all of them under. Its pixels' own blue over green runs from 2.0 stops (1 %) up, so the
+/// whole spare lies under that: ending it at 2.1 left 0.2 % of them pulled into pale specks, at 1.9 0.04 %. A
+/// magenta-red near white with blue 1.5 stops over green, paler in Lightroom than ours, keeps the pull (frame 4941 at
+/// +1.33 EV, patch 13); warm and red light have blue under green or about it.
+pub const NEAR_WHITE_MAGENTA: [f32; 2] = [1.6, 1.9];
 
 /// ProPhoto's luminance weights (D50 Y of its primaries).
 const PROPHOTO_Y: [f32; 3] = [0.288_040_2, 0.711_874_1, 0.000_085_7];
@@ -1470,7 +1480,8 @@ const PROPHOTO_Y: [f32; 3] = [0.288_040_2, 0.711_874_1, 0.000_085_7];
 /// channel as that channel nears white: Lightroom Classic lifts the other two there (lighter and a little less
 /// saturated, hue kept), where ours stayed up to 8 C* more saturated and 2 L* darker. Colours below
 /// [`NEAR_WHITE`]'s start are unchanged, and so are colours whose luminance is small for their brightest channel
-/// (blue- and magenta-led): Lightroom keeps those as saturated as ours or more.
+/// (blue- and magenta-led) or whose blue lies well over green ([`NEAR_WHITE_MAGENTA`]): Lightroom keeps those as
+/// saturated as ours or more.
 #[inline]
 pub(crate) fn near_white(p: [f32; 3], peak: f32) -> [f32; 3] {
     let hi = p[0].max(p[1]).max(p[2]);
@@ -1478,8 +1489,10 @@ pub(crate) fn near_white(p: [f32; 3], peak: f32) -> [f32; 3] {
         return p;
     }
     let [a, k0, k1, y0, y1] = NEAR_WHITE;
+    let [m0, m1] = NEAR_WHITE_MAGENTA;
     let y = PROPHOTO_Y[0] * p[0] + PROPHOTO_Y[1] * p[1] + PROPHOTO_Y[2] * p[2];
-    let t = a * smooth(k0 * peak, k1 * peak, hi) * smooth(y0, y1, y / hi);
+    let magenta = smooth(m0, m1, (p[2].max(1e-9) / p[1].max(1e-9)).log2());
+    let t = a * smooth(k0 * peak, k1 * peak, hi) * smooth(y0, y1, y / hi) * (1.0 - magenta);
     if t <= 0.0 {
         return p;
     }
@@ -1749,6 +1762,12 @@ mod tests {
         for p in [[0.8, 0.0, 1.0], [0.5, 0.05, 1.0], [0.6, 0.1, 1.2]] {
             assert_eq!(near_white(p, 1.0), p);
         }
+        // a bright magenta-red whose luminance passes the gate (0.40 of its red) but whose blue lies 2.2 stops over its
+        // green: unchanged (round24's patch 18, which Lightroom Classic keeps more saturated); one with blue 1.5 stops over
+        // green (paler in Lightroom) and red light with blue under green take the pull
+        assert_eq!(near_white([1.0, 0.15, 0.69], 1.0), [1.0, 0.15, 0.69]);
+        assert!(pull([1.0, 0.14, 0.39]) > 0.3 * NEAR_WHITE[0], "{}", pull([1.0, 0.14, 0.39]));
+        assert!(pull([1.0, 0.15, 0.1]) > 0.5 * NEAR_WHITE[0], "{}", pull([1.0, 0.15, 0.1]));
     }
 
     /// The brightest and darkest channel take the curve and the middle one keeps its place between them: on each

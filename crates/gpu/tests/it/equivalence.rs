@@ -93,8 +93,8 @@ fn v9_lrc_base_tone_per_channel() {
 }
 
 /// Process V9's per-channel tone pulls a colour toward its own brightest channel near white (`finish::near_white`),
-/// warm hues only (magenta and blue-led ones are gated out): a sweep of every hue at every brightness up to past
-/// white, so the pull, its start, its fade and the gate all show in the comparison.
+/// warm hues only (magenta and blue-led ones, and those with blue well over green, are gated out): a sweep of every
+/// hue at every brightness up to past white, so the pull, its start, its fade and both gates all show in the comparison.
 #[test]
 fn v9_near_white_pull() {
     if !gpu() {
