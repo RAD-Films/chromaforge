@@ -97,6 +97,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("DITHER", 1),
     // process V9: bright colours take the tone curve per channel (`lcc_pipeline::finish::top_shoulder`)
     ("TOP_SHOULDER", 1),
+    // process V9: the scene level where the tone reaches white, 0 for none (`FinishParams::past_white`)
+    ("PAST_WHITE", 1),
     ("SHARPEN", 1),
     ("SHARPEN_MASK", 1),
     ("SHARPEN_LIMIT", 1),
@@ -475,6 +477,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.b("HUE_CLIP", fp.hue_clip);
     p.b("DITHER", fp.dither);
     p.b("TOP_SHOULDER", fp.top_shoulder);
+    p.f("PAST_WHITE", fp.past_white.unwrap_or(0.0));
     p.f("SHARPEN", fp.sharpen);
     p.f("SHARPEN_MASK", fp.sharpen_mask);
     p.f("SHARPEN_LIMIT", fp.sharpen_limit);

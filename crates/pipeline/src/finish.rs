@@ -434,6 +434,10 @@ pub struct FinishParams {
     /// brightest and darkest channel; the middle one keeps its place between them ([`tone_keeping_hue`]). Such a
     /// render keeps a colour past the output's range as it is until the output, where each channel is clipped.
     pub tone_per_channel: Option<[[[f32; 3]; 3]; 2]>,
+    /// Process V9, a raw's SDR render: the scene level (linear, Exposure applied) where the tone reaches white, from
+    /// which a colour's brightest channel (ProPhoto when toned per channel, else the working space) counts its stops
+    /// past white ([`past_white`], [`PAST_WHITE`]). `None`: no past-white fade.
+    pub past_white: Option<f32>,
 }
 
 impl FinishParams {
@@ -493,6 +497,11 @@ impl FinishParams {
         FinishParams {
             // a render toned per channel already has the shoulder this step adds
             top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info),
+            past_white: (s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info) && peak <= 1.0)
+                .then(|| crate::hl_edge::white_of(&tone))
+                .flatten()
+                .map(|e| crate::tone::GREY * e.exp2())
+                .filter(|v| v.is_finite() && *v > 0.0),
             tone_per_channel: per_channel,
             peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
@@ -1050,7 +1059,10 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let tone_map = |c: [f32; 3]| {
                 let (o, d) = match &fp.tone_per_channel {
                     Some([to, from]) => {
-                        let d = mul3(from, near_white(tone_keeping_hue(mul3(to, c), |v| tone.apply(v)), peak));
+                        let q = mul3(to, c);
+                        let t = near_white(tone_keeping_hue(q, |v| tone.apply(v)), peak);
+                        let t = fp.past_white.map_or(t, |w| past_white_fade(t, past_white(q, w), peak));
+                        let d = mul3(from, t);
                         (luminance_2020(d), d)
                     }
                     None => {
@@ -1065,7 +1077,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     }
                 };
                 if fp.top_shoulder {
-                    let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
+                    let s = fp.past_white.map_or(f32::NEG_INFINITY, |w| past_white(c, w));
+                    let moved = top_shoulder_past_white(d, c, o, peak, |v| tone.apply(v), s);
                     let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
                     hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
                 } else if fp.tone_per_channel.is_some() {
@@ -1414,6 +1427,35 @@ pub fn top_shoulder(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f
     [d[0] + (pc[0] - d[0]) * b, d[1] + (pc[1] - d[1]) * b, d[2] + (pc[2] - d[2]) * b]
 }
 
+/// [`top_shoulder`] for a colour whose brightest scene channel lies `s` stops past white ([`past_white`]). From
+/// [`PAST_WHITE_SHOULDER`]'s start the shoulder comes in by stops under white as well as by the scene level, its
+/// per-channel target keeps part of its hue ([`tone_keeping_hue`], by [`past_white_hue`] times the shoulder's share)
+/// and past white it fades toward white ([`past_white_fade`]). On each channel alone, bright warm light far past
+/// white rose to R = G = 1 with blue under them: lemon (hue 107) with a hard edge where the shoulder came in.
+#[inline]
+pub fn top_shoulder_past_white(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f32) -> f32, s: f32) -> [f32; 3] {
+    let [r0, r1, share] = PAST_WHITE_SHOULDER;
+    if s.is_nan() || s <= r0 {
+        return top_shoulder(d, c, o, peak, tone);
+    }
+    let hi = d[0].max(d[1]).max(d[2]);
+    if !peak.is_finite() || peak <= 0.0 || !hi.is_finite() || !o.is_finite() {
+        return d;
+    }
+    let [k0, k1, o0, o1, s0, s1] = TOP_SHOULDER;
+    let scene = smooth(s0, s1, c[0].max(c[1]).max(c[2])).max(smooth(r0, r1, s));
+    let b = smooth(k0 * peak, k1 * peak, hi) * smooth(o0 * peak, o1 * peak, o) * scene;
+    if b <= 0.0 {
+        return d;
+    }
+    let plain = c.map(|v| tone(v.max(0.0)));
+    let kept = tone_keeping_hue(c, &tone);
+    let h = past_white_hue(s) * share;
+    let pc: [f32; 3] = std::array::from_fn(|i| plain[i] + (kept[i] - plain[i]) * h);
+    let pc = past_white_fade(pc, s, peak);
+    [d[0] + (pc[0] - d[0]) * b, d[1] + (pc[1] - d[1]) * b, d[2] + (pc[2] - d[2]) * b]
+}
+
 /// How much of a colour's luminance [`top_shoulder`] may take, against the render without it: nothing at the
 /// scene's brightest channel `[1]`, the share `[0]` from `[2]`. Slow enough that the render's own rise along an
 /// exposure ramp covers it, so lightness can't fall as the input rises. Fitted on a saturated red's ramp against
@@ -1490,6 +1532,55 @@ pub const NEAR_WHITE: [f32; 5] = [0.035, 0.8, 1.0, 0.28, 0.4];
 /// magenta-red near white with blue 1.5 stops over green, paler in Lightroom than ours, keeps the pull (frame 4941 at
 /// +1.33 EV, patch 13); warm and red light have blue under green or about it.
 pub const NEAR_WHITE_MAGENTA: [f32; 2] = [1.6, 1.9];
+
+/// Past white (process V9, a raw's base tone): the fade toward white of a colour whose brightest scene channel lies
+/// past the level where the tone reaches white ([`past_white_fade`]), from nothing at the first stop count to the
+/// share in the third at the second (smoothstep). One fade for every camera. Fitted to Lightroom Classic exports of
+/// lamp-lit walls pushed +1 to +3 EV (Lumix G9, a profile with its own tone curve): Lightroom keeps that light warm
+/// white, hue 85-88, C* from about 20 just past white to 7 at +2 stops and 2 at +3, L* rising to 99. Ours now
+/// keeps hue 85-90 and C* 9 → 2 over the same stops (before: lemon, hue 107, C* 13-17 to +3 stops). R5 C frames under
+/// a profile without a curve, which Lightroom takes to neutral within half a stop, are unchanged (C* within 0.1).
+pub const PAST_WHITE: [f32; 3] = [0.75, 3.5, 0.9];
+/// Stops past white over which [`top_shoulder_past_white`]'s target comes to keep (its share of) the colour's hue. A
+/// render toned per ProPhoto channel keeps each output channel clipped (a49e716da): a hue-keeping clip there took warm
+/// light half a stop past white back to nearly white, which that change had fixed.
+pub const PAST_WHITE_HUE: [f32; 2] = [-0.5, 0.0];
+/// [`top_shoulder_past_white`]: stops under white over which the shoulder comes in whatever the scene level (it came in
+/// only at scene level 0.9-1.4, which on a camera whose tone reaches white lower is 0.7-1.3 stops past it, with a
+/// hard edge there), and the share of the hue the shoulder's target keeps (a full share took the G9's lamp light to
+/// orange, hue 56; none, lemon 107; a half, 85-90 as Lightroom).
+pub const PAST_WHITE_SHOULDER: [f32; 3] = [-2.0, -1.0, 0.5];
+
+/// Stops a scene colour `q` (linear ProPhoto)'s brightest channel lies past `white`, the scene level where the tone
+/// reaches white (negative below it).
+#[inline]
+pub(crate) fn past_white(q: [f32; 3], white: f32) -> f32 {
+    let hi = q[0].max(q[1]).max(q[2]);
+    if !(hi > 0.0 && hi.is_finite() && white > 0.0) {
+        return f32::NEG_INFINITY;
+    }
+    (hi / white).log2()
+}
+
+/// A toned colour `t` (linear ProPhoto) faded toward its own brightest channel by how far past white its scene colour
+/// lies (`s` stops).
+#[inline]
+pub(crate) fn past_white_fade(t: [f32; 3], s: f32, peak: f32) -> [f32; 3] {
+    let [s0, s1, f] = PAST_WHITE;
+    let k = f * smooth(s0, s1, s);
+    if k.is_nan() || k <= 0.0 {
+        return t;
+    }
+    let top = t[0].max(t[1]).max(t[2]).min(peak);
+    t.map(|v| v + (top - v) * k)
+}
+
+/// How far a colour `s` stops past white keeps its hue ([`PAST_WHITE_HUE`]), 0..1.
+#[inline]
+pub(crate) fn past_white_hue(s: f32) -> f32 {
+    let [h0, h1] = PAST_WHITE_HUE;
+    smooth(h0, h1, s)
+}
 
 /// ProPhoto's luminance weights (D50 Y of its primaries).
 const PROPHOTO_Y: [f32; 3] = [0.288_040_2, 0.711_874_1, 0.000_085_7];
@@ -1824,6 +1915,68 @@ mod tests {
         assert!(v9[0] == 255 && v9[1] < 225 && v9[2] < v9[1] - 15, "V9 {v9:?}");
         let v8 = at(&DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() });
         assert_eq!(v8, [255, 242, 239, 255], "V8 render pinned");
+    }
+
+    /// Warm lamp light along an exposure ramp from under white to five stops past it, under a camera tone with its own
+    /// curve (V9 tones it on luminance with the top shoulder): no lemon (red and green at the top with blue far under
+    /// them, as the shoulder's per-channel target gave), no step between neighbours, and white at the far end. On the
+    /// shoulder as it was, the ramp went lemon from about 2.5 stops past white ([255, 250, 191]); now it stays peach.
+    #[test]
+    fn v9_warm_light_past_white_fades_without_lemon_or_steps() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let curve = crate::tone::CameraTone::new(knots).unwrap();
+        let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+        let n = 400;
+        let src = lcc_raster::Rgb32f::from_fn(n, 1, |x, _| {
+            let v = 0.1 * (9.0 * x as f32 / (n - 1) as f32).exp2();
+            [v, 0.6 * v, 0.03 * v]
+        });
+        let img = crate::render(&src, &info, &DevelopSettings::default(), &crate::RenderRequest::fit(n, 1)).image;
+        let px: Vec<[u8; 4]> = (0..n).map(|x| img.get(x, 0)).collect();
+        for (x, p) in px.iter().enumerate() {
+            let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+            assert!(!(r - g < 6 && r - b > 30), "lemon at {x}: {p:?}");
+        }
+        // an edge is a kink in the ramp: the change from one pixel to the next jumps (a channel coming off 0 on sRGB's
+        // steep foot, as before this change, is not counted)
+        for (x, w) in px.windows(3).enumerate() {
+            for i in 0..3 {
+                if w[0][i].min(w[1][i]).min(w[2][i]) < 16 {
+                    continue;
+                }
+                let (d0, d1) = (i32::from(w[1][i]) - i32::from(w[0][i]), i32::from(w[2][i]) - i32::from(w[1][i]));
+                assert!((d1 - d0).abs() <= 4, "kink of {} at {x}, channel {i}: {:?} {:?} {:?}", d1 - d0, w[0], w[1], w[2]);
+            }
+        }
+        let last = px[n - 1];
+        assert!(last[0] == 255 && last[2] >= 235, "white at five stops past: {last:?}");
+        // under white, the render is the top shoulder's as before
+        let s = -3.0;
+        let (d, c) = ([0.6, 0.35, 0.1], [0.5, 0.3, 0.1]);
+        let tone = |v: f32| 1.0 - (-2.0 * v).exp();
+        assert_eq!(top_shoulder_past_white(d, c, 0.4, 1.0, tone, s), top_shoulder(d, c, 0.4, 1.0, tone));
+    }
+
+    /// The past-white pieces at their edges: nothing below the fade's start, white-ward past it, and
+    /// no panic or non-finite result on bad input.
+    #[test]
+    fn past_white_pieces_hold_their_ends() {
+        assert_eq!(past_white([2.0, 1.0, 0.5], 1.0), 1.0);
+        assert_eq!(past_white([0.0; 3], 1.0), f32::NEG_INFINITY);
+        assert_eq!(past_white([f32::NAN, 1.0, 0.5], 1.0), 0.0);
+        assert_eq!(past_white([1.0; 3], 0.0), f32::NEG_INFINITY);
+        let t = [1.0, 0.6, 0.2];
+        assert_eq!(past_white_fade(t, PAST_WHITE[0], 1.0), t);
+        let far = past_white_fade(t, 10.0, 1.0);
+        assert!((far[1] - (0.6 + 0.4 * PAST_WHITE[2])).abs() < 1e-6 && far[0] == 1.0, "{far:?}");
+        assert_eq!(past_white_hue(PAST_WHITE_HUE[0]), 0.0);
+        assert_eq!(past_white_hue(PAST_WHITE_HUE[1]), 1.0);
+        let tone = |v: f32| 1.0 - (-2.0 * v).exp();
+        let r = top_shoulder_past_white([f32::NAN, 1.0, 0.2], [2.0, 1.0, 0.2], 0.9, 1.0, tone, 2.0);
+        assert!(r[1].is_finite());
     }
 
     #[test]

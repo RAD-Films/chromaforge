@@ -126,6 +126,41 @@ fn v9_near_white_pull() {
     }
 }
 
+/// Process V9's past-white fade (`finish::PAST_WHITE`): every hue from two stops under white to four past it, under a
+/// camera tone with its own curve (toned on luminance, `top_shoulder_past_white`) and under one without (toned per
+/// ProPhoto channel, the fade and the hue-keeping output clip), at Exposure 0, +1.5 and +3.
+#[test]
+fn v9_past_white_fade() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (360, 240);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let hue = 6.0 * x as f32 / w as f32;
+        let v = 0.05 * (8.0 * y as f32 / h as f32).exp2();
+        let s = if (y / 20) % 2 == 0 { 0.85 } else { 0.5 };
+        let f = |n: f32| {
+            let k = (n + hue) % 6.0;
+            v * (1.0 - s * (k.min(4.0 - k).clamp(0.0, 1.0)))
+        };
+        [f(5.0), f(3.0), f(1.0)]
+    }));
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap();
+    for (name, tone) in [("own curve", curve), ("default curve", curve.under_default_curve())] {
+        let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(tone), ..Default::default() };
+        let mut s = DevelopSettings::default();
+        assert_eq!(s.process.process(), Process::V9);
+        for ev in [0.0, 1.5, 3.0] {
+            s.light.exposure = ev;
+            check(&format!("V9 past white, {name}, exposure {ev}"), &src, &info, &s, &RenderRequest::fit(w, h));
+        }
+    }
+}
+
 fn scene(i: usize, w: usize, h: usize) -> Arc<Rgb32f> {
     Arc::new(lcc_scenes::demo_library()[i].render(w, h))
 }

@@ -647,7 +647,9 @@ fn hdr_jpeg_export_writes_a_gain_map_and_sdr_edits_stay_plain() {
     let e = export_photo(&mut s, id, &o, 1).unwrap();
     assert!(gainmap::is_gain_map_jpeg(&e.bytes));
     let gm = gainmap::read_jpeg(&e.bytes).unwrap();
-    assert!(gm.meta.alternate_headroom > 0.5 && gm.meta.alternate_headroom <= 3.05, "headroom {}", gm.meta.alternate_headroom);
+    // (about Max EV: the SDR base keeps a trace of a colour far past white (`finish::PAST_WHITE`), so the gain on its
+    // weaker channel can pass Max EV by a few hundredths of a stop: 3.054 on this sunset)
+    assert!(gm.meta.alternate_headroom > 0.5 && gm.meta.alternate_headroom <= 3.1, "headroom {}", gm.meta.alternate_headroom);
     // the base is the edit's SDR rendition: the same pixels as an SDR export of the same HDR edit (the decoders
     // agree). Not the HDR-off export: the SDR rendition rolls highlights off instead of clipping them (#69).
     let sdr = export_photo(&mut s, id, &ExportOptions::from_json(&json!({"longEdge": 320, "hdr": false})), 1).unwrap();

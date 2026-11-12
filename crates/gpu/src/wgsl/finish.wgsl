@@ -1627,7 +1627,7 @@ fn tone_map(c: vec3<f32>) -> vec3<f32> {
     var d = vec3<f32>(0.0);
     if (pu(F_TONE_PC) != 0u) {
         let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
-        d = mul3(mat_at(F_TONE_PC_FROM), near_white(tone_keeping_hue(q), pf(F_PEAK)));
+        d = mul3(mat_at(F_TONE_PC_FROM), past_white_fade(near_white(tone_keeping_hue(q), pf(F_PEAK)), past_white(q), pf(F_PEAK)));
         o = lum2020(d);
     } else {
         let yl = lum2020(c);
@@ -1642,7 +1642,7 @@ fn tone_map(c: vec3<f32>) -> vec3<f32> {
     }
     let peak = pf(F_PEAK);
     if (pu(F_TOP_SHOULDER) != 0u) {
-        let moved = top_shoulder(d, c, o, peak);
+        let moved = top_shoulder_past_white(d, c, o, peak, past_white(c));
         d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
     } else if (pu(F_TONE_PC) == 0u) {
         // (toned per channel: clipped per channel at the output instead)
@@ -1728,6 +1728,56 @@ fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
         return d;
     }
     let pc = vec3<f32>(tone_apply(max(c.x, 0.0)), tone_apply(max(c.y, 0.0)), tone_apply(max(c.z, 0.0)));
+    return d + (pc - d) * b;
+}
+
+// `finish::PAST_WHITE` (fade from, full at, share), `PAST_WHITE_HUE`, `PAST_WHITE_SHOULDER` (from, full at, hue share)
+const PAST_WHITE: vec3<f32> = vec3<f32>(0.75, 3.5, 0.9);
+const PAST_WHITE_HUE: vec2<f32> = vec2<f32>(-0.5, 0.0);
+const PAST_WHITE_SHOULDER: vec3<f32> = vec3<f32>(-2.0, -1.0, 0.5);
+
+// `finish::past_white`: stops the brightest channel of `q` lies past the level where the tone reaches white
+fn past_white(q: vec3<f32>) -> f32 {
+    let w = pf(F_PAST_WHITE);
+    let hi = max(q.x, max(q.y, q.z));
+    if (!(hi > 0.0) || !(hi <= 3.4e38) || !(w > 0.0)) {
+        return -1e30;
+    }
+    return log2(hi / w);
+}
+
+// `finish::past_white_fade`
+fn past_white_fade(t: vec3<f32>, s: f32, peak: f32) -> vec3<f32> {
+    let k = PAST_WHITE.z * sstep(PAST_WHITE.x, PAST_WHITE.y, s);
+    if (!(k > 0.0)) {
+        return t;
+    }
+    let top = min(max(t.x, max(t.y, t.z)), peak);
+    return t + (vec3<f32>(top) - t) * k;
+}
+
+// `finish::past_white_hue`
+fn past_white_hue(s: f32) -> f32 {
+    return sstep(PAST_WHITE_HUE.x, PAST_WHITE_HUE.y, s);
+}
+
+// `finish::top_shoulder_past_white`
+fn top_shoulder_past_white(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32, s: f32) -> vec3<f32> {
+    if (!(s > PAST_WHITE_SHOULDER.x)) {
+        return top_shoulder(d, c, o, peak);
+    }
+    let hi = max(d.x, max(d.y, d.z));
+    if (!(peak > 0.0) || !(hi <= 3.4e38) || !(o <= 3.4e38)) {
+        return d;
+    }
+    let scene = max(sstep(TOP_SHOULDER_SCENE.x, TOP_SHOULDER_SCENE.y, max(c.x, max(c.y, c.z))), sstep(PAST_WHITE_SHOULDER.x, PAST_WHITE_SHOULDER.y, s));
+    let b = sstep(TOP_SHOULDER.x * peak, TOP_SHOULDER.y * peak, hi) * sstep(TOP_SHOULDER.z * peak, TOP_SHOULDER.w * peak, o) * scene;
+    if (!(b > 0.0)) {
+        return d;
+    }
+    let plain = vec3<f32>(tone_apply(max(c.x, 0.0)), tone_apply(max(c.y, 0.0)), tone_apply(max(c.z, 0.0)));
+    let kept = tone_keeping_hue(max(c, vec3<f32>(0.0)));
+    let pc = past_white_fade(plain + (kept - plain) * (past_white_hue(s) * PAST_WHITE_SHOULDER.z), s, peak);
     return d + (pc - d) * b;
 }
 
