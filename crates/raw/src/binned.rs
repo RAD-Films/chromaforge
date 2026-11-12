@@ -149,8 +149,11 @@ impl RawImage {
             && let Some((layout, _)) = layouts.get((c.y % ph) * pw + c.x % pw)
         {
             let offsets = plane_offsets(layout, k);
-            // process V9, across edges: red and blue follow green's shape ([`follow_green`])
-            if let Some(means) = align_planes(&mut out, offsets) {
+            // process V9, across edges: red and blue follow green's shape ([`follow_green`]), on the blocks the alignment
+            // flags as candidates
+            let rule = Follow::wider(self.sensor_noise(), k as f32 / 2.0);
+            let greens = layout.iter().filter(|&&l| l == 1).count() as f32;
+            if let Some((means, flags)) = align_and_flag(&mut out, offsets, Some(&rule), greens) {
                 let (aw, ah) = (a.width, a.height);
                 // a normalised sample of the active area, mirror-reflected at its edges (which keeps the pattern)
                 let sample = |x: isize, y: isize| -> f32 {
@@ -166,19 +169,34 @@ impl RawImage {
                         }
                     }
                 };
-                // green estimated at block (bx, by)'s samples of `colour`, averaged
+                // the same away from the active area's edges, for a plain file (no reflection, no per-sample black)
+                let plain = match (&norm, &self.data) {
+                    (None, RawData::U16(d)) if uniform_black => Some(d),
+                    _ => None,
+                };
+                let (stride, origin) = (self.width as isize, (a.y * self.width + a.x) as isize);
+                // (a negative index wraps far past the data, where `get` finds nothing)
+                let direct = |x: isize, y: isize| -> f32 {
+                    let i = (origin + y * stride + x) as usize;
+                    plain.and_then(|d| d.get(i)).map_or(0.0, |&v| (f32::from(v) - black0) * scale)
+                };
+                // green estimated at block (bx, by)'s samples of `colour`, averaged (`green_at` reads 2 px around a site)
                 let (cx, cy) = (c.x, c.y);
+                let sites: [Vec<usize>; 3] =
+                    std::array::from_fn(|colour| (0..layout.len()).filter(|&t| layout.get(t).is_some_and(|&l| l as usize == colour)).collect());
                 let green_sites = |bx: usize, by: usize, colour: usize| -> f32 {
                     let (x0, y0) = (cx + bx * k, cy + by * k);
-                    let (mut sum, mut n) = (0f32, 0f32);
-                    for (t, _) in layout.iter().enumerate().filter(|(_, l)| **l as usize == colour) {
-                        sum += green_at(&sample, (x0 + t % k) as isize, (y0 + t / k) as isize);
-                        n += 1.0;
-                    }
-                    if n > 0.0 { sum / n } else { 0.0 }
+                    let Some(sites) = sites.get(colour).filter(|s| !s.is_empty()) else { return 0.0 };
+                    let inside = plain.is_some() && x0 >= 2 && y0 >= 2 && x0 + k + 2 <= aw && y0 + k + 2 <= ah;
+                    let sum: f32 = if inside {
+                        sites.iter().map(|&t| green_at(&direct, (x0 + t % k) as isize, (y0 + t / k) as isize)).sum()
+                    } else {
+                        sites.iter().map(|&t| green_at(&sample, (x0 + t % k) as isize, (y0 + t / k) as isize)).sum()
+                    };
+                    sum / sites.len() as f32
                 };
                 let per_block: [f32; 3] = std::array::from_fn(|c| layout.iter().filter(|&&l| l as usize == c).count() as f32);
-                follow_green(&mut out, &means, offsets, &Follow::wider(self.sensor_noise(), k as f32 / 2.0), per_block, &mask, &green_sites);
+                follow_green(&mut out, &means, &flags, offsets, &rule, per_block, &mask, &green_sites);
             }
         }
         if list3.is_empty() {
@@ -227,8 +245,9 @@ fn green_at(at: &impl Fn(isize, isize) -> f32, x: isize, y: isize) -> f32 {
     let own = 2.0 * at(x, y);
     let dh = (l - r).abs() + (own - at(x - 2, y) - at(x + 2, y)).abs();
     let dv = (u - d).abs() + (own - at(x, y - 2) - at(x, y + 2)).abs();
-    let (wh, wv) = (1.0 / (dh + GRADIENT_FLOOR), 1.0 / (dv + GRADIENT_FLOOR));
-    let g = ((l + r) * 0.5 * wh + (u + d) * 0.5 * wv) / (wh + wv);
+    // weights 1 / (dh + floor) and 1 / (dv + floor), with a single division
+    let (a, b) = (dh + GRADIENT_FLOOR, dv + GRADIENT_FLOOR);
+    let g = ((l + r) * 0.5 * b + (u + d) * 0.5 * a) / (a + b);
     if g.is_finite() { g } else { 0.0 }
 }
 
@@ -253,42 +272,43 @@ fn axis(i: usize, n: usize, d: f32) -> [(usize, f32); 4] {
 /// times its ratio to green at its sites (`green_sites(x, y, c)`: green estimated at block `(x, y)`'s sites of colour
 /// `c`), both read at the block's centre with [`align_planes`]' weights and summed over the alignment's blocks and the
 /// next ones out ([`axis`]), kept within the alignment's blocks' means and trusted by the green's noise
-/// ([`Follow::trust`]; `per_block`: the sites of each colour in a block). Elsewhere (flat and smoothly shaded areas)
-/// the aligned means stay, bit for bit. A ratio, not a difference: across an edge the colour's ratio to green stays
-/// put, its difference doesn't.
+/// ([`Follow::trust`]; `per_block`: the sites of each colour in a block). Only the blocks and colours `flags` marks
+/// ([`align_and_flag`]) are looked at; elsewhere (flat and smoothly shaded areas) the aligned means stay, bit for
+/// bit. A ratio, not a difference: across an edge the colour's ratio to green stays put, its difference doesn't.
 ///
 /// The outer blocks next to a block holding a clipped sample (`mask`) stay out of the sums: their green at the sites
 /// reads clipped greens, which read lower than the light was, and a ratio to it overstates the colour (a magenta line
 /// on the bright side of dark bars against a clipped sky, at -3 EV). The alignment's own blocks stay in: they hold the
 /// colour being corrected, and the result is kept within their means.
+#[allow(clippy::too_many_arguments)]
 fn follow_green(
     img: &mut Rgb32f,
     means: &Rgb32f,
+    flags: &[u8],
     offsets: [(f32, f32); 3],
     rule: &Follow,
     per_block: [f32; 3],
     mask: &[u8],
-    green_sites: &(dyn Fn(usize, usize, usize) -> f32 + Sync),
+    green_sites: &(impl Fn(usize, usize, usize) -> f32 + Sync),
 ) {
     let (w, h) = (img.width, img.height);
-    if w == 0 || h == 0 || img.data.len() != w * h || means.data.len() != w * h {
+    if w == 0 || h == 0 || img.data.len() != w * h || means.data.len() != w * h || flags.len() != w * h || flags.iter().all(|&f| f == 0) {
         return;
     }
     // samples in a block's green, for the edge gate's noise allowance
     let per_green = per_block.get(1).copied().unwrap_or(1.0);
-    let any_clipped = mask.iter().any(|&m| m != 0);
-    // whether block (x, y) or one beside it holds a clipped sample
-    let touched = |x: usize, y: usize| {
-        any_clipped
-            && (y.saturating_sub(1)..(y + 2).min(h))
-                .any(|yy| (x.saturating_sub(1)..(x + 2).min(w)).any(|xx| mask.get(yy * w + xx).is_some_and(|&m| m != 0)))
-    };
+    // which blocks hold a clipped sample or lie beside one (none in a frame without)
+    let near_clip = clip_touched(mask, w, h);
+    let touched = |x: usize, y: usize| near_clip.as_ref().is_some_and(|t| t.get(y * w + x).copied().unwrap_or(true));
     let at = |x: usize, y: usize| means.data.get(y * w + x).copied().unwrap_or([0.0; 3]);
     let colours: Vec<(usize, usize, f32, f32)> = [(0usize, 0usize), (1, 2)]
         .into_iter()
         .filter_map(|(slot, c)| offsets.get(c).filter(|(dx, dy)| *dx != 0.0 || *dy != 0.0).map(|&(dx, dy)| (slot, c, dx, dy)))
         .collect();
-    img.data.par_chunks_mut(w * BAND).enumerate().for_each(|(band, rows)| {
+    img.data.par_chunks_mut(w * BAND).zip(flags.par_chunks(w * BAND)).enumerate().for_each(|(band, (rows, band_flags))| {
+        if band_flags.iter().all(|&f| f == 0) {
+            return;
+        }
         // green at the sites of each block the band reads (its rows and two either side), estimated once:
         // [red's sites, blue's sites], NaN until needed (made when a block of the band first needs it)
         let y0 = band * BAND;
@@ -307,20 +327,17 @@ fn follow_green(
                 None => green_sites(x, y, c),
             }
         };
-        for (r, row) in rows.chunks_mut(w).enumerate() {
+        for (r, (row, row_flags)) in rows.chunks_mut(w).zip(band_flags.chunks(w)).enumerate() {
             let y = y0 + r;
-            for (x, px) in row.iter_mut().enumerate() {
+            for (x, (px, &flag)) in row.iter_mut().zip(row_flags).enumerate().filter(|(_, (_, f))| **f != 0) {
                 let green = at(x, y)[1];
-                for &(slot, c, dx, dy) in &colours {
-                    // the alignment's four blocks ([`axis`]' first two along each): the edge gate on their greens
-                    // first (most blocks stop here), then the colour's range there
+                for &(slot, c, dx, dy) in colours.iter().filter(|&&(_, c, _, _)| flag & (1 << c) != 0) {
+                    // the alignment's four blocks ([`axis`]' first two along each): the edge gate on their greens, then
+                    // the colour's range there
                     let nx = if dx > 0.0 { x.saturating_sub(1) } else { (x + 1).min(w - 1) };
                     let ny = if dy > 0.0 { y.saturating_sub(1) } else { (y + 1).min(h - 1) };
                     let four = [at(x, y), at(nx, y), at(x, ny), at(nx, ny)];
                     let (green_lo, green_hi) = four.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
-                    if !rule.may_step(green, green_lo, green_hi) {
-                        continue;
-                    }
                     let gate = rule.edge(green, green_lo, green_hi, per_green);
                     if gate.is_nan() || gate <= 0.0 {
                         continue;
@@ -357,17 +374,58 @@ fn follow_green(
     });
 }
 
+/// Which blocks of a `w × h` clip `mask` hold a clipped sample or lie beside one (a 3 × 3 square), or `None` when none
+/// holds one.
+fn clip_touched(mask: &[u8], w: usize, h: usize) -> Option<Vec<bool>> {
+    if w == 0 || mask.len() != w * h || mask.iter().all(|&m| m == 0) {
+        return None;
+    }
+    // along the rows, then down the columns
+    let mut rows = vec![false; w * h];
+    rows.par_chunks_mut(w).zip(mask.par_chunks(w)).for_each(|(dst, src)| {
+        for (x, d) in dst.iter_mut().enumerate() {
+            *d = src.get(x.saturating_sub(1)..(x + 2).min(w)).is_some_and(|s| s.iter().any(|&m| m != 0));
+        }
+    });
+    let mut out = vec![false; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, dst)| {
+        for yy in y.saturating_sub(1)..(y + 2).min(h) {
+            if let Some(src) = rows.get(yy * w..(yy + 1) * w) {
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d |= s;
+                }
+            }
+        }
+    });
+    Some(out)
+}
+
 /// Each colour plane read at the blocks' centres: between a block's own value (which lies `offsets` away from its
 /// centre) and the neighbouring block's on the other side of it. Returns the block means as they were (`None`: nothing
 /// to align).
+#[cfg(test)]
 fn align_planes(img: &mut Rgb32f, offsets: [(f32, f32); 3]) -> Option<Rgb32f> {
+    align_and_flag(img, offsets, None, 1.0).map(|(means, _)| means)
+}
+
+/// [`align_planes`], and with a `rule`, per block which colours [`follow_green`] may change (bit `c` for colour `c`):
+/// those the alignment moves, where the greens of the 3 x 3 blocks around (each the mean of `per_green` samples; every
+/// block the alignment reads) step far enough for the rule's edge gate ([`edge::FirstTest`]: a superset of what each
+/// colour's own gate passes). Empty without a rule.
+fn align_and_flag(img: &mut Rgb32f, offsets: [(f32, f32); 3], rule: Option<&Follow>, per_green: f32) -> Option<(Rgb32f, Vec<u8>)> {
     let (w, h) = (img.width, img.height);
     if w == 0 || h == 0 || offsets.iter().all(|&(x, y)| x == 0.0 && y == 0.0) {
         return None;
     }
     let src = img.clone();
     let at = |x: usize, y: usize, c: usize| src.data.get(y * w + x).map_or(0.0, |p| p[c]);
-    img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+    // the colours that have a plane to move: the bits a flagged block gets
+    let moved = offsets.iter().enumerate().filter(|(_, (dx, dy))| *dx != 0.0 || *dy != 0.0).fold(0u8, |b, (c, _)| b | 1 << c);
+    let gate = rule.map(|r| r.first_test(per_green));
+    let src_row = |y: usize| src.data.get(y * w..(y + 1) * w).unwrap_or(&[]);
+    // one row: its aligned planes, and its flags when there are any to set (`extremes`: room for the greens' extremes
+    // down each column of the 3 x 3)
+    let align_row = |y: usize, row: &mut [[f32; 3]], flag_row: Option<&mut [u8]>, extremes: &mut Vec<(f32, f32)>| {
         for (x, px) in row.iter_mut().enumerate() {
             for (c, &(dx, dy)) in offsets.iter().enumerate() {
                 if dx == 0.0 && dy == 0.0 {
@@ -380,8 +438,34 @@ fn align_planes(img: &mut Rgb32f, offsets: [(f32, f32); 3]) -> Option<Rgb32f> {
                     at(x, y, c) * (1.0 - ax) * (1.0 - ay) + at(nx, y, c) * ax * (1.0 - ay) + at(x, ny, c) * (1.0 - ax) * ay + at(nx, ny, c) * ax * ay;
             }
         }
-    });
-    Some(src)
+        // the greens of the 3 x 3 blocks around each (every block the alignment reads, for any colour): their extremes
+        // down each column, then across three columns (plain comparisons: a NaN green only flags or doesn't)
+        if let (Some(gate), Some(flag_row)) = (&gate, flag_row) {
+            let (up, mid, down) = (src_row(y.saturating_sub(1)), src_row(y), src_row((y + 1).min(h - 1)));
+            let low = |a: f32, b: f32| if b < a { b } else { a };
+            let high = |a: f32, b: f32| if b > a { b } else { a };
+            extremes.clear();
+            extremes.extend(up.iter().zip(mid).zip(down).map(|((u, m), d)| (low(low(u[1], m[1]), d[1]), high(high(u[1], m[1]), d[1]))));
+            let last = extremes.len().saturating_sub(1);
+            for (x, (flag, p)) in flag_row.iter_mut().zip(mid).enumerate() {
+                let at = |i: usize| extremes.get(i).copied().unwrap_or((p[1], p[1]));
+                let ((l0, h0), (l1, h1), (l2, h2)) = (at(x.saturating_sub(1)), at(x), at((x + 1).min(last)));
+                *flag = if gate.passes(p[1], low(low(l0, l1), l2), high(high(h0, h1), h2)) { moved } else { 0 };
+            }
+        }
+    };
+    let mut flags = Vec::new();
+    if rule.is_some() {
+        flags = vec![0u8; w * h];
+        img.data
+            .par_chunks_mut(w)
+            .zip(flags.par_chunks_mut(w))
+            .enumerate()
+            .for_each_init(Vec::new, |extremes, (y, (row, f))| align_row(y, row, Some(f), extremes));
+    } else {
+        img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| align_row(y, row, None, &mut Vec::new()));
+    }
+    Some((src, flags))
 }
 
 /// Colours of the `k × k` samples of a block whose corner sits at pattern position `(i, j)`

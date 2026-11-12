@@ -165,6 +165,13 @@ impl Follow {
         g > self.edge.0 * (lo.max(0.0) + RATIO_FLOOR) || hi.max(0.0) + RATIO_FLOOR > self.edge.0 * g
     }
 
+    /// [`Follow::edge`]'s first test for greens that are each the mean of `samples` samples ([`FirstTest::passes`]).
+    pub(crate) fn first_test(&self, samples: f32) -> FirstTest {
+        let k = 0.99 * EDGE_SIGMAS * EDGE_SIGMAS / if samples > 1.0 { samples } else { 1.0 };
+        let e = self.edge.0;
+        FirstTest { e, k, e2k: e * e * k, noise: self.noise }
+    }
+
     /// The edge gate ([`EDGE_STOPS`]) between a pixel's `green` and the green at its sites, which spans `lo..=hi`
     /// (each green the mean of `samples` samples' worth), each step shrunk by what noise could have made of it
     /// ([`EDGE_SIGMAS`]): 0 (exactly) below the gate's start, 1 past its end.
@@ -197,6 +204,29 @@ impl Follow {
             return 0.0;
         }
         1.0 - smoothstep(NOISE_CV.0, NOISE_CV.1, cv)
+    }
+}
+
+/// Whether [`Follow::edge`] may pass anything for some greens, noise allowance included, without a square root, a
+/// division or a branch (noise makes branches unpredictable): true wherever the gate is above 0 and, by a hair of
+/// slack against rounding, a little beyond. Made by [`Follow::first_test`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FirstTest {
+    e: f32,
+    k: f32,
+    e2k: f32,
+    noise: SensorNoise,
+}
+
+impl FirstTest {
+    /// For a pixel's `green` and the greens around it, which span `lo..=hi`.
+    #[inline]
+    pub(crate) fn passes(&self, green: f32, lo: f32, hi: f32) -> bool {
+        let (g, lo, hi) = (green.max(0.0), lo.max(0.0), hi.max(0.0));
+        // each step passes when it outgrows its noise allowance (see `Follow::edge`), squared
+        let (d_lo, d_hi) = ((g + RATIO_FLOOR) - self.e * (lo + RATIO_FLOOR), (hi + RATIO_FLOOR) - self.e * (g + RATIO_FLOOR));
+        let var = |a: f32| self.noise.variance(a) + self.noise.variance(g);
+        ((d_lo > 0.0) & (d_lo * d_lo > self.e2k * var(lo))) | ((d_hi > 0.0) & (d_hi * d_hi > self.k * var(hi)))
     }
 }
 
@@ -257,6 +287,15 @@ mod tests {
         assert!(f.edge(0.5, 0.42, 0.5, 1.0) > 0.0);
         assert_eq!(f.edge(0.2, 0.2, 0.5, 1.0), 1.0);
         assert_eq!(f.edge(0.5, 0.2, 0.5, 1.0), 1.0);
+        // the first test passes wherever the gate does
+        for (g, lo, hi, n) in
+            [(0.5, 0.42, 0.5, 1.0), (0.05, 0.05, 0.08, 64.0), (0.05, 0.05, 0.08, 1.0), (0.3, 0.2, 0.31, 2.0), (0.01, 0.002, 0.01, 8.0)]
+        {
+            for r in [f, noisy] {
+                assert!(r.edge(g, lo, hi, n) == 0.0 || r.first_test(n).passes(g, lo, hi), "{g} {lo} {hi} {n}");
+            }
+        }
+        assert!(!noisy.first_test(1.0).passes(0.05, 0.05, 0.065));
         for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0] {
             for w in [f32::NAN, 0.3, f32::INFINITY] {
                 assert!((0.0..=1.0).contains(&f.edge(v, w, w, 1.0)), "{v} {w}");
