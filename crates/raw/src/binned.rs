@@ -178,7 +178,7 @@ impl RawImage {
                     if n > 0.0 { sum / n } else { 0.0 }
                 };
                 let per_block: [f32; 3] = std::array::from_fn(|c| layout.iter().filter(|&&l| l as usize == c).count() as f32);
-                follow_green(&mut out, &means, offsets, &Follow::wider(self.sensor_noise(), k as f32 / 2.0), per_block, &green_sites);
+                follow_green(&mut out, &means, offsets, &Follow::wider(self.sensor_noise(), k as f32 / 2.0), per_block, &mask, &green_sites);
             }
         }
         if list3.is_empty() {
@@ -253,29 +253,46 @@ fn axis(i: usize, n: usize, d: f32) -> [(usize, f32); 4] {
 /// times its ratio to green at its sites (`green_sites(x, y, c)`: green estimated at block `(x, y)`'s sites of colour
 /// `c`), both read at the block's centre with [`align_planes`]' weights and summed over the alignment's blocks and the
 /// next ones out ([`axis`]), kept within the alignment's blocks' means and trusted by the green's noise
-/// ([`Follow::trust`]; `per_block`: the sites of each colour in a block). Elsewhere (flat and smoothly shaded areas) the aligned means stay, bit for bit. A
-/// ratio, not a difference: across an edge the colour's ratio to green stays put, its difference doesn't.
+/// ([`Follow::trust`]; `per_block`: the sites of each colour in a block). Elsewhere (flat and smoothly shaded areas)
+/// the aligned means stay, bit for bit. A ratio, not a difference: across an edge the colour's ratio to green stays
+/// put, its difference doesn't.
+///
+/// The outer blocks next to a block holding a clipped sample (`mask`) stay out of the sums: their green at the sites
+/// reads clipped greens, which read lower than the light was, and a ratio to it overstates the colour (a magenta line
+/// on the bright side of dark bars against a clipped sky, at -3 EV). The alignment's own blocks stay in: they hold the
+/// colour being corrected, and the result is kept within their means.
 fn follow_green(
     img: &mut Rgb32f,
     means: &Rgb32f,
     offsets: [(f32, f32); 3],
     rule: &Follow,
     per_block: [f32; 3],
+    mask: &[u8],
     green_sites: &(dyn Fn(usize, usize, usize) -> f32 + Sync),
 ) {
     let (w, h) = (img.width, img.height);
-    // samples in a block's green, for the edge gate's noise allowance
-    let per_green = per_block.get(1).copied().unwrap_or(1.0);
     if w == 0 || h == 0 || img.data.len() != w * h || means.data.len() != w * h {
         return;
     }
+    // samples in a block's green, for the edge gate's noise allowance
+    let per_green = per_block.get(1).copied().unwrap_or(1.0);
+    let any_clipped = mask.iter().any(|&m| m != 0);
+    // whether block (x, y) or one beside it holds a clipped sample
+    let touched = |x: usize, y: usize| {
+        any_clipped
+            && (y.saturating_sub(1)..(y + 2).min(h))
+                .any(|yy| (x.saturating_sub(1)..(x + 2).min(w)).any(|xx| mask.get(yy * w + xx).is_some_and(|&m| m != 0)))
+    };
     let at = |x: usize, y: usize| means.data.get(y * w + x).copied().unwrap_or([0.0; 3]);
+    let colours: Vec<(usize, usize, f32, f32)> = [(0usize, 0usize), (1, 2)]
+        .into_iter()
+        .filter_map(|(slot, c)| offsets.get(c).filter(|(dx, dy)| *dx != 0.0 || *dy != 0.0).map(|&(dx, dy)| (slot, c, dx, dy)))
+        .collect();
     img.data.par_chunks_mut(w * BAND).enumerate().for_each(|(band, rows)| {
         // green at the sites of each block the band reads (its rows and two either side), estimated once:
-        // [red's sites, blue's sites], NaN until needed
+        // [red's sites, blue's sites], NaN until needed (made when a block of the band first needs it)
         let y0 = band * BAND;
         let g0 = y0.saturating_sub(2);
-        // (made when a block of the band first needs it: most bands of a frame have no edge)
         let mut guides: Vec<[f32; 2]> = Vec::new();
         let mut guide = |x: usize, y: usize, slot: usize, c: usize| -> f32 {
             if guides.is_empty() {
@@ -294,13 +311,9 @@ fn follow_green(
             let y = y0 + r;
             for (x, px) in row.iter_mut().enumerate() {
                 let green = at(x, y)[1];
-                for (slot, c) in [(0usize, 0usize), (1, 2)] {
-                    let Some(&(dx, dy)) = offsets.get(c) else { continue };
-                    if dx == 0.0 && dy == 0.0 {
-                        continue;
-                    }
-                    // the alignment's four blocks ([`axis`]' first two along each): their greens first (most blocks stop
-                    // here), then the colour's range there
+                for &(slot, c, dx, dy) in &colours {
+                    // the alignment's four blocks ([`axis`]' first two along each): the edge gate on their greens
+                    // first (most blocks stop here), then the colour's range there
                     let nx = if dx > 0.0 { x.saturating_sub(1) } else { (x + 1).min(w - 1) };
                     let ny = if dy > 0.0 { y.saturating_sub(1) } else { (y + 1).min(h - 1) };
                     let four = [at(x, y), at(nx, y), at(x, ny), at(nx, ny)];
@@ -313,11 +326,14 @@ fn follow_green(
                         continue;
                     }
                     let (lo, hi) = four.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| (lo.min(p[c]), hi.max(p[c])));
-                    // and the blocks one further out
+                    // and the blocks one further out, but those next to a clipped sample
                     let (xs, ys) = (axis(x, w, dx), axis(y, h, dy));
                     let (mut own_all, mut green_all, mut sum, mut sum_sq) = (0f32, 0f32, 0f32, 0f32);
-                    for &(ty, ky) in &ys {
-                        for &(tx, kx) in &xs {
+                    for (iy, &(ty, ky)) in ys.iter().enumerate() {
+                        for (ix, &(tx, kx)) in xs.iter().enumerate() {
+                            if (ix >= 2 || iy >= 2) && touched(tx, ty) {
+                                continue;
+                            }
                             let k = kx * ky;
                             own_all += k * at(tx, ty)[c];
                             green_all += k * guide(tx, ty, slot, c);
@@ -633,6 +649,89 @@ mod tests {
         }
         assert!(before * 5 >= total, "without the rule the edge has a line: {before} of {total}");
         assert!(after * 30 <= total, "with it: {after} of {total}");
+    }
+
+    /// Dark bars against a sky two stops over the clip in green (blue clips too, red doesn't): the ring next to clipped
+    /// samples, where the bars' edges climb toward the clipped sky, that a -3 EV render shows. Soft edges, one bar
+    /// slanted and one steep, every block phase. Camera RGB: sky red / green 0.45, blue / green 0.75.
+    fn ring_scene(w: usize, h: usize) -> Rgb32f {
+        let (sky, dark) = ([0.45f32, 1.0, 0.75], [0.02f32, 0.04, 0.03]);
+        Rgb32f::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let bar = (fy - (0.35 * h as f32 + fx / 7.0)).abs() - 2.5;
+            let post = (fx - (0.65 * w as f32 + fy / 6.0)).abs() - 2.0;
+            let d = bar.min(post);
+            let t = 0.5 + 0.5 * (d / 0.7).tanh();
+            std::array::from_fn(|c| dark[c] + (sky[c] * 2.0 - dark[c]) * t)
+        })
+    }
+
+    /// Over the blocks of `out` (×`k`) within 5 sensor pixels of a block holding a clipped sample (`mask`) that hold
+    /// none themselves and whose true colour (`truth`, the scene's block means) is clipped in no channel: how many have
+    /// a red or blue ratio to green more than 10 % outside the range the bars and the sky span (colour neither has),
+    /// how many of those are magenta (red and blue both too high against green), and the count.
+    fn ring_error(out: &Rgb32f, truth: &Rgb32f, mask: &[u8], k: usize) -> (usize, usize, usize) {
+        let (w, h) = (out.width, out.height);
+        let r = 5usize.div_ceil(k);
+        let (mut bad, mut magenta, mut count) = (0, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let t: [f32; 3] =
+                    std::array::from_fn(|c| (0..k * k).map(|i| truth.get(x * k + i % k, y * k + i / k)[c]).sum::<f32>() / (k * k) as f32);
+                let near =
+                    (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| mask[yy * w + xx] != 0));
+                // (a block holding a clipped sample is the highlight rebuild's)
+                if t.iter().any(|&v| v >= 0.95) || mask[y * w + x] != 0 || !near {
+                    continue;
+                }
+                count += 1;
+                let p = out.get(x, y);
+                // red / green: sky 0.45, bars 0.5; blue / green 0.75 on both: any mix of the two lies between
+                let (rg, bg) = (p[0] / p[1], p[2] / p[1]);
+                if !(0.45 / 1.1..=0.5 * 1.1).contains(&rg) || !(0.75 / 1.1..=0.75 * 1.1).contains(&bg) {
+                    bad += 1;
+                    if rg > 0.5 * 1.1 && bg > 0.75 * 1.1 {
+                        magenta += 1;
+                    }
+                }
+            }
+        }
+        (bad, magenta, count)
+    }
+
+    /// Process V9 next to clipped samples, at fit size (×2 and ×4): where a dark bar's edge climbs toward a clipped sky
+    /// (the ring a -3 EV render shows), red and blue don't turn magenta. A ratio to a green read from clipped greens,
+    /// which read too low, made them too high there; the aligned means alone are magenta here too (they read the
+    /// clipped sky's planes), and the rule takes most of it away.
+    #[test]
+    fn next_to_clipped_samples_the_ring_keeps_its_colour() {
+        let truth = ring_scene(224, 160);
+        let clipped = Rgb32f { data: truth.data.iter().map(|p| p.map(|v| v.min(1.0))).collect(), ..truth.clone() };
+        let mut results = Vec::new();
+        for k in [2, 4] {
+            let (mut plain_bad, mut plain_magenta, mut bad, mut magenta, mut total) = (0, 0, 0, 0, 0);
+            for pattern in PATTERNS {
+                let mut raw = raw_from(&mosaic_from_rgb(&clipped, &Cfa::bayer(pattern).unwrap()), 512.0, 16383.0);
+                raw.metadata.iso = Some(100);
+                let (plain, mask) = plain_aligned(&raw, k);
+                let fixed = raw.develop_binned_masked_aligned(k, 0.99).unwrap().unwrap().0;
+                let (was, was_magenta, count) = ring_error(&plain, &truth, &mask, k);
+                let (now, now_magenta, _) = ring_error(&fixed, &truth, &mask, k);
+                eprintln!("×{k} {pattern}: off colour in the ring {was} ({was_magenta} magenta) -> {now} ({now_magenta} magenta) of {count}");
+                (plain_bad, plain_magenta, bad, magenta, total) =
+                    (plain_bad + was, plain_magenta + was_magenta, bad + now, magenta + now_magenta, total + count);
+            }
+            eprintln!("×{k} ring: {plain_bad} ({plain_magenta} magenta) -> {bad} ({magenta} magenta) of {total}");
+            results.push((k, plain_magenta, magenta, total));
+        }
+        for (k, plain_magenta, magenta, total) in results {
+            assert!(total >= 100, "×{k}: {total} ring blocks");
+            // the aligned means alone are magenta here (they read the clipped sky's planes); the rule takes most of it
+            assert!(magenta * 2 <= plain_magenta, "×{k}: magenta in the ring: {plain_magenta} -> {magenta} of {total}");
+            if k == 2 {
+                assert!(magenta * 10 <= total, "×{k}: magenta in the ring: {magenta} of {total}");
+            }
+        }
     }
 
     /// Flat and smoothly shaded areas (a flat colour, linear ramps, a slow colour wave, a bright gradient with mild noise)

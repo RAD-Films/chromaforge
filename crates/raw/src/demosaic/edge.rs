@@ -14,6 +14,12 @@
 //! model ([`SensorNoise`]: the file's black and white levels and its ISO), not by fixed dark levels ([`NOISE_CV`]), and
 //! it is summed over more sites than the nearest ones to bring that noise down ([`SUPPORT_OUTER`]).
 //!
+//! Next to clipped samples the sums leave out the sites whose green the clip understates (a clipped sample on or beside
+//! the site): a ratio to such a green is too high, and on the bright side of dark bars against a clipped sky it drew a
+//! magenta line (worst at fit size at -3 EV). The outer sites reach into the clipping first. At full size the nearest
+//! sites are left out too (none left: the colour difference stays); at fit size only the outer blocks, since the
+//! alignment's own blocks carry the colour being corrected and the result stays within their means.
+//!
 //! Every tunable of the rule is here, so a round of tuning against Lightroom Classic changes this file only:
 //!
 //! | constant | what it sets |

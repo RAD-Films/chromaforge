@@ -143,6 +143,8 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
     let inner = |d: usize| (d..bh - d).flat_map(move |y| y * bw + d..y * bw + bw - d);
     // process V9: the pixels whose candidates read a clipped sample (none in a tile without one)
     let near = if clip_aware { near_clipped(&mos, bw, bh) } else { None };
+    // and the sites the ratio leaves out: a clipped sample or one beside it, whose green the clip understates
+    let touched = if rule.is_some() && near.is_some() { Some(clip_touched(&mos, bw)) } else { None };
     let sites = Sites::new(bw);
     // 1. directional greens (down to 2 px from the buffer's edge: the ratio's outer sites read them 3 px around)
     let mut gh = vec![0f32; n];
@@ -180,7 +182,7 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
                 set(p, 2 - own, gvv + (d(i - bw - 1) + d(i - bw + 1) + d(i + bw - 1) + d(i + bw + 1)) * 0.25)
             };
             let p = match rule {
-                Some(rule) if on_edge(rule, own, gvv, g, i, bw) => by_ratio(p, own, gvv, &mos, &col, g, i, &sites, rule),
+                Some(rule) if on_edge(rule, own, gvv, g, i, bw) => by_ratio(p, own, gvv, &mos, &col, g, i, &sites, rule, touched.as_deref()),
                 _ => p,
             };
             let p = match &near {
@@ -271,6 +273,17 @@ fn near_clipped(mos: &[f32], bw: usize, bh: usize) -> Option<Vec<bool>> {
     Some(near)
 }
 
+/// Which samples of the tile buffer `mos` (`bw` wide) are clipped ([`CLIP`]) or have a clipped sample beside them
+/// (left, right, above, below: the greens a site's directional green is interpolated from).
+fn clip_touched(mos: &[f32], bw: usize) -> Vec<bool> {
+    let clipped = |j: Option<usize>| j.and_then(|j| mos.get(j)).is_some_and(|&v| v >= CLIP);
+    (0..mos.len())
+        .map(|j| {
+            clipped(Some(j)) || clipped(j.checked_sub(1)) || clipped(j.checked_add(1)) || clipped(j.checked_sub(bw)) || clipped(j.checked_add(bw))
+        })
+        .collect()
+}
+
 /// Offsets in a tile buffer `bw` wide of the sites a pixel's missing colour is interpolated from, `(nearest, outer)`
 /// ([`edge::SUPPORT_OUTER`]): at a green pixel, the colour of its row neighbours (`row`) and of its column neighbours
 /// (`column`); at a red or blue pixel, the other one, on the diagonals (`diagonal`). Each set lies symmetrically
@@ -315,8 +328,24 @@ fn on_edge(rule: &Follow, own: u8, green: f32, g: &[f32], i: usize, bw: usize) -
 /// bright side's difference: a neon green-cyan fringe. The ratio stays put (0.54 and 0.53 there). How far: the edge
 /// gate between `green` and the nearest sites' greens ([`Follow::edge`]; 0 leaves `p` exactly as it is), the
 /// trust in the ratio given the sites' green noise ([`Follow::trust`]) and the near-clip fade ([`edge::fade`]).
+///
+/// The sums leave out the sites `touched` marks ([`clip_touched`]): a clipped sample reads lower than the light was,
+/// and so does a green interpolated from one, so a ratio to it overstates the colour. Next to a clipped sky that made
+/// red and blue too high on the bright side of dark bars, a magenta line a -3 EV render showed; the outer sites, 3 px
+/// out, reach into the clipping first. When every nearest site is touched the colour difference stays.
 #[allow(clippy::too_many_arguments)]
-fn by_ratio(mut p: [f32; 3], own: u8, green: f32, mos: &[f32], col: &[u8], g: &[f32], i: usize, sites: &Sites, rule: &Follow) -> [f32; 3] {
+fn by_ratio(
+    mut p: [f32; 3],
+    own: u8,
+    green: f32,
+    mos: &[f32],
+    col: &[u8],
+    g: &[f32],
+    i: usize,
+    sites: &Sites,
+    rule: &Follow,
+    touched: Option<&[bool]>,
+) -> [f32; 3] {
     let fade = if green <= edge::GUIDE_BRIGHT.0 { 1.0 } else { edge::fade(green) };
     if fade.is_nan() || fade <= 0.0 {
         return p;
@@ -328,11 +357,15 @@ fn by_ratio(mut p: [f32; 3], own: u8, green: f32, mos: &[f32], col: &[u8], g: &[
             Some((lo.min(gj), hi.max(gj)))
         })
     };
-    // the colour's and green's sums over some sites (`None` past the buffer, which the margin rules out)
+    // the colour's and green's sums over some sites and how many they are, leaving out the sites next to a clipped
+    // sample (`None` past the buffer, which the margin rules out)
     let sum = |offsets: &[isize]| {
-        offsets.iter().try_fold((0f32, 0f32), |(own, green), &o| {
+        offsets.iter().try_fold((0f32, 0f32, 0f32), |(own, green, n), &o| {
             let j = i.wrapping_add_signed(o);
-            Some((own + *mos.get(j)?, green + *g.get(j)?))
+            if touched.is_some_and(|t| t.get(j).copied().unwrap_or(true)) {
+                return Some((own, green, n));
+            }
+            Some((own + *mos.get(j)?, green + *g.get(j)?, n + 1.0))
         })
     };
     let mut follow = |c: Option<&u8>, near: &[isize], outer: &[isize]| {
@@ -344,9 +377,12 @@ fn by_ratio(mut p: [f32; 3], own: u8, green: f32, mos: &[f32], col: &[u8], g: &[
         if gate.is_nan() || gate <= 0.0 {
             return;
         }
-        let n = near.len() as f32;
-        let (Some((own_near, green_near)), Some((own_outer, green_outer))) = (sum(near), sum(outer)) else { return };
-        let (w, m) = (edge::SUPPORT_OUTER, outer.len() as f32);
+        // (every nearest site next to a clipped sample: the colour difference stays)
+        let (Some((own_near, green_near, n)), Some((own_outer, green_outer, m))) = (sum(near), sum(outer)) else { return };
+        if n <= 0.0 {
+            return;
+        }
+        let w = edge::SUPPORT_OUTER;
         let total = n + w * m;
         let (own_mean, guide) = ((own_near + w * own_outer) / total, (green_near + w * green_outer) / total);
         let t = gate * rule.trust(guide, edge::samples(total, n + w * w * m, SITE_SAMPLES));
@@ -624,6 +660,73 @@ mod tests {
         }
         assert!(before * 5 >= total, "without the rule the edge has a fringe: {before} of {total}");
         assert!(after * 30 <= total, "with it: {after} of {total}");
+    }
+
+    /// Dark bars against a sky two stops over the clip in green (blue clips too, red doesn't): the ring next to clipped
+    /// samples, where the bars' edges climb toward the clipped sky, that a -3 EV render shows. Soft edges, one bar
+    /// slanted and one steep, every pattern phase. Camera RGB: sky red / green 0.45, blue / green 0.75.
+    fn ring_scene(w: usize, h: usize) -> Rgb32f {
+        let (sky, dark) = ([0.45f32, 1.0, 0.75], [0.02f32, 0.04, 0.03]);
+        Rgb32f::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let bar = (fy - (0.35 * h as f32 + fx / 7.0)).abs() - 2.5;
+            let post = (fx - (0.65 * w as f32 + fy / 6.0)).abs() - 2.0;
+            let d = bar.min(post);
+            let t = 0.5 + 0.5 * (d / 0.7).tanh();
+            std::array::from_fn(|c| dark[c] + (sky[c] * 2.0 - dark[c]) * t)
+        })
+    }
+
+    /// Over the pixels of `out` within 5 px of a clipped sample of `n` whose true colour (`truth`) is clipped in no
+    /// channel: how many have a red or blue ratio to green more than 10 % outside the range the bars and the sky span
+    /// (colour neither has), how many of those are magenta (red and blue both too high against green), and the count.
+    fn ring_error(out: &Rgb32f, truth: &Rgb32f, n: &[f32]) -> (usize, usize, usize) {
+        let (w, h) = (out.width, out.height);
+        let (mut bad, mut magenta, mut count) = (0, 0, 0);
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                let t = truth.get(x, y);
+                if t.iter().any(|&v| v >= 0.95) || !near_clip(n, w, h, x, y, 5) {
+                    continue;
+                }
+                count += 1;
+                let p = out.get(x, y);
+                // red / green: sky 0.45, bars 0.5; blue / green 0.75 on both: any mix of the two lies between
+                let (rg, bg) = (p[0] / p[1], p[2] / p[1]);
+                if !(0.45 / 1.1..=0.5 * 1.1).contains(&rg) || !(0.75 / 1.1..=0.75 * 1.1).contains(&bg) {
+                    bad += 1;
+                    if rg > 0.5 * 1.1 && bg > 0.75 * 1.1 {
+                        magenta += 1;
+                    }
+                }
+            }
+        }
+        (bad, magenta, count)
+    }
+
+    /// Process V9 next to clipped samples, at full size: on the bright side of a dark bar against a clipped sky (the
+    /// ring a -3 EV render shows), red and blue keep the sky's colour. A ratio to a green read from clipped greens,
+    /// which reads too low, made them too high there: a magenta line.
+    #[test]
+    fn next_to_clipped_samples_the_ring_keeps_its_colour() {
+        let truth = ring_scene(112, 80);
+        let clipped = Rgb32f { data: truth.data.iter().map(|p| p.map(|v| v.min(1.0))).collect(), ..truth.clone() };
+        let (mut plain_bad, mut plain_magenta, mut bad, mut magenta, mut total) = (0, 0, 0, 0, 0);
+        for pattern in PATTERNS {
+            let cfa = Cfa::bayer(pattern).unwrap();
+            let n = mosaic_from_rgb(&clipped, &cfa);
+            let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+            let (was, was_magenta, count) = ring_error(&without_rule(&m), &truth, &n.data);
+            let (now, now_magenta, _) = ring_error(&v9(&m, clean()), &truth, &n.data);
+            eprintln!("{pattern}: off colour in the ring {was} ({was_magenta} magenta) -> {now} ({now_magenta} magenta) of {count}");
+            (plain_bad, plain_magenta, bad, magenta, total) =
+                (plain_bad + was, plain_magenta + was_magenta, bad + now, magenta + now_magenta, total + count);
+        }
+        eprintln!("ring: {plain_bad} ({plain_magenta} magenta) -> {bad} ({magenta} magenta) of {total}");
+        assert!(total >= 200, "{total} ring pixels");
+        assert!(magenta * 10 <= total, "magenta in the ring: {magenta} of {total}");
+        assert!(magenta <= plain_magenta, "the rule adds magenta in the ring: {plain_magenta} -> {magenta}");
+        assert!(bad <= plain_bad, "the rule adds off colour in the ring: {plain_bad} -> {bad} of {total}");
     }
 
     /// Flat and smoothly shaded areas (a flat colour, linear ramps, a slow colour wave, a bright gradient with mild noise)
