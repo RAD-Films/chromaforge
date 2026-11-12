@@ -1118,6 +1118,10 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     if let Some(left) = app.ui.mask_adjusting_until.map(|t| t.saturating_duration_since(std::time::Instant::now())).filter(|d| !d.is_zero()) {
         ui.ctx().request_repaint_after(left);
     }
+    // a picked mask's peek overlay goes again when its moment is up (issue #1109)
+    if let Some(left) = app.ui.mask_peek_until.map(|t| t.saturating_duration_since(std::time::Instant::now())).filter(|d| !d.is_zero()) {
+        ui.ctx().request_repaint_after(left);
+    }
     // a drag drafts at full size where the GPU draws the view (by the GPU's own rule, `handles`;
     // `ready` first: `available` would wait for a device still being created)
     let gpu = draft_drag
@@ -1216,7 +1220,22 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(crate::loupe_timing::SETTLE_SECS / 2.0));
     }
-    let main_job = if settling {
+    // the background preparation is making this very photo's preview: the loupe waits for it (it
+    // lands in the view cache, which the render below then finds) rather than decoding the same raw a
+    // second time beside it, at most PREP_WAIT_MAX_S (a build held up elsewhere doesn't keep the photo
+    // unrendered)
+    let wait_for_prep = !settling
+        && !interacting
+        && !drafting
+        && plan.window_edge.is_none()
+        && app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id)
+        && app.loupe_timing.on_screen_secs(id, now) < PREP_WAIT_MAX_S
+        && app.session.being_prepared(id);
+    if wait_for_prep {
+        app.renderer.drop_queued(Slot::Main);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    let main_job = if settling || wait_for_prep {
         None
     } else if drafting {
         app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool).map(|job| {
@@ -1305,6 +1324,10 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                     break;
                 }
                 let Some(at) = ids.iter().position(|p| *p == nid) else { continue };
+                // (one the background preparation is making already is not decoded a second time)
+                if !develop && app.session.being_prepared(nid) {
+                    continue;
+                }
                 // the nearest one each way in slots 0 (ahead) and 1 (behind), kept to be adopted at
                 // the step; the others by their place in the view, so a step keeps them where they are
                 let side = usize::from((at < i) != app.prep_backward);
@@ -1386,6 +1409,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     if app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id)
         && let Some(q) = app.session.quick_view_job(id, want.max(8), !crop_tool)
     {
+        let q = cheapest_first(app, id, q, want.max(8), !crop_tool, settling);
         app.renderer.request_quick(Slot::Preview, q, 110);
     }
     if !interacting && let Some(i) = here {
@@ -1476,10 +1500,12 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
         } else {
             app.region_view = shown;
         }
-        // a side no longer shown zoomed frees its tiles
+        // a side no longer shown zoomed frees the tiles of other photos; the photo on screen keeps
+        // its own (the cache's budget bounds them), so a return to 100 % with the same look draws
+        // at once instead of rendering every tile again (about 5 s on a 45 MP raw)
         if shown.is_none() {
             let pane = if before { crate::render::PANE_BEFORE } else { crate::render::PANE_AFTER };
-            app.renderer.tiles.retain(|k| k.pane != pane);
+            app.renderer.tiles.retain(|k| k.pane != pane || k.photo == id);
             app.renderer.release(Slot::Window(pane));
         }
     }
@@ -1716,8 +1742,8 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     }
     // …and the window renders go over the whole-frame ones, all of them, where they belong in the
     // frame (clipped to their pane, or their side of the line)
-    let window_drawn =
-        app.renderer.tiles.has_render_of(id) || app.renderer.window_texture(crate::render::PANE_AFTER).is_some_and(|(_, g)| g.photo == id);
+    let window_drawn = app.region_view.is_some_and(|v| v.photo == id && app.renderer.tiles.has_render_of_look(id, v.settings))
+        || app.renderer.window_texture(crate::render::PANE_AFTER).is_some_and(|(_, g)| g.photo == id);
     if camera_full_drawn && !window_drawn {
         app.loupe_shown = Some((id, "embedded"));
         camera_preview_badge(ui, canvas, img_rect.intersect(canvas));
@@ -2492,6 +2518,9 @@ fn navigator(app: &mut LccApp, ui: &mut egui::Ui, canvas: Rect, img: Rect, id: P
 /// How many photos ahead (in the direction of travel) the loupe makes its stand-in for, and how
 /// many behind (a step back is common when culling).
 const AHEAD: usize = 5;
+/// The thumbnails made ahead while a step key is held ([`crate::loupe_timing::LoupeTiming::holding`]):
+/// about a second of a held key.
+pub(crate) const AHEAD_WHILE_HOLDING: usize = 30;
 const BEHIND: usize = 1;
 /// The look-ahead's priority: below the loupe's own render (100), above everything else.
 const AHEAD_PRIORITY: u32 = 96;
@@ -2511,6 +2540,45 @@ pub(crate) fn ahead_and_behind(ids: &[PhotoId], i: usize, backward: bool, ahead:
     let ahead = (1..=cap(ahead)).filter_map(|k| at(dir * k));
     let behind = (1..=cap(behind)).filter_map(|k| at(-dir * k));
     ahead.chain(behind).collect()
+}
+
+/// The long edge of the loupe's first stand-in of a photo shown from its camera JPEG: the size of the
+/// small JPEG most raws keep beside the full-size one (Canon CR3 1620 px, Sony ARW 1616 px), which
+/// decodes in a few ms. The full-size JPEG of a 45 MP raw takes 0.3-1.2 s, and stepping at 0.4 s
+/// showed nothing at all for half of the photos while it decoded (2026-11-10 culling sweep).
+pub(crate) const FIRST_PICTURE_EDGE: usize = 1600;
+
+/// Told apart from the photo's full-size stand-in (whose key doesn't depend on the size).
+const FIRST_PICTURE_SALT: u64 = 0x5f1e_57ad_c0de_0001;
+
+/// The photo's quick stand-in at [`FIRST_PICTURE_EDGE`] (`None`: none of that kind), keyed apart.
+fn first_picture_job(app: &mut LccApp, id: PhotoId, crop: bool) -> Option<lcc_engine::media::QuickJob> {
+    let mut q = app.session.quick_view_job(id, FIRST_PICTURE_EDGE, crop)?;
+    q.embedded.as_ref()?;
+    q.key ^= FIRST_PICTURE_SALT;
+    Some(q)
+}
+
+/// The cheapest picture first, then the next (the user's rule, PERF-CULL-TIERS): while the loupe
+/// shows nothing of this photo as big as [`FIRST_PICTURE_EDGE`], its camera JPEG at that size; once
+/// that is up and the photo stays (not `settling`), `full` (the camera JPEG at the loupe's size, or a
+/// cached render). A photo whose stand-in at full size was made ahead takes that one at once.
+fn cheapest_first(
+    app: &mut LccApp,
+    id: PhotoId,
+    full: lcc_engine::media::QuickJob,
+    want: usize,
+    crop: bool,
+    settling: bool,
+) -> lcc_engine::media::QuickJob {
+    if want <= FIRST_PICTURE_EDGE || full.embedded.is_none() || app.renderer.made_ahead(id, full.key) {
+        return full;
+    }
+    let shown = app.renderer.textures.get(&Slot::Preview).filter(|t| t.photo == id).map_or(0, |t| t.size[0].max(t.size[1]));
+    if shown >= FIRST_PICTURE_EDGE * 9 / 10 && !settling {
+        return full;
+    }
+    first_picture_job(app, id, crop).unwrap_or(full)
 }
 
 /// Culling: make the loupe's stand-ins (the camera JPEG of a raw as shot, or a cached render) of
@@ -2533,15 +2601,29 @@ fn look_ahead(app: &mut LccApp, ids: &[PhotoId], i: usize, edge: usize, crop: bo
     }
     // their thumbnails first (a small embedded JPEG each, a few ms): something to show at once
     // even when a step outruns the full-size previews, and in full screen, where no filmstrip
-    // asks for them
-    for &nid in &targets {
+    // asks for them. A held key steps about 30 photos a second and outran the five ahead within a
+    // fifth of a second: a quarter of the steps showed nothing at all (2026-11-10 culling sweep);
+    // while it is held, the thumbnails go further ahead.
+    let thumbs_ahead = if app.loupe_timing.holding() { AHEAD_WHILE_HOLDING } else { AHEAD };
+    for nid in ahead_and_behind(ids, i, app.prep_backward, thumbs_ahead, BEHIND) {
         super::grid::request_thumb(app, nid, AHEAD_THUMB_EDGE, AHEAD_PRIORITY + 2);
     }
     // (an edited photo's stand-in made ahead is its last render, if any: never a raw decode for a
     // thumbnail ahead, which would take the cores from the render the user waits for)
+    // (a raw as shot: its camera JPEG at the first picture's size, which the step shows at once and
+    // replaces with the full-size one once the photo stays; see `cheapest_first`)
     let jobs = targets
         .into_iter()
-        .filter_map(|nid| app.session.quick_view_job(nid, edge, crop))
+        .filter_map(|nid| {
+            let q = app.session.quick_view_job(nid, edge, crop)?;
+            if edge > FIRST_PICTURE_EDGE
+                && q.embedded.is_some()
+                && let Some(first) = first_picture_job(app, nid, crop)
+            {
+                return Some(first);
+            }
+            Some(q)
+        })
         .map(|mut q| {
             if !q.latest.is_empty() {
                 q.small = None;
@@ -2551,6 +2633,12 @@ fn look_ahead(app: &mut LccApp, ids: &[PhotoId], i: usize, edge: usize, crop: bo
         .collect();
     app.renderer.look_ahead(jobs, AHEAD_PRIORITY);
 }
+
+/// The longest the loupe waits for the background preparation's preview of the photo on screen
+/// (s) before rendering it itself. Short: the preparation runs at the lowest priority, and on a busy
+/// machine (a build beside the app) its render crawled while the photo on screen waited for it
+/// (4 s at first: 0 of 15 photos sharp at 1.5 s steps, 2026-11-10).
+pub(crate) const PREP_WAIT_MAX_S: f64 = 1.0;
 
 /// Neighbour prefetch: below on-screen thumbnails, above background thumbnail refreshes.
 const PREFETCH_PRIORITY: u32 = 4;
@@ -3108,9 +3196,12 @@ pub(crate) fn view_overlay(app: &LccApp, d: &DevelopSettings, alt_held: bool) ->
             opacity: app.ui.mask_overlay_opacity.clamp(0.0, 100.0).round() as u8,
         };
     }
+    // a picked mask with settings peeks its overlay for a moment (issue #1109), so the user sees
+    // which mask is on; the Show Overlay checkbox stays as the auto rule left it (not latched on)
+    let peeking = app.ui.mask_peek_until.is_some_and(|t| std::time::Instant::now() < t);
     if shown
         && app.ui.right == RightPanel::Masking
-        && app.ui.mask_overlay
+        && (app.ui.mask_overlay || peeking)
         && let Some(m) = app.session.active_mask.and_then(|id| d.masks.iter().find(|m| m.id == id))
         && !m.components.is_empty()
         && ai_computing(app, m).is_none()
@@ -3331,6 +3422,17 @@ fn wb_loupe(app: &LccApp, ui: &egui::Ui, q: Pos2, img: Rect, canvas: Rect) {
     p.rect_stroke(sq, 0.0, Stroke::new(2.0, Color32::BLACK), egui::StrokeKind::Outside);
     p.rect_stroke(sq, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Outside);
     register(ui.ctx(), "canvas:wbLoupe", at);
+    // the colour under the pointer right under the loupe, as under the histogram, so it can be read
+    // without looking away from the photo (#1094); above the loupe when there's no room below
+    if let Some(rgb) = tex.pixels.as_deref().and_then(|px| crate::color_readout::srgb_at(px, u, v, app.renderer.display().map(|d| d.as_ref()))) {
+        let text = app.ui.settings.color_readout.format(rgb);
+        let h = 20.0;
+        let y = if at.bottom() + 2.0 + h <= canvas.bottom() { at.bottom() + 2.0 } else { at.top() - 2.0 - h };
+        let band = Rect::from_min_size(pos2(at.left() - 2.0, y), vec2(side + 4.0, h));
+        p.rect_filled(band, 3.0, Color32::from_black_alpha(200));
+        p.text(band.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), Color32::from_gray(230));
+        register(ui.ctx(), "canvas:wbLoupeReadout", band);
+    }
 }
 
 /// The photo `img` reaches past its pane `canvas`: a drag pans it.
@@ -6156,6 +6258,23 @@ pub(crate) fn film_thumb_px(cell_w: f32, ppp: f32) -> usize {
     (px.round() as usize).clamp(128, 512)
 }
 
+/// The filmstrip's scroll offset after its cells change from `old_w` to `new_w` points wide: the
+/// photo at index `at` (the active one) stays where it was on screen; with none, the first photo
+/// in view does.
+pub(crate) fn film_rescroll(old_off: f32, old_w: f32, new_w: f32, at: Option<usize>) -> f32 {
+    if !(old_off.is_finite() && old_w.is_finite() && new_w.is_finite()) || old_w <= 0.0 {
+        return 0.0;
+    }
+    let off = match at {
+        Some(i) => {
+            let centre = (i as f32 + 0.5) * old_w;
+            (i as f32 + 0.5) * new_w - (centre - old_off)
+        }
+        None => old_off * new_w / old_w,
+    };
+    off.max(0.0)
+}
+
 /// The filmstrip's top edge: dragged up or down, it resizes the strip (and its thumbnails) within
 /// [`crate::state::FILM_HEIGHT`]; a double click puts it back. The height is kept with the UI
 /// settings (widget `filmstrip:resize`; `film:` ids are the photos).
@@ -6235,11 +6354,24 @@ fn filmstrip_strip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
     );
     // a bar that can be seen and grabbed, as in the grid, its handle always there
     super::grid::visible_scroll_bar(&mut child);
-    egui::ScrollArea::horizontal()
-        .id_salt("filmstrip")
-        .auto_shrink([false, false])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .show_viewport(&mut child, |ui, vp| {
+    // a resized strip keeps the active photo where it was on screen (#1082)
+    let width_id = egui::Id::new("film-cell-width");
+    let last_w = child.data(|d| d.get_temp::<f32>(width_id));
+    child.data_mut(|d| d.insert_temp(width_id, cell_w));
+    let rescroll = match (last_w, app.film_scroll) {
+        (Some(old_w), Some(old_off)) if (old_w - cell_w).abs() > 0.01 && old_w > 0.0 => {
+            let at = active.and_then(|a| ids.iter().position(|id| *id == a));
+            Some(film_rescroll(old_off, old_w, cell_w, at))
+        }
+        _ => None,
+    };
+    let mut area = egui::ScrollArea::horizontal();
+    if let Some(off) = rescroll {
+        area = area.horizontal_scroll_offset(off);
+    }
+    area.id_salt("filmstrip").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show_viewport(
+        &mut child,
+        |ui, vp| {
             if wheel != egui::Vec2::ZERO {
                 ui.scroll_with_delta_animation(wheel, egui::style::ScrollAnimation::none());
             }
@@ -6406,7 +6538,8 @@ fn filmstrip_strip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
                 super::compare::activate_on_right_click(app, &resp, *id);
                 crate::widgets::context_menu(&resp, |ui| super::grid::context_menu(app, ui, *id));
             }
-        });
+        },
+    );
 }
 
 /// What a screen reader says for a filmstrip thumbnail: the file, and why there is no picture

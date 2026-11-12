@@ -699,15 +699,16 @@ pub fn calibration_matrix(c: &Calibration, process: lcc_develop::Process) -> Opt
         e[i] = 1.0;
         let [l, ch, h] = lab_to_lch(oklab_from_2020(e));
         let h2 = h + (hue.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_HUE;
-        let c2 = ch * (1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT);
-        let q = oklab_to_2020(lch_to_lab([l, c2, h2]));
+        let gain = 1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT;
+        let q = oklab_to_2020(lch_to_lab([l, ch * gain, h2]));
         for (r, row) in p.iter_mut().enumerate() {
             row[i] = q[r] as f64;
         }
     }
     let m = Mat3(p);
     let k = m.inverse()?.apply([1.0, 1.0, 1.0]);
-    Some(std::array::from_fn(|r| std::array::from_fn(|col| (p[r][col] * k[col]) as f32)))
+    let out: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|col| p[r][col] * k[col]));
+    Some(out.map(|row| row.map(|v| v as f32)))
 }
 
 /// Process V9 calibration, as measured on Lightroom Classic (round 17 charts): each ProPhoto primary,
@@ -1405,6 +1406,40 @@ mod tests {
             let c = Calibration { red_hue: v, red_sat: v, green_hue: v, green_sat: v, blue_hue: v, blue_sat: v, ..Default::default() };
             if let Some(m) = calibration_matrix(&c, lcc_develop::Process::V9) {
                 assert!(m.iter().flatten().all(|x| x.is_finite()), "{v}: {m:?}");
+            }
+        }
+    }
+
+    /// #1031: from V9 a primary's Saturation changes the chroma of its colours and leaves their hue,
+    /// which the Hue slider moves; grey stays grey.
+    #[test]
+    fn primary_saturation_scales_chroma_not_hue() {
+        let lch = |c: [f32; 3]| lab_to_lch(oklab_from_2020(c));
+        let turn = |a: f32, b: f32| wrap(b - a).abs();
+        for (i, px) in [[0.4f32, 0.05, 0.03], [0.05, 0.35, 0.05], [0.03, 0.05, 0.4], [0.06, 0.08, 0.4]].into_iter().enumerate() {
+            let [_, c0, h0] = lch(px);
+            let prim = if i < 2 { i } else { 2 };
+            let cal = |hue: f64, sat: f64| {
+                let mut c = Calibration::default();
+                match prim {
+                    0 => (c.red_hue, c.red_sat) = (hue, sat),
+                    1 => (c.green_hue, c.green_sat) = (hue, sat),
+                    _ => (c.blue_hue, c.blue_sat) = (hue, sat),
+                }
+                calibration_matrix(&c, lcc_develop::Process::V9).unwrap()
+            };
+            let more = cal(0.0, 100.0);
+            let less = cal(0.0, -100.0);
+            let hue = cal(100.0, 0.0);
+            let [_, c_more, h_more] = lch(calibrate(px, Some(&more), 0.0));
+            let [_, c_less, h_less] = lch(calibrate(px, Some(&less), 0.0));
+            let [_, _, h_hue] = lch(calibrate(px, Some(&hue), 0.0));
+            assert!(c_more > c0 * 1.15 && c_less < c0 * 0.85, "{px:?}: chroma {c0} -> {c_less} / {c_more}");
+            let rotated = turn(h0, h_hue);
+            assert!(turn(h0, h_more) < rotated * 0.5 && turn(h0, h_less) < rotated * 0.5, "{px:?}: hue {h0} -> {h_less} / {h_more} (Hue: {h_hue})");
+            for m in [more, less, hue] {
+                let grey = calibrate([0.3, 0.3, 0.3], Some(&m), 0.0);
+                assert!(grey.iter().all(|v| (v - 0.3).abs() < 1e-4), "{grey:?}");
             }
         }
     }

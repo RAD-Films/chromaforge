@@ -482,6 +482,7 @@ fn measured_mixer(o: u32, rgb: vec3<f32>, strength: f32) -> vec3<f32> {
 
 // `finish::local_point_colors`: each mask's Color Mixer, then its Point Color samples at the mask's opacity (at most 1).
 // A V9 mixer (record word 1 = 2, its block's offset in word 2) acts on the linear colour, a V1–V8 one (word 1 = 1) in OkLCh.
+// `i`, `n`: the pixel's index in the mask planes and their stride (`main`'s `mi`, `mn`).
 fn local_point_colors(d0: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
     var d = d0;
     var lch = vec3<f32>(0.0);
@@ -1130,6 +1131,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let i = y * w + x;
     let n = w * h;
+    // the mask planes' stride and this band's first pixel in `masks`: the whole image's planes
+    // (MASK_N = 0), or a band's rows copied out of planes too big for one buffer (`render`)
+    let mn = select(n, pu(F_MASK_N), pu(F_MASK_N) != 0u);
+    let mi = i - pu(F_MASK_I0);
     let gain = pf(F_GAIN);
     let ev = pf(F_EV);
     var c = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
@@ -1146,7 +1151,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var tint_amt = 0.0;
     let nm = pu(F_NMASK);
     for (var m = 0u; m < nm; m++) {
-        let a = masks[m * n + i];
+        let a = masks[m * mn + mi];
         if (a <= 0.0) {
             continue;
         }
@@ -1171,7 +1176,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let raw = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
         let y = lum2020(c);
         let ch0 = raw / max(lum2020(raw), 1e-6);
-        let o = nm * n + 3u * i;
+        let o = nm * mn + 3u * mi;
         let cb = vec3<f32>(masks[o], masks[o + 1u], masks[o + 2u]);
         c = max((ch0 + (cb - ch0) * mt) * y, vec3<f32>(0.0));
     }
@@ -1252,7 +1257,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // LOCAL_WB_EV)
     if (lt[6] != 0.0 || lt[7] != 0.0) {
         for (var m = 0u; m < nm; m++) {
-            let a = masks[m * n + i];
+            let a = masks[m * mn + mi];
             if (a <= 0.0) {
                 continue;
             }
@@ -1347,7 +1352,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- colour
     d = color_ops(d, lt[11], lt[12]);
     if (pu(F_LPOINTS) != 0u) {
-        d = local_point_colors(d, i, n);
+        d = local_point_colors(d, mi, mn);
     }
     if (tint_on) {
         let lab = oklab(d);
@@ -1481,7 +1486,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let so = pu(F_LCURVE_OFF);
         for (var m = 0u; m < nm; m++) {
             let slot = aux[so + m];
-            let a = masks[m * n + i];
+            let a = masks[m * mn + mi];
             if (slot < 0.0 || a <= 0.0) {
                 continue;
             }

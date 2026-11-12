@@ -537,18 +537,13 @@ fn header_rows(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, d: &DevelopSett
     // header: Edit (Reset sits in the bar under the panels, issue #116), then Lightroom Classic's Basic button row:
     // Auto, B&W | HDR (issue #124). Compact: no title (the tool row says which panel this is), the
     // buttons on one row of the panel's row height
-    if !dense {
-        egui::Frame::NONE.inner_margin(crate::widgets::row_margin(ui, egui::Margin { left: 12, right: 16, top: 14, bottom: 0 }, 3, 0)).show(
-            ui,
-            |ui| {
-                ui.label(egui::RichText::new(crate::i18n::tr("Edit")).font(t.semibold(15.0)).color(t.text));
-            },
-        );
-    }
-    egui::Frame::NONE.inner_margin(m(ui, egui::Margin { left: 12, right: 16, top: 10, bottom: 14 }, 3, 3)).show(ui, |ui| {
+    // (Classic: the title shares the buttons' row, as Camera Raw's does — issue #530)
+    egui::Frame::NONE.inner_margin(m(ui, egui::Margin { left: 12, right: 16, top: 12, bottom: 14 }, 3, 3)).show(ui, |ui| {
         ui.horizontal(|ui| {
             if dense {
                 ui.set_height(crate::widgets::DENSE_ROW_H - 2.0);
+            } else {
+                ui.label(egui::RichText::new(crate::i18n::tr("Edit")).font(t.semibold(15.0)).color(t.text));
             }
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1239,7 +1234,21 @@ pub(crate) fn histogram(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
     if clicked && !menu_clicked {
         let _ = app.run("view.clipping", json!({}));
     }
-    app.clipping_preview = preview;
+    // (only once the pointer rests on the indicator: gliding across the histogram passes over the
+    // triangles, and each preview toggled the overlay, so the photo rendered again, every tile at
+    // 100 %, twice per pass)
+    let (now, pass) = (ui.input(|i| i.time), ui.ctx().cumulative_pass_nr());
+    app.clipping_hover = if preview {
+        let since = app.clipping_hover.filter(|(_, seen)| seen.saturating_add(1) >= pass).map_or(now, |(since, _)| since);
+        Some((since, pass))
+    } else {
+        None
+    };
+    app.clipping_preview = app.clipping_hover.is_some_and(|(since, _)| clipping_preview_due(since, now));
+    if let Some((since, _)) = app.clipping_hover.filter(|_| !app.clipping_preview) {
+        let left = (since + CLIPPING_PREVIEW_REST_S - now).clamp(0.0, CLIPPING_PREVIEW_REST_S);
+        ui.ctx().request_repaint_after(std::time::Duration::try_from_secs_f64(left).unwrap_or_default());
+    }
     // the histogram's context menu: which distribution it draws and how tall its bins are, then the
     // format of the colour readout (Lightroom's "Show Lab Color Values")
     crate::widgets::context_menu(&resp, |ui| {
@@ -3265,6 +3274,17 @@ pub(crate) fn reset_tip(keymap: &crate::shortcuts::Keymap, mac: bool) -> String 
         Some(sc) => format!("{base} ({})", crate::menubar::shortcut_text(sc, mac)),
         None => base.to_string(),
     }
+}
+
+/// How long the pointer rests on a histogram clipping indicator before its overlay is previewed
+/// on the photo (see [`crate::LccApp::clipping_hover`]).
+pub(crate) const CLIPPING_PREVIEW_REST_S: f64 = 0.3;
+
+/// Whether a clipping indicator hovered since `since` has been rested on long enough at `now` (a
+/// clock that went back counts as no rest).
+pub(crate) fn clipping_preview_due(since: f64, now: f64) -> bool {
+    let rested = now - since;
+    rested.is_finite() && rested >= CLIPPING_PREVIEW_REST_S
 }
 
 #[cfg(test)]

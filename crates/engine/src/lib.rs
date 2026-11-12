@@ -48,6 +48,7 @@ pub mod display;
 pub mod dng_update;
 pub mod dng_validate;
 pub mod doc_path;
+pub mod duplicates;
 pub mod dust_map;
 pub mod email;
 pub mod enhance;
@@ -86,6 +87,7 @@ mod lightroom_archive;
 pub mod lightroom_catalog;
 pub mod lightroom_folder;
 pub mod lightroom_job;
+mod lightroom_print;
 mod lightroom_smart;
 mod lightroom_sqlite;
 pub mod link;
@@ -108,6 +110,8 @@ pub mod peer_exchange;
 pub mod peers;
 mod people_smart;
 pub mod people_store;
+pub mod phash;
+pub mod phash_store;
 pub mod placement;
 pub mod prep;
 pub mod preset_import;
@@ -166,6 +170,24 @@ pub use media::{RenderJob, SourceLevel};
 use serde_json::Value;
 pub use view::{Browse, FilterChip, LibrarySource, Selection, SelectionState, filter_chips};
 pub use {lcc_catalog as catalog, lcc_develop as develop, lcc_gpu as gpu, lcc_pipeline as pipeline};
+
+/// [`Session::before_step`]: the commit count and the length of the queue of ops not yet written to the library's log.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BeforeStep {
+    commits: u64,
+    log: usize,
+}
+
+/// One step a command has just committed ([`Session::committed_step`]), to take back if the command then fails.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommittedStep {
+    /// [`Session::commits`] with the step committed.
+    commits: u64,
+    /// The undo stack's length with the step on top.
+    undo_len: usize,
+    /// Where the step's op waits in the queue for the library's log, while it hasn't been written.
+    pending: Option<usize>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -1248,6 +1270,49 @@ impl Session {
         }
         let _ = id;
         rect
+    }
+
+    /// Where things stand before a command commits a step it may have to take back if it then fails
+    /// ([`Session::committed_step`]).
+    pub(crate) fn before_step(&self) -> BeforeStep {
+        BeforeStep { commits: self.commits, log: self.pending_log.len() }
+    }
+
+    /// The one step committed since `before`, for [`Session::take_back`]; `None` when no step, or more than one, was
+    /// committed since.
+    pub(crate) fn committed_step(&self, before: BeforeStep) -> Option<CommittedStep> {
+        (self.commits == before.commits.wrapping_add(1) && !self.undo.is_empty()).then(|| CommittedStep {
+            commits: self.commits,
+            undo_len: self.undo.len(),
+            pending: (self.pending_log.len() == before.log.saturating_add(1)).then_some(before.log),
+        })
+    }
+
+    /// Take back `step`, the step a command committed before it failed, as an undo would, with nothing left to redo.
+    /// Only that step: when anything was committed, undone or merged ([`Session::merge_undo`]) since it, the top of the
+    /// undo stack may be a step that isn't the command's, and this refuses instead. When the step isn't written to the
+    /// library's log yet, it leaves the queue, so neither it nor its reversal reaches the disk; otherwise the reversal
+    /// is logged like an undo. A step that can't be taken back stays on the undo stack, and the error says why.
+    pub(crate) fn take_back(&mut self, step: CommittedStep) -> Result<()> {
+        // A later commit changes the count; an undo, a redo or a merge changes the stack's length (at the cap a commit
+        // leaves the length as it was, but changes the count).
+        if self.commits != step.commits || self.undo.len() != step.undo_len {
+            return Err(EngineError::Other("the step to take back is no longer the last one".into()));
+        }
+        let mut e = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to take back".into()))?;
+        if let Err(err) = self.apply_with_files(&mut e, &rename::RealFs) {
+            self.undo.push(e);
+            return Err(err);
+        }
+        self.drop_gone_from_selection();
+        self.reconcile_view();
+        // Dropping the queued step, rather than logging its reversal after it, keeps a write cut short (a crash, a full
+        // disk) from saving the step without its reversal: each op is its own record in the log.
+        match step.pending.filter(|at| at.saturating_add(1) == self.pending_log.len()) {
+            Some(at) => self.pending_log.truncate(at),
+            None => self.pending_log.push(e.op),
+        }
+        Ok(())
     }
 
     /// Apply an op that is the app's own bookkeeping rather than something the user did (faces found by the background
@@ -2635,6 +2700,8 @@ mod tests_crop_aspect;
 mod tests_crop_aspects;
 #[cfg(test)]
 mod tests_crop_same;
+#[cfg(test)]
+mod tests_cull_suggest;
 #[cfg(test)]
 mod tests_denoise;
 #[cfg(test)]

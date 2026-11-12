@@ -261,6 +261,9 @@ pub enum Process {
     /// Bright colours take the tone curve per channel: a colour near white keeps its saturation at about its
     /// brightness (`finish::top_shoulder`) instead of its brightest channel going over white and the colour fading
     /// to white, as Lightroom Classic renders it (yellows and reds near white had lost two thirds of their chroma).
+    ///
+    /// Calibration's primary Saturation scales a primary's distance from white in CIE xy (Lightroom Classic's model,
+    /// above), so it no longer turns blues in hue like the Hue slider (fork issue #1031).
     V9,
 }
 
