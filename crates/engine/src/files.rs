@@ -467,18 +467,31 @@ impl CameraColourModel<'_> {
     /// colour near the clip ([`NearClip`]), whose rims the rebuild reads in their moved colour: a clipped area meets its
     /// unclipped surroundings in the colour they end up with. A pixel with only red clipped keeps its rebuilt red while
     /// green and blue move as an unclipped neighbour's do, so the band where only red clips joins the wall around it
-    /// (left alone it stayed 10–14 degrees redder at −3 EV: a hard orange line). Every other clipped pixel keeps what the
-    /// rebuild gave it: moving the blue of warm pixels with only green clipped turned them 10 degrees too red.
+    /// (left alone it stayed 10–14 degrees redder at −3 EV: a hard orange line). Under magenta light a pixel with only
+    /// blue clipped takes the magenta move ([`NearClip::magenta`]) as an unclipped neighbour does at the clip, both as far
+    /// as blue is clipped over an area around them ([`lcc_raw::highlight::BlueExtent`], the rebuild's own measure). Every
+    /// other clipped pixel keeps what the rebuild gave it: moving the blue of warm pixels with only green clipped turned
+    /// them 10 degrees too red.
     pub fn rebuild_highlights_near_clip(&self, img: &mut Rgb32f, mask: Option<&[u8]>, how: lcc_raw::highlight::Rebuild, nc: &NearClip) {
-        use lcc_raw::highlight::CLIPPED_R;
+        use lcc_raw::highlight::{BlueExtent, CLIPPED_B, CLIPPED_R};
         use rayon::prelude::*;
         let clipped = Self::clipped_channels(img, mask);
+        let area = BlueExtent::new(img.width, img.height, |i| clipped.get(i).is_some_and(|b| b & CLIPPED_B != 0));
         let colour = |p: [f32; 3]| nc.pixel(p, [false; 3]);
-        lcc_raw::highlight::reconstruct_how_rim(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, mask, Some(&colour));
-        img.data.par_iter_mut().zip(clipped.par_iter()).for_each(|(p, &bits)| match bits {
-            0 => *p = nc.pixel(*p, [false; 3]),
-            CLIPPED_R => *p = nc.pixel(*p, [true, false, false]),
-            _ => {}
+        let white = clipped_white(&self.matrix);
+        lcc_raw::highlight::reconstruct_how_rim(img, self.wb, HIGHLIGHT_CLIP, white, how, mask, Some(&colour));
+        let w = img.width.max(1);
+        img.data.par_iter_mut().zip(clipped.par_iter()).enumerate().for_each(|(i, (p, &bits))| {
+            let area = || area.as_ref().map_or(0.0, |a| a.weight(i % w, i / w));
+            match bits {
+                0 => {
+                    let q = nc.pixel(*p, [false; 3]);
+                    *p = if q[2] >= NEAR_CLIP_MAGENTA_ONSET { nc.magenta(q, white, area()) } else { q };
+                }
+                CLIPPED_R => *p = nc.pixel(*p, [true, false, false]),
+                CLIPPED_B => *p = nc.magenta(*p, white, area()),
+                _ => {}
+            }
         });
     }
 
@@ -549,6 +562,32 @@ const NEAR_CLIP_AMOUNT: f32 = 0.5;
 const NEAR_CLIP_ONSET: f32 = 0.338;
 /// …and the shape of its ramp between them.
 const NEAR_CLIP_POWER: f32 = 1.175;
+/// [`NearClip`] is for warm and red light: it phases out over this many stops of blue over green around
+/// [`NEAR_CLIP_MAGENTA_AT`], so saturated magenta light keeps its colour near the clip as Lightroom Classic does…
+const NEAR_CLIP_WARM: f32 = 0.4;
+/// …this many stops of blue over green (white-balanced). On round24's magenta chart at +3.35 EV the patches with red
+/// clipped and blue 1.7 and 2.0 stops over green, C* 156 and 160 in Lightroom, came out at 61 and 65 with the move; the
+/// red one with blue 0.6 stops over green is pale in Lightroom (C* 16), and the move gives that (dE00 0.4, 3.5 without).
+/// Phased out from blue equal to green, the move left that red patch too pink…
+const NEAR_CLIP_MAGENTA_AT: f32 = 1.3;
+/// …but only as far as the colour is saturated (1 − smallest / largest white-balanced channel, from `.0` to `.1`):
+/// near-white purple highlights keep the move, which brought them nearer Lightroom (frame 6698 at −3 EV: without it,
+/// band L* 75–85 7.07 → 7.48 dE).
+const NEAR_CLIP_MAGENTA_SAT: (f32, f32) = (0.3, 0.6);
+/// [`NearClip::magenta`]: the share of the way to the clipped neutral (at its own level) a pixel under magenta light
+/// moves once its blue reaches the clip. On round24's magenta chart at +3.35 EV Lightroom Classic renders the patches
+/// with only blue clipped pale (L* 77–93, C* 24–57) where green lies within 1.05 stops of its clip, deep violet further
+/// under; with their own colour kept (`lcc_raw::highlight`) this share gives both through the finish (dE00 2.5–5.0 on
+/// the four pale ones, frame 4941's at +1.33 EV among them, and 1.1 on the nearest violet; 0.1 left the pale ones
+/// violet, 0.2 turned the violets pale). Without it the clip at ProPhoto's edge left the pale ones deep violet (dE00
+/// 34–36)…
+const NEAR_CLIP_MAGENTA_FADE: f32 = 0.15;
+/// …phased in from this raw level of blue (share of the white level) to the clip, so that nothing steps where blue
+/// clips (violet patches with blue at 0.91–0.95 of the clip keep Lightroom's chroma), and out again as red rises from
+/// it to its own clip: magenta with red clipped keeps its full chroma in Lightroom (C* 160)…
+const NEAR_CLIP_MAGENTA_ONSET: f32 = 0.9;
+/// …as far as green lies this many stops under the lower of red and blue (white-balanced): magenta light.
+const NEAR_CLIP_MAGENTA_SIDE: f32 = 0.3;
 
 /// Lightroom Classic's colour near the sensor's clip (process V9), on warm light (red the brightest white-balanced
 /// channel): as a raw channel nears the clip, LrC moves the colour toward its brightest channel, by the raw level and
@@ -596,9 +635,22 @@ impl NearClip {
         if c[0] < c[1] || c[0] < c[2] {
             return p;
         }
+        // warm or red, not saturated magenta: blue under [`NEAR_CLIP_MAGENTA_AT`] stops over green, phased over
+        // [`NEAR_CLIP_WARM`] stops, as far as the colour is saturated ([`NEAR_CLIP_MAGENTA_SAT`])
+        let smooth = |x: f32| {
+            let x = x.clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let hue = smooth(((c[1].max(1e-9) / c[2].max(1e-9)).log2() + NEAR_CLIP_MAGENTA_AT) / NEAR_CLIP_WARM + 0.5);
+        let (lo, sat_at) = (c[1].min(c[2]), NEAR_CLIP_MAGENTA_SAT);
+        let sat = smooth((1.0 - lo / c[0].max(1e-9) - sat_at.0) / (sat_at.1 - sat_at.0));
+        let warm = 1.0 - (1.0 - hue) * sat;
+        if warm <= 0.0 {
+            return p;
+        }
         let w: [f32; 3] = std::array::from_fn(|i| {
             let t = ((p[i].min(p[0]) - onset) / (1.0 - onset)).clamp(0.0, 1.0);
-            if i == 0 || keep[i] || t <= 0.0 { 0.0 } else { amount * t.powf(power) }
+            if i == 0 || keep[i] || t <= 0.0 { 0.0 } else { warm * amount * t.powf(power) }
         });
         if w[1] <= 0.0 && w[2] <= 0.0 {
             return p;
@@ -608,6 +660,38 @@ impl NearClip {
         let top = q[0].max(q[1]).max(q[2]);
         let moved = mul(&self.from_pp, std::array::from_fn(|i| q[i] + w[i] * (top - q[i])));
         let out: [f32; 3] = std::array::from_fn(|i| if keep[i] { p[i] } else { moved[i] / wb[i] });
+        if out.iter().all(|v| v.is_finite()) { out } else { p }
+    }
+
+    /// One pixel of camera RGB (1 = the white level), after the rebuild, under magenta light as its blue nears or passes
+    /// the clip ([`NEAR_CLIP_MAGENTA_FADE`]): it moves toward the clipped neutral `white` (white-balanced camera RGB) at
+    /// its own level, as far as `area` says blue is clipped over an area around it, not on a thin feature
+    /// ([`lcc_raw::highlight::BlueExtent::weight`]; Lightroom Classic keeps a thin line of clipped blue in its light's
+    /// colour). For unclipped pixels and those with only blue clipped. A pixel whose blue lies under the onset, whose red
+    /// reached its clip, away from clipped areas, that isn't magenta light or isn't a valid colour comes back bit for bit.
+    pub fn magenta(&self, p: [f32; 3], white: [f32; 3], area: f32) -> [f32; 3] {
+        let (fade, onset) = (NEAR_CLIP_MAGENTA_FADE, NEAR_CLIP_MAGENTA_ONSET);
+        if !p.iter().chain(white.iter()).all(|v| v.is_finite() && *v >= 0.0) || !area.is_finite() {
+            return p;
+        }
+        let smooth = |x: f32| {
+            let x = x.clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let near = |v: f32| smooth((v - onset) / (1.0 - onset));
+        let t = fade * near(p[2]) * (1.0 - near(p[0])) * area.clamp(0.0, 1.0);
+        if t <= 0.0 {
+            return p;
+        }
+        let wb = self.wb;
+        let c = [p[0] * wb[0], p[1] * wb[1], p[2] * wb[2]];
+        let t = t * smooth((c[0].min(c[2]).max(1e-9) / c[1].max(1e-9)).log2() / NEAR_CLIP_MAGENTA_SIDE);
+        let total = white[0] + white[1] + white[2];
+        if t <= 0.0 || total <= 0.0 {
+            return p;
+        }
+        let level = (c[0] + c[1] + c[2]) / total;
+        let out: [f32; 3] = std::array::from_fn(|i| (c[i] + (white[i] * level - c[i]) * t) / wb[i]);
         if out.iter().all(|v| v.is_finite()) { out } else { p }
     }
 }
@@ -651,8 +735,8 @@ mod near_clip_tests {
         assert!(same_bits(near().pixel(far, [false; 3]), far));
     }
 
-    /// Every pixel whose raw channels all lie under the onset, every pixel that isn't warm light (a pale sky, foliage)
-    /// and every broken one comes back bit for bit: the move only ever touches warm light near the clip.
+    /// Every pixel whose raw channels all lie under the onset, every pixel that isn't warm light (a pale sky, foliage,
+    /// magenta light) and every broken one comes back bit for bit: the move only ever touches warm light near the clip.
     #[test]
     fn under_the_onset_off_warm_light_and_broken_pixels_are_bit_identical() {
         let nc = near();
@@ -667,7 +751,17 @@ mod near_clip_tests {
             let p = [next() * 0.337, next() * 0.337, next() * 0.337];
             assert!(same_bits(nc.pixel(p, [false; 3]), p), "{p:?}");
         }
-        for p in [[0.4, 0.97, 0.6], [0.3, 0.6, 0.9], [0.3, 0.9, 0.4], [f32::INFINITY, 0.9, 0.2], [0.9, -0.1, 0.2], [f32::NAN, 0.9, 0.2]] {
+        // a pale sky, foliage, a blue light, magenta light near the clip (red brightest, blue 2.3 stops over green),
+        // broken values
+        for p in [
+            [0.4, 0.97, 0.6],
+            [0.3, 0.6, 0.9],
+            [0.3, 0.9, 0.4],
+            [0.95, 0.35, 0.97],
+            [f32::INFINITY, 0.9, 0.2],
+            [0.9, -0.1, 0.2],
+            [f32::NAN, 0.9, 0.2],
+        ] {
             assert!(same_bits(nc.pixel(p, [false; 3]), p), "{p:?}");
         }
     }
@@ -718,6 +812,113 @@ mod near_clip_tests {
         assert_eq!(ours.get(40, 32), rebuilt.get(40, 32), "red and green clipped: the rebuild's");
         assert_eq!(ours.get(56, 32), rebuilt.get(56, 32), "only green clipped: the rebuild's");
         assert!(ours.get(8, 32)[1] > raw.get(8, 32)[1], "the unclipped wall moves");
+    }
+
+    /// The share of the way to the clipped neutral `before` moved to reach `after` (white-balanced, at its own level).
+    fn faded(before: [f32; 3], after: [f32; 3], white: [f32; 3]) -> f32 {
+        let (a, b) = ([0, 1, 2].map(|i| before[i] * WB[i]), [0, 1, 2].map(|i| after[i] * WB[i]));
+        let level = a.iter().sum::<f32>() / white.iter().sum::<f32>();
+        (b[1] - a[1]) / (white[1] * level - a[1])
+    }
+
+    /// Under magenta light (green the lowest white-balanced channel) a pixel whose blue reached the clip in a clipped area
+    /// moves [`NEAR_CLIP_MAGENTA_FADE`] of the way to the clipped neutral at its own level, every channel alike, and that
+    /// share times `area` elsewhere; nothing steps where blue clips, as the move phases in under it; the same light two
+    /// stops darker, a pixel whose red reached its own clip, one that isn't magenta light (a blue light) and one away
+    /// from any clipped area are left alone.
+    #[test]
+    fn under_magenta_light_blue_at_its_clip_moves_toward_the_neutral() {
+        let (nc, white) = (near(), clipped_white(&lcc_color::Mat3::IDENTITY));
+        let lilac = [0.44, 0.49, 1.0];
+        let out = nc.magenta(lilac, white, 1.0);
+        let (a, b) = ([0, 1, 2].map(|i| lilac[i] * WB[i]), [0, 1, 2].map(|i| out[i] * WB[i]));
+        let level = a.iter().sum::<f32>() / white.iter().sum::<f32>();
+        for i in 0..3 {
+            let want = a[i] + (white[i] * level - a[i]) * NEAR_CLIP_MAGENTA_FADE;
+            assert!((b[i] - want).abs() < 1e-4, "{lilac:?} -> {out:?}: channel {i} {} against {want}", b[i]);
+        }
+        let half = faded(lilac, nc.magenta(lilac, white, 0.5), white);
+        assert!((half - 0.5 * NEAR_CLIP_MAGENTA_FADE).abs() < 1e-3, "half an area moves {half}");
+        let under = [0.44, 0.49, 0.985];
+        let step = faded(lilac, out, white) - faded(under, nc.magenta(under, white, 1.0), white);
+        assert!(step.abs() < 0.1 * NEAR_CLIP_MAGENTA_FADE, "the move steps by {step} where blue clips");
+        for (p, area) in [(lilac.map(|v| v / 4.0), 1.0), ([1.0, 0.45, 1.0], 1.0), ([0.2, 0.5, 1.0], 1.0), (lilac, 0.0)] {
+            assert!(same_bits(nc.magenta(p, white, area), p), "{p:?} in an area of {area}");
+        }
+    }
+
+    /// Every pixel whose blue lies under [`NEAR_CLIP_MAGENTA_ONSET`], every pixel that isn't magenta light (warm light,
+    /// a pale sky, foliage, a blue light) and every broken one comes back from [`NearClip::magenta`] bit for bit.
+    #[test]
+    fn under_blues_onset_off_magenta_light_and_broken_pixels_are_bit_identical() {
+        let (nc, white) = (near(), clipped_white(&lcc_color::Mat3::IDENTITY));
+        let mut seed = 0x6c07_8965_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10_000) as f32 / 10_000.0
+        };
+        for _ in 0..10_000 {
+            let p = [next() * 1.2, next() * 1.2, next() * NEAR_CLIP_MAGENTA_ONSET];
+            assert!(same_bits(nc.magenta(p, white, 1.0), p), "{p:?}");
+        }
+        for p in
+            [[0.98, 0.9, 0.5], [0.4, 0.97, 1.0], [0.3, 0.9, 0.95], [0.2, 0.5, 1.0], [f32::INFINITY, 0.4, 1.0], [0.5, -0.1, 1.0], [0.5, f32::NAN, 1.0]]
+        {
+            assert!(same_bits(nc.magenta(p, white, 1.0), p), "{p:?}");
+        }
+        assert!(same_bits(nc.magenta([0.44, 0.49, 1.0], white, f32::NAN), [0.44, 0.49, 1.0]), "a broken area weight");
+    }
+
+    /// The warm move is for warm and red light: a red patch with red clipped and blue 0.6 stops over green (white-balanced)
+    /// takes it, as Lightroom Classic renders such a patch pale (round24's magenta chart at +3.35 EV), while magenta with
+    /// blue 2 stops over green, which Lightroom keeps at full chroma, comes back bit for bit ([`NEAR_CLIP_MAGENTA_AT`]).
+    #[test]
+    fn red_light_near_the_clip_takes_the_warm_move_and_magenta_keeps_its_colour() {
+        let nc = near();
+        let red = [1.05, 0.42, 0.36];
+        let moved = nc.pixel(red, [true, false, false]);
+        assert_eq!(moved[0], red[0], "the clipped red stays");
+        assert!(moved[1] > red[1] + 0.005, "green comes up: {moved:?}");
+        let magenta = [1.05, 0.44, 0.97];
+        assert!(same_bits(nc.pixel(magenta, [true, false, false]), magenta));
+    }
+
+    /// Through the whole step: a lilac area with only blue clipped takes the magenta move on top of the rebuild, and the
+    /// unclipped lilac beside it part of it, fading out away from the area without a jump; a thin line of the same
+    /// clipped lilac keeps its own colour without the move, as Lightroom Classic keeps such lines in their light's
+    /// colour; a magenta area with red clipped keeps the rebuild's colour (Lightroom keeps those at full chroma).
+    #[test]
+    fn only_blue_clipped_magenta_takes_the_magenta_move_after_the_rebuild() {
+        let nc = near();
+        let white = clipped_white(&lcc_color::Mat3::IDENTITY);
+        // blue clipped area (x 8-55), a blue clipped line (x 80-81), red clipped area (x 104-119); the rest just under
+        let raw = Rgb32f::from_fn(128, 64, |x, y| {
+            let rows = (8..56).contains(&y);
+            match x {
+                8..56 if rows => [0.44, 0.49, 1.0],
+                80..82 if rows => [0.44, 0.49, 1.0],
+                104..120 if rows => [1.0, 0.44, 0.9],
+                96.. => [0.97, 0.43, 0.88],
+                _ => [0.42, 0.47, 0.97],
+            }
+        });
+        let how = lcc_raw::highlight::Rebuild { headroom: 0.0, rim_hue: true };
+        let mut ours = raw.clone();
+        model().rebuild_highlights_near_clip(&mut ours, None, how, &nc);
+        let mut rebuilt = raw.clone();
+        let colour = |p: [f32; 3]| nc.pixel(p, [false; 3]);
+        lcc_raw::highlight::reconstruct_how_rim(&mut rebuilt, WB, HIGHLIGHT_CLIP, white, how, None, Some(&colour));
+        let moved = |x: usize| faded(rebuilt.get(x, 32), ours.get(x, 32), white);
+        assert!((moved(32) - NEAR_CLIP_MAGENTA_FADE).abs() < 0.01, "inside the blue-clipped area: {}", moved(32));
+        assert!(moved(56) > 0.0 && moved(56) < moved(32), "beside it: {}", moved(56));
+        for x in 40..76 {
+            assert!((moved(x + 1) - moved(x)).abs() < 0.3 * NEAR_CLIP_MAGENTA_FADE, "a jump at x {x}: {} -> {}", moved(x), moved(x + 1));
+        }
+        assert_eq!(moved(70), 0.0, "away from the area");
+        assert_eq!(ours.get(80, 32), raw.get(80, 32), "the thin line keeps its own colour");
+        assert_eq!(ours.get(112, 32), nc.pixel(rebuilt.get(112, 32), [true, false, false]), "red clipped: the rebuild's");
     }
 
     /// Pixels whose raw channels all lie under the onset come out of the whole step (rebuild included) bit for bit as

@@ -1218,11 +1218,20 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
         let mut p = vec![m.is_some() as u32];
         p.extend(m.unwrap_or_default().iter().flatten().map(|v| v.to_bits()));
         let out = cx.gpu.buffer(n * 3);
+        // `wb_floor`: the clip at 0, after the matrix (P[11]) or after the tables (P[42])
+        let floor = local::prophoto_floor(info, s);
+        let floor_words = || {
+            let mut f = vec![floor.is_some() as u32];
+            f.extend(floor.unwrap_or_default().iter().flatten().flatten().map(|v| v.to_bits()));
+            f
+        };
         if let Some(Some((words, entries))) = &tables {
             p.extend_from_slice(words);
+            p.extend(floor_words());
             let entries = cx.gpu.upload(entries);
             map(cx, "wb_tables_k", n, &p, [Some(sampled), Some(&entries), None], &out);
         } else {
+            p.extend(floor_words());
             map(cx, "wb_k", n, &p, [Some(sampled), None, None], &out);
         }
         // `lin_cpu`'s order: white balance, defringe, spots, red eye

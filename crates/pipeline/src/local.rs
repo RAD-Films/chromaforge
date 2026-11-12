@@ -34,7 +34,7 @@ pub(crate) fn white_balance_key(info: &SourceInfo, s: &DevelopSettings) -> impl 
         .as_ref()
         .filter(|c| c.deferred_tables_gain.is_some())
         .map(|c| (Arc::as_ptr(c) as usize, c.deferred_tables_gain.map(f32::to_bits), [c.developed_for.x.to_bits(), c.developed_for.y.to_bits()]));
-    (m, tables)
+    (m, tables, prophoto_floor(info, s).is_some())
 }
 
 /// The white-balance matrix (linear Rec.2020) for the settings, or `None` when the as-shot white
@@ -42,6 +42,12 @@ pub(crate) fn white_balance_key(info: &SourceInfo, s: &DevelopSettings) -> impl 
 /// the new white in camera space, as Lightroom does (so a neutral under the chosen white renders
 /// neutral and saturated colours move as the camera's matrices say); other sources are adapted
 /// with Bradford, luminance-preserving.
+/// The matrices into and out of linear ProPhoto when the white-balance stage clips the scene colour at ProPhoto's edge
+/// instead of Rec.2020's (`finish::prophoto_floor`); `None` clips each Rec.2020 channel at 0. The GPU follows it.
+pub fn prophoto_floor(info: &SourceInfo, s: &DevelopSettings) -> Option<[[[f32; 3]; 3]; 2]> {
+    crate::finish::prophoto_floor(s, info)
+}
+
 pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]; 3]> {
     let (t, tint) = effective_wb(info, s);
     if (t - info.as_shot_temp).abs() < 1e-6 && (tint - info.as_shot_tint).abs() < 1e-6 {
@@ -83,6 +89,7 @@ pub fn deferred_tables(info: &SourceInfo, s: &DevelopSettings) -> Option<(lcc_ra
 fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) {
     let m = wb_matrix_for(info, s);
     let tables = deferred_tables(info, s);
+    let floor = crate::finish::prophoto_floor(s, info);
     let w = img.width;
     for_rows(&mut img.data, w, |_, row| {
         for p in row.iter_mut() {
@@ -97,7 +104,15 @@ fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) 
             if let Some((tables, baseline)) = &tables {
                 c = tables.apply(c.map(|v| v / baseline), *baseline).map(|v| if v.is_finite() { v } else { 0.0 });
             }
-            *p = [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)];
+            *p = match &floor {
+                // toned per ProPhoto channel: clipped at ProPhoto's edge, not Rec.2020's (see `finish::prophoto_floor`)
+                Some([to, from]) => {
+                    let m3 = |m: &[[f32; 3]; 3], d: [f32; 3]| std::array::from_fn(|r| m[r][0] * d[0] + m[r][1] * d[1] + m[r][2] * d[2]);
+                    let q: [f32; 3] = m3(to, c.map(|v| v * gain));
+                    m3(from, q.map(|v| v.max(0.0))).map(|v: f32| if v.is_finite() { v } else { 0.0 })
+                }
+                None => [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)],
+            };
         }
     });
 }
@@ -1593,5 +1608,40 @@ mod nrc_tests {
         }
         println!("worst mean deviation {:.4} %", 100.0 * worst);
         assert!(worst < 0.0005, "the joint colour NR moved a channel's mean by {:.3} %", 100.0 * worst);
+    }
+
+    /// Toned per ProPhoto channel (V9, a raw with the base curve), a magenta beyond ProPhoto's green edge keeps a green
+    /// of exactly 0 there (as Lightroom Classic renders it), where the clip per Rec.2020 channel left it positive. A
+    /// render without the per-channel tone keeps the clip in Rec.2020.
+    #[test]
+    fn wb_clips_at_prophoto_edge_when_toned_per_channel() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let curve = crate::tone::CameraTone::new(knots).unwrap().under_default_curve();
+        let v9 = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+        let s = DevelopSettings::default();
+        let [to, from] = prophoto_floor(&v9, &s).expect("toned per channel");
+        let m3 = |m: &[[f32; 3]; 3], d: [f32; 3]| -> [f32; 3] { std::array::from_fn(|r| m[r][0] * d[0] + m[r][1] * d[1] + m[r][2] * d[2]) };
+        // magenta with a ProPhoto green of −0.1 of its brightest channel
+        let px = m3(&from, [0.5, -0.06, 0.6]);
+        let one = |info: &SourceInfo| {
+            let mut img = Rgb32f::filled(1, 1, px);
+            wb_gain(&mut img, info, &s, 1.0);
+            img.get(0, 0)
+        };
+        let pp = m3(&to, one(&v9));
+        assert!(pp[1].abs() < 1e-5 && (pp[0] - 0.5).abs() < 1e-4 && (pp[2] - 0.6).abs() < 1e-4, "{pp:?}");
+        // without the per-channel tone (no camera tone): each Rec.2020 channel clipped, ProPhoto green above 0
+        let plain = SourceInfo { raw: true, relative_wb: true, ..Default::default() };
+        assert!(prophoto_floor(&plain, &s).is_none());
+        let c = one(&plain);
+        assert!(c.iter().all(|v| *v >= 0.0) && m3(&to, c)[1] > 0.005, "{:?}", m3(&to, c));
+        // a colour inside ProPhoto is unchanged
+        let inside = m3(&from, [0.5, 0.2, 0.6]);
+        let mut img = Rgb32f::filled(1, 1, inside);
+        wb_gain(&mut img, &v9, &s, 1.0);
+        assert!(img.get(0, 0).iter().zip(inside).all(|(a, b)| (a - b).abs() < 1e-5));
     }
 }

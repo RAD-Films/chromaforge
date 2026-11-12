@@ -1695,6 +1695,8 @@ fn tone_keeping_hue(p: vec3<f32>) -> vec3<f32> {
 const NEAR_WHITE_A: f32 = 0.035;
 const NEAR_WHITE_K: vec2<f32> = vec2<f32>(0.8, 1.0);
 const NEAR_WHITE_Y: vec2<f32> = vec2<f32>(0.28, 0.4);
+// `finish::NEAR_WHITE_MAGENTA` (blue over green in stops: from none to all of the pull spared)
+const NEAR_WHITE_MAGENTA: vec2<f32> = vec2<f32>(1.6, 1.9);
 // `finish::PROPHOTO_Y`
 const PROPHOTO_Y: vec3<f32> = vec3<f32>(0.2880402, 0.7118741, 0.0000857);
 
@@ -1705,8 +1707,9 @@ fn near_white(p: vec3<f32>, peak: f32) -> vec3<f32> {
     if (!finite || !(peak > 0.0) || !(hi > 0.0)) {
         return p;
     }
+    let magenta = sstep(NEAR_WHITE_MAGENTA.x, NEAR_WHITE_MAGENTA.y, log2(max(p.z, 1e-9) / max(p.y, 1e-9)));
     let t = NEAR_WHITE_A * sstep(NEAR_WHITE_K.x * peak, NEAR_WHITE_K.y * peak, hi)
-        * sstep(NEAR_WHITE_Y.x, NEAR_WHITE_Y.y, dot(PROPHOTO_Y, p) / hi);
+        * sstep(NEAR_WHITE_Y.x, NEAR_WHITE_Y.y, dot(PROPHOTO_Y, p) / hi) * (1.0 - magenta);
     if (!(t > 0.0)) {
         return p;
     }

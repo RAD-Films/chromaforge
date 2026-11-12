@@ -93,8 +93,8 @@ fn v9_lrc_base_tone_per_channel() {
 }
 
 /// Process V9's per-channel tone pulls a colour toward its own brightest channel near white (`finish::near_white`),
-/// warm hues only (magenta and blue-led ones are gated out): a sweep of every hue at every brightness up to past
-/// white, so the pull, its start, its fade and the gate all show in the comparison.
+/// warm hues only (magenta and blue-led ones, and those with blue well over green, are gated out): a sweep of every
+/// hue at every brightness up to past white, so the pull, its start, its fade and both gates all show in the comparison.
 #[test]
 fn v9_near_white_pull() {
     if !gpu() {
@@ -2382,6 +2382,41 @@ fn deferred_tables_source(gain: f32) -> SourceInfo {
     let (temp, tint) = (5500.0, 0.0);
     let cc = lcc_pipeline::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint), deferred_tables_gain: Some(gain) };
     SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, camera_color: Some(Arc::new(cc)), ..Default::default() }
+}
+
+/// Process V9 toned per ProPhoto channel: the white-balance stage clips the scene colour at ProPhoto's edge, not
+/// Rec.2020's (`local::prophoto_floor`), so a magenta light beyond ProPhoto keeps a green of exactly 0. Saturated
+/// magentas and purples with a negative Rec.2020 green, through `wb_k` and (with a profile's tables) `wb_tables_k`.
+#[test]
+fn v9_prophoto_floor_matches() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (320, 160);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let t = x as f32 / w as f32;
+        let v = 0.03 + 1.4 * y as f32 / h as f32;
+        // red-led magenta to blue-led purple, green from −0.25 of the brightest channel to +0.1
+        let g = -0.25 + 0.35 * ((y / 8) % 5) as f32 / 4.0;
+        [v * (1.0 - 0.6 * t), v * g, v * (0.4 + 0.6 * t)]
+    }));
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap()
+    .under_default_curve();
+    let req = RenderRequest::fit(w, h);
+    let plain = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+    let tables = SourceInfo { camera_tone: Some(curve), ..deferred_tables_source(1.0) };
+    for (name, info) in [("matrix", &plain), ("tables", &tables)] {
+        let mut s = DevelopSettings::for_raw(5500.0, 0.0);
+        assert!(lcc_pipeline::local::prophoto_floor(info, &s).is_some(), "{name}: toned per channel");
+        check(&format!("V9 ProPhoto floor, {name}"), &src, info, &s, &req);
+        s.light.exposure = 1.0;
+        (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 4200.0, 15.0);
+        check(&format!("V9 ProPhoto floor, {name}, +1 EV at 4200 K"), &src, info, &s, &req);
+    }
 }
 
 #[test]

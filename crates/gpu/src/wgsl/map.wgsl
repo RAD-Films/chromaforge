@@ -121,7 +121,17 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
-// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0.
+// `local::wb_gain`'s clip at 0: per Rec.2020 channel, or (P[o] != 0, `local::prophoto_floor`) per linear ProPhoto
+// channel, P[o+1..o+10] into ProPhoto and P[o+10..o+19] back.
+fn wb_floor(c: vec3<f32>, o: u32) -> vec3<f32> {
+    if (pu(o) == 0u) {
+        return max(c, vec3<f32>(0.0));
+    }
+    let r = tab_mat(o + 10u, max(tab_mat(o + 1u, c), vec3<f32>(0.0)));
+    return vec3<f32>(tab_finite(r.x), tab_finite(r.y), tab_finite(r.z));
+}
+
+// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clipped at 0 (`wb_floor` at P[11]).
 @compute @workgroup_size(256)
 fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -136,7 +146,7 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
             pf(8u) * c.x + pf(9u) * c.y + pf(10u) * c.z,
         );
     }
-    put_rgb(i, max(c * 1.0, vec3<f32>(0.0)));
+    put_rgb(i, wb_floor(c, 11u));
 }
 
 // White balance, then (process V9) a camera profile's tables: `wb_k`, then `lcc_raw::profile::ProfileTables::apply`
@@ -303,7 +313,7 @@ fn wb_tables_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgro
     p = tab_apply(36u, p);
     c = tab_mat(20u, p);
     c = vec3<f32>(tab_finite(c.x), tab_finite(c.y), tab_finite(c.z));
-    put_rgb(i, max(c, vec3<f32>(0.0)));
+    put_rgb(i, wb_floor(c, 42u));
 }
 
 // Luminance NR: scale by 2^((f − l)·k) (a: image, b: log luminance l, c: filtered f). P[1] = k.
