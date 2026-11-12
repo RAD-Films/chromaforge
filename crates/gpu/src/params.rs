@@ -72,6 +72,8 @@ const FIELDS: &[(&str, usize)] = &[
     // across a step in the surroundings: the span planes (0 = none) and the grading by own tone
     ("EDGE_SPAN_OFF", 1),
     ("EDGE_STEP_GAP", 1),
+    // a grid cell reads the cells beside it at this share per row and column
+    ("EDGE_CELL_SIDE", 1),
     ("EDGE_STEP_RAMP", 1),
     ("EDGE_STEP_TOP", 1),
     ("CLAR", 1),
@@ -601,6 +603,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.f("EDGE_READ_FLOOR", lcc_pipeline::hl_edge::READ_FLOOR);
         p.u("EDGE_SPAN_OFF", span_off as u32);
         p.f("EDGE_STEP_GAP", lcc_pipeline::hl_edge::STEP_GAP);
+        p.f("EDGE_CELL_SIDE", lcc_pipeline::hl_edge::CELL_SIDE);
         p.f("EDGE_STEP_RAMP", lcc_pipeline::hl_edge::STEP_RAMP);
         p.f("EDGE_STEP_TOP", lcc_pipeline::hl_edge::STEP_TOP);
     }

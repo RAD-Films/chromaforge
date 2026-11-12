@@ -70,6 +70,10 @@ pub const READ_FLOOR: f32 = 3.354_626e-4;
 /// sky beside one darker than the beam). Smaller steps (a lamp's ring, a specular streak on metal) keep the read by
 /// tone, which follows the reference closer there…
 pub const STEP_GAP: f32 = 4.0;
+/// A grid cell reads the cells beside it at this share per row and column (the rest its own): enough that a cell next
+/// to a matching tone reads it, so the reads change smoothly between cells, and little enough that the surroundings
+/// reach no further than the bilinear read did.
+pub const CELL_SIDE: f32 = 0.125;
 /// …where a pixel's own tone counts as itself up to this many EV below the brightest surroundings…
 pub const STEP_RAMP: f32 = 2.9;
 /// …and as the brightest surroundings from this many EV below them (sky a little darker than its surroundings keeps
@@ -104,61 +108,92 @@ impl EdgePull {
     }
 
     /// The Highlights pull (EV, ≤ 0) at rendered pixel `(x, y)`, whose tone a mask moved by `shift` EV and whose own
-    /// base tone (EV over grey, exposure and `shift` included) is `own`. The four nearest grid cells count by how near
-    /// they are and by how close their surroundings' tone is to `own` ([`READ_TONE`]), so a pixel beside a much
-    /// brighter area (a clipped one) takes the pull of its own side; when none is close, by nearness ([`READ_FLOOR`]).
+    /// base tone (EV over grey, exposure and `shift` included) is `own`.
     ///
-    /// Across a step in the surroundings ([`STEP_GAP`]) the weights are not scaled up to a whole: what the cells near
-    /// the pixel's tone leave goes to the pixel's own tone, raised towards the brightest surroundings as it nears them
-    /// ([`STEP_RAMP`], [`STEP_TOP`]). An edge pixel between a beam and the sky then takes a pull graded by its tone,
-    /// and a cell joining the four can't take over at once (whole grid cells of one side's pull: squares and blocks).
+    /// Each of the four nearest grid cells reads its own neighbourhood (the 3×3 cells around it) by how close their
+    /// surroundings' tone is to `own` ([`EdgePull::cell_read`]), and the four reads blend bilinearly. A cell's read
+    /// doesn't depend on where the pixel lies, so the pull changes smoothly from pixel to pixel: weighing the four
+    /// cells by tone at the pixel instead let a cell whose tone matched take over as soon as it joined the four, and
+    /// a clipped lamp showed flat grey rectangles one cell across, a sky light patches one per cell.
     pub fn at(&self, x: usize, y: usize, shift: f32, own: f32) -> f32 {
         let Some(cells) = self.cells(x, y) else { return 0.0 };
-        let wide_at = |i: usize| self.wide.data.get(i).copied().unwrap_or(0.0);
-        let plane_at = |i: usize| self.plane.data.get(i).copied().unwrap_or(0.0);
         let guided = !self.wide.data.is_empty() && own.is_finite();
-        // how close each cell's surroundings' tone is to the pixel's
-        let near = cells.map(|(i, _)| {
-            let z = if guided { ((wide_at(i) + shift - own) / READ_TONE).abs().min(8.0) } else { 0.0 };
-            (-0.5 * z * z).exp()
-        });
-        let tone = cells.iter().zip(&near).map(|(&(_, b), &g)| {
-            let v = b * (g + READ_FLOOR);
-            if v.is_finite() { v } else { 0.0 }
-        });
-        let tone: Vec<f32> = tone.collect();
-        let sum: f32 = tone.iter().sum();
-        let w: Vec<f32> = if sum > 1e-30 { tone.iter().map(|v| v / sum).collect() } else { cells.iter().map(|c| c.1).collect() };
-        let read = |f: &dyn Fn(usize) -> f32| cells.iter().zip(&w).map(|(&(i, _), &k)| k * f(i)).sum::<f32>();
-        let (mut surround, mut edge) = (read(&|i| wide_at(i) + shift), read(&plane_at));
-        let (lo_p, hi_p) = (&self.span.0, &self.span.1);
-        if guided && lo_p.data.len() == self.wide.data.len() && hi_p.data.len() == self.wide.data.len() {
-            let bil = |f: &dyn Fn(usize) -> f32| cells.iter().map(|&(i, b)| b * f(i)).sum::<f32>();
-            let hi = bil(&|i| hi_p.data.get(i).copied().unwrap_or(0.0)) + shift;
-            // each cell's step, read bilinearly: the rule fades in over a whole cell, not along a line where the gap
-            // passes the threshold
-            let mix = bil(&|i| {
-                let gap = hi_p.data.get(i).copied().unwrap_or(0.0) - lo_p.data.get(i).copied().unwrap_or(0.0);
-                smooth(STEP_GAP - 0.5, STEP_GAP + 0.5, gap)
-            });
-            if mix > 0.0 {
-                let held = cells.iter().zip(&near).map(|(&(_, b), &g)| b * g);
-                let held: Vec<f32> = held.collect();
-                let rest = (1.0 - held.iter().sum::<f32>()).clamp(0.0, 1.0);
-                let own_side = own + (hi - own) * smooth(hi - STEP_RAMP, hi - STEP_TOP, own);
-                let by = |f: &dyn Fn(usize) -> f32| cells.iter().zip(&held).map(|(&(i, _), &k)| k * f(i)).sum::<f32>();
-                let s = by(&|i| wide_at(i) + shift) + rest * own_side;
-                let e = by(&plane_at) + rest * bil(&plane_at);
-                if s.is_finite() && e.is_finite() {
-                    surround += (s - surround) * mix;
-                    edge += (e - edge) * mix;
-                }
-            }
+        let (mut surround, mut edge) = (0.0f32, 0.0f32);
+        for &(i, b) in &cells {
+            let (s, e) = if guided {
+                self.cell_read(i, shift, own)
+            } else {
+                (self.wide.data.get(i).copied().unwrap_or(0.0) + shift, self.plane.data.get(i).copied().unwrap_or(0.0))
+            };
+            surround += b * s;
+            edge += b * e;
         }
         let edge = if self.plane.data.is_empty() { 0.0 } else { self.gain * edge };
         let wide = if self.wide.data.is_empty() { 0.0 } else { self.pull.at(surround) };
         let v = edge + wide;
         if v.is_finite() { v } else { 0.0 }
+    }
+
+    /// Grid cell `i`'s read for a pixel of tone `own`: its surroundings' tone (with `shift`) and edge pull, over the
+    /// 3×3 cells around it ([`CELL_SIDE`] each side row and column, the rest the centre), each counting by how close its tone is
+    /// to `own` ([`READ_TONE`]), or by nearness when none is close ([`READ_FLOOR`]).
+    ///
+    /// Across a step in the surroundings ([`STEP_GAP`]) the weights are not scaled up to a whole: what the cells near
+    /// the pixel's tone leave goes to the pixel's own tone, raised towards the brightest surroundings as it nears them
+    /// ([`STEP_RAMP`], [`STEP_TOP`]). An edge pixel between a beam and the sky then takes a pull graded by its tone.
+    fn cell_read(&self, i: usize, shift: f32, own: f32) -> (f32, f32) {
+        let (pw, ph) = (self.wide.width, self.wide.height);
+        let wide_at = |i: usize| self.wide.data.get(i).copied().unwrap_or(0.0);
+        let plane_at = |i: usize| self.plane.data.get(i).copied().unwrap_or(0.0);
+        let fallback = (wide_at(i) + shift, plane_at(i));
+        if pw == 0 || ph == 0 {
+            return fallback;
+        }
+        let (cx, cy) = (i % pw, i / pw);
+        let (mut sum, mut s_n, mut e_n) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut all, mut held, mut s_h, mut e_h) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for dy in 0..3usize {
+            let Some(yy) = (cy + dy).checked_sub(1).filter(|&v| v < ph) else { continue };
+            for dx in 0..3usize {
+                let Some(xx) = (cx + dx).checked_sub(1).filter(|&v| v < pw) else { continue };
+                let j = yy * pw + xx;
+                let a = if dx == 1 { 1.0 - 2.0 * CELL_SIDE } else { CELL_SIDE } * if dy == 1 { 1.0 - 2.0 * CELL_SIDE } else { CELL_SIDE };
+                let (t, e) = (wide_at(j) + shift, plane_at(j));
+                if !t.is_finite() || !e.is_finite() {
+                    continue;
+                }
+                let z = ((t - own) / READ_TONE).abs().min(8.0);
+                let g = (-0.5 * z * z).exp();
+                let k = a * (g + READ_FLOOR);
+                sum += k;
+                s_n += k * t;
+                e_n += k * e;
+                all += a;
+                held += a * g;
+                s_h += a * g * t;
+                e_h += a * g * e;
+            }
+        }
+        if sum <= 1e-30 || all <= 0.0 {
+            return fallback;
+        }
+        let (mut s, mut e) = (s_n / sum, e_n / sum);
+        let (lo, hi) = (self.span.0.data.get(i).copied(), self.span.1.data.get(i).copied());
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            let mix = smooth(STEP_GAP - 0.5, STEP_GAP + 0.5, hi - lo);
+            if mix > 0.0 {
+                let hi = hi + shift;
+                let rest = (all - held).max(0.0);
+                let own_side = own + (hi - own) * smooth(hi - STEP_RAMP, hi - STEP_TOP, own);
+                let su = (s_h + rest * own_side) / all;
+                let eu = (e_h + rest * plane_at(i)) / all;
+                if su.is_finite() && eu.is_finite() {
+                    s += (su - s) * mix;
+                    e += (eu - e) * mix;
+                }
+            }
+        }
+        (s, e)
     }
 
     /// The four grid cells around rendered pixel `(x, y)`: their index in the planes and bilinear weight, or `None`
@@ -506,6 +541,39 @@ mod tests {
         let ring = grid(-0.5, 2.9);
         let r = ring.at(32, 24, 0.0, 0.0);
         assert!((r - p(-0.5)).abs() < 0.05, "ring: {r}");
+    }
+
+    /// Inside a clipped lamp every pixel has the same tone, so any step in the pull shows as a flat grey block. The
+    /// lamp's cells (4 EV in the middle, 2.5 EV at its rim) on a dim ceiling (−1 EV): read along a row through it, the
+    /// pull changes by no more than a smooth ramp would from one pixel to the next. Weighing the four cells by tone at
+    /// each pixel let the middle cells take over within a pixel or two as they joined the four (0.09 EV in one pixel).
+    #[test]
+    fn a_clipped_lamp_reads_no_cell_shaped_steps() {
+        use crate::tone_lift::{LIFT_LO, LIFT_N, LIFT_STEP, Lift};
+        let pull = Lift((0..LIFT_N).map(|i| -0.5 * (LIFT_LO + LIFT_STEP * i as f32).max(0.0)).collect());
+        let mut wide = Plane::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (3..5).contains(&x) && (3..5).contains(&y) {
+                    4.0
+                } else if (2..6).contains(&x) && (2..6).contains(&y) {
+                    2.5
+                } else {
+                    -1.0
+                };
+                if let Some(p) = wide.data.get_mut(y * 8 + x) {
+                    *p = v;
+                }
+            }
+        }
+        // 16 output px per cell; the row through the lamp's middle, pixels all clipped (own 4 EV)
+        let e = EdgePull::new(Arc::new(Plane::new(8, 8)), Arc::new(wide), Arc::new(pull), 1.0, (0.0625, 0.0625), (0, 0));
+        let row: Vec<f32> = (24..104).map(|x| e.at(x, 64, 0.0, 4.0)).collect();
+        let worst = row.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.06, "largest step between neighbouring pixels {worst}: {row:?}");
+        // the middle still takes the lamp's pull
+        let mid = e.at(64, 64, 0.0, 4.0);
+        assert!(mid < -1.5, "middle: {mid}");
     }
 
     /// The span planes hold each cell's darkest and brightest neighbour and stay finite on hostile values.

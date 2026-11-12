@@ -1133,6 +1133,30 @@ fn v9_highlights_pull_grades_across_a_soft_edge() {
     check("V9 pull across a soft edge, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
 }
 
+/// Process V9's Highlights pull inside a clipped lamp on a dim ceiling, with a glow around it: each grid cell reads
+/// its own neighbourhood by tone and the reads blend bilinearly (`hl_edge::EdgePull::at`), on both renderers.
+#[test]
+fn v9_highlights_pull_reads_a_clipped_lamp_by_cell() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let r = ((x as f32 - 470.0).powi(2) / 1.6 + (y as f32 - 300.0).powi(2)).sqrt();
+        // a clipped disc 300 px across, a short glow, a dark ceiling
+        let v = if r < 150.0 { 1.3 } else { 0.01 + 0.3 * (-(r - 150.0) / 12.0).exp() };
+        [0.95 * v, 0.9 * v, 0.8 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 330, y: 200, w: 280, h: 200 };
+    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    s.light.highlights = -100.0;
+    let req = RenderRequest::fit(w, h);
+    assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
+    check("V9 pull in a clipped lamp", &src, &info, &s, &req);
+    check("V9 pull in a clipped lamp, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+}
+
 /// Black pixels have no hue. The GPU's `atan2(0, 0)` is undefined (NaN on some GPUs), which made
 /// every exactly black pixel NaN once a colour tool ran, and a lightening vignette then showed it:
 /// the CPU lifted the black corners, the GPU left them black.
