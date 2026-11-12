@@ -1109,6 +1109,30 @@ fn v9_highlights_pull_next_to_clipped_areas_matches() {
     }
 }
 
+/// Process V9's Highlights pull across a soft step (`hl_edge::EdgePull::across_step`): a dark beam over a clipped sky,
+/// slanted, with a few pixels of tones between them, so the edge pixels grade their pull on both renderers.
+#[test]
+fn v9_highlights_pull_grades_across_a_soft_edge() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        // the edge falls 1 px every 7, with an 8-px ramp from the beam (0.04) to the clipped sky (3.0)
+        let t = ((y as f32 - 280.0 - x as f32 / 7.0) / 8.0).clamp(0.0, 1.0);
+        let v = 0.04 + (3.0 - 0.04) * t;
+        [0.9 * v, 0.95 * v, 1.1 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 200, y: 260, w: 320, h: 160 };
+    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    s.light.highlights = -100.0;
+    let req = RenderRequest::fit(w, h);
+    assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
+    check("V9 pull across a soft edge", &src, &info, &s, &req);
+    check("V9 pull across a soft edge, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+}
+
 /// Black pixels have no hue. The GPU's `atan2(0, 0)` is undefined (NaN on some GPUs), which made
 /// every exactly black pixel NaN once a colour tool ran, and a lightening vignette then showed it:
 /// the CPU lifted the black corners, the GPU left them black.

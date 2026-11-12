@@ -63,6 +63,27 @@ fn lift_at(ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// The four cells' weights for a pixel of tone `own`: bilinear, times how close each cell's surroundings' tone is to it
+// when `guided` (`hl_edge::EdgePull::at`).
+fn edge_weights(wo: u32, idx: array<u32, 4>, bil: array<f32, 4>, shift: f32, own: f32, guided: bool) -> array<f32, 4> {
+    var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    var sum = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        var z = 0.0;
+        if (guided) {
+            z = min(abs((aux[wo + idx[k]] + shift - own) / pf(F_EDGE_READ_TONE)), 8.0);
+        }
+        var v = bil[k] * (exp(-0.5 * z * z) + pf(F_EDGE_READ_FLOOR));
+        v = select(0.0, v, v == v);
+        w[k] = v;
+        sum += v;
+    }
+    for (var k = 0u; k < 4u; k++) {
+        w[k] = select(bil[k], w[k] / sum, sum > 1e-30);
+    }
+    return w;
+}
+
 // Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
 // `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V9 Highlights grid (EDGE_W × EDGE_H in aux), each by
 // its bilinear weight and how close its surroundings' tone is to `own`.
@@ -90,33 +111,58 @@ fn edge_at(x: u32, y: u32, shift: f32, own: f32) -> f32 {
     let bil = array<f32, 4>((1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty);
     let wo = pu(F_EDGE_WIDE_OFF);
     let guided = wo != 0u && own == own && abs(own) < 1e30;
-    var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
-    var sum = 0.0;
-    for (var k = 0u; k < 4u; k++) {
-        var z = 0.0;
-        if (guided) {
-            z = min(abs((aux[wo + idx[k]] + shift - own) / pf(F_EDGE_READ_TONE)), 8.0);
-        }
-        var v = bil[k] * (exp(-0.5 * z * z) + pf(F_EDGE_READ_FLOOR));
-        v = select(0.0, v, v == v);
-        w[k] = v;
-        sum += v;
-    }
-    for (var k = 0u; k < 4u; k++) {
-        w[k] = select(bil[k], w[k] / sum, sum > 1e-30);
-    }
+    let w = edge_weights(wo, idx, bil, shift, own, guided);
     let eo = pu(F_EDGE_OFF);
     var edge = 0.0;
-    var wide = 0.0;
+    var surround = 0.0;
     for (var k = 0u; k < 4u; k++) {
         edge += w[k] * aux[eo + idx[k]];
         if (wo != 0u) {
-            wide += w[k] * aux[wo + idx[k]];
+            surround += w[k] * (aux[wo + idx[k]] + shift);
+        }
+    }
+    let so = pu(F_EDGE_SPAN_OFF);
+    if (guided && so != 0u) {
+        // across a step in the surroundings: weights not scaled to a whole, the rest to the pixel's own tone
+        // (`hl_edge::EdgePull::at`)
+        let n = pw * ph;
+        let gap = pf(F_EDGE_STEP_GAP);
+        var hi = 0.0;
+        var e_bil = 0.0;
+        var mix = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+            let c_lo = aux[so + idx[k]];
+            let c_hi = aux[so + n + idx[k]];
+            hi += bil[k] * c_hi;
+            e_bil += bil[k] * aux[eo + idx[k]];
+            // each cell's step, read bilinearly: the rule fades in over a whole cell
+            mix += bil[k] * smoothstep(gap - 0.5, gap + 0.5, c_hi - c_lo);
+        }
+        hi += shift;
+        if (mix > 0.0) {
+            var held_sum = 0.0;
+            var s = 0.0;
+            var e = 0.0;
+            for (var k = 0u; k < 4u; k++) {
+                let z = min(abs((aux[wo + idx[k]] + shift - own) / pf(F_EDGE_READ_TONE)), 8.0);
+                let h = bil[k] * exp(-0.5 * z * z);
+                held_sum += h;
+                s += h * (aux[wo + idx[k]] + shift);
+                e += h * aux[eo + idx[k]];
+            }
+            let rest = clamp(1.0 - held_sum, 0.0, 1.0);
+            let own_side = own + (hi - own) * smoothstep(hi - pf(F_EDGE_STEP_RAMP), hi - pf(F_EDGE_STEP_TOP), own);
+            s += rest * own_side;
+            e += rest * e_bil;
+            if (s == s && e == e && abs(s) < 1e30 && abs(e) < 1e30) {
+                surround += (s - surround) * mix;
+                edge += (e - edge) * mix;
+            }
         }
     }
     var v = pf(F_EDGE_GAIN) * edge;
     if (wo != 0u) {
-        v += table_at(pu(F_EDGE_TABLE_OFF), wide + shift);
+        v += table_at(pu(F_EDGE_TABLE_OFF), surround);
     }
     return select(0.0, v, v == v);
 }
