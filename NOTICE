@@ -72,6 +72,13 @@ poisson.rs), Copyright the PhotoCraft contributors, licensed under the MIT Licen
 License 2.0, at your option. The port was modified by the LightCraft contributors (2026); each
 ported file says so.
 
+crates/pipeline/src/mixer_measured.rs (lcc-pipeline) ports the measured Color Mixer model of PhotoCraft
+(https://github.com/storytold/photocraft, pull request #12228 at commit 46ff8b8e0835b3376f8f6f303b92c626cb8904bb:
+crates/algo/src/camera_raw/color_mixer.rs and hsv_table.rs, by fusaocom) and includes its data file
+unchanged as crates/pipeline/data/camera_raw_hsl.bin, Copyright the PhotoCraft contributors, licensed under
+the MIT License or the Apache License 2.0, at your option. The port was modified by the Chromaforge
+contributors (2026); the ported file says so.
+
 crates/raw/src/vc5.rs (lcc-raw) ports the VC-5 decoder of GoPro's GPR SDK
 (https://github.com/gopro/gpr, source/lib/vc5_common and source/lib/vc5_decoder, including its codebook 17
 table), Copyright 2018 GoPro Inc., licensed under the Apache License 2.0 or the MIT License, at your

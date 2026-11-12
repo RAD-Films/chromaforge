@@ -53,6 +53,7 @@ fn xiaomi() -> lcc_camdb::calibration::Calibration {
             baseline_exposure_offset: 0.0,
             look_table: None,
             tone_curve: vec![],
+            since_process: None,
         }],
         evidence: lcc_camdb::calibration::Evidence {
             photos: 10,
@@ -66,6 +67,7 @@ fn xiaomi() -> lcc_camdb::calibration::Calibration {
                 held_out: 2,
                 before: Default::default(),
                 after: Default::default(),
+                since_process: None,
             }],
         },
     }

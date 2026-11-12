@@ -243,9 +243,27 @@ pub enum Process {
     /// jointly, leaving Y alone, with edge-aware weights from a denoised guide and a brake for
     /// isolated colour specks (adapted from upstream #1348).
     V8,
-    /// Calibration's primary Saturation scales a primary's distance from grey in linear light
-    /// instead of its OkLab chroma, so it no longer turns blues in hue like the Hue slider
-    /// (fork issue #1031).
+    /// A raw's camera-profile tables (a calibration's or `.dcp`'s hue/saturation map and look table, a DNG's own)
+    /// apply after the white balance, at the chosen white, in the order of the DNG specification (chapter 6): white
+    /// balance, matrix, hue/saturation map, exposure, look table. Before V9 they were applied while decoding, at the
+    /// as-shot white, and a white-balance change re-balanced colours the tables had already moved, so a grey picked
+    /// neutral stayed tinted (up to 12 b* on a Canon EOS R6 calibration from 5500 K to 3200 K). Built on V8.
+    ///
+    /// The global Highlights and Shadows follow Lightroom Classic's: one tone curve per picture, its shape taken from
+    /// the picture's own histogram (fitted to Lightroom Classic exports of our own procedural pictures; OneSlips).
+    /// The parametric Tone Curve's regions bend the curve as Lightroom Classic's do (measured on a grey wedge of our
+    /// own), so Darks and Lights no longer fold the curve into a flat band of mid-tones; on a display-referred
+    /// source Exposure up, Whites and Blacks follow Lightroom Classic's responses on the same wedge.
+    ///
+    /// HDR renders follow Lightroom Classic's HDR tone: above the SDR mid tones the HDR value unrolls the SDR
+    /// shoulder (`ToneMap::hdr_from_sdr`, measured on LrC 15.5 exports of our own charts and of real raws) and
+    /// clips at the headroom, instead of creeping toward it.
+    /// Bright colours take the tone curve per channel: a colour near white keeps its saturation at about its
+    /// brightness (`finish::top_shoulder`) instead of its brightest channel going over white and the colour fading
+    /// to white, as Lightroom Classic renders it (yellows and reds near white had lost two thirds of their chroma).
+    ///
+    /// Calibration's primary Saturation scales a primary's distance from white in CIE xy (Lightroom Classic's model,
+    /// above), so it no longer turns blues in hue like the Hue slider (fork issue #1031).
     V9,
 }
 
@@ -2295,8 +2313,15 @@ impl Default for Hdr {
 }
 
 impl Hdr {
-    pub const DEFAULT_MAX_EV: f64 = 3.0;
+    /// New HDR edits start at Lightroom Classic's default headroom: it writes `crs:HDRMaxValue="+2.30"` on a
+    /// photo whose HDR is switched on (read from its saved XMP, 7 Nov 2026), so an edit moved from LrC keeps its
+    /// look. More headroom is the user's choice on the Headroom slider. Edits saved with HDR on keep their own
+    /// value (an enabled `Hdr` is saved whole).
+    pub const DEFAULT_MAX_EV: f64 = 2.3;
     pub const MAX_EV_LIMIT: f64 = 5.0;
+    /// Headroom at which SDR Blend has its nominal strength (the default before 2.3; kept so the SDR rendition
+    /// of an existing edit stays as it was).
+    pub const BLEND_REF_EV: f64 = 3.0;
 
     /// Whether these are the default HDR settings (HDR off, nothing changed).
     pub fn is_default(&self) -> bool {
@@ -2351,7 +2376,7 @@ impl DevelopSettings {
         // takes a stronger compression; damaged values contribute nothing
         let blend = if h.sdr_blend.is_finite() { h.sdr_blend.clamp(-100.0, 100.0) } else { 0.0 };
         let ev = if h.max_ev.is_finite() { h.max_ev.clamp(0.0, Hdr::MAX_EV_LIMIT) } else { Hdr::DEFAULT_MAX_EV };
-        let k = blend * (ev / Hdr::DEFAULT_MAX_EV).min(1.5);
+        let k = blend * (ev / Hdr::BLEND_REF_EV).min(1.5);
         s.light.highlights = add(s.light.highlights, -0.6 * k);
         s.light.whites = add(s.light.whites, -0.3 * k);
         std::borrow::Cow::Owned(s)

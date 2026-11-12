@@ -6,6 +6,10 @@
 //! - `fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME] [--lens MODEL] [--dry-run]`: pair, sample,
 //!   fit; writes the calibration JSON (the file to send) and one `.dcp` per look for the contributor's own local
 //!   testing. `--lens` makes the fit one lens's (the photos' Exif lens model, e.g. one of a phone's cameras).
+//!   `--base FILE` keeps that calibration's camera model and looks and fits only the exports' other looks on top
+//!   (`--replace-looks` also refits a look it has); `--hold-out NAME,…` holds out the photos whose raw file names
+//!   contain one of the names instead of a share picked by order; `--since-process N` adds the fitted looks as
+//!   entries for process N and newer, next to the file's own.
 //! - `add FILE [--repo DIR] [--contributor NAME] [--lens MODEL] [--replace]`: validate a contribution and
 //!   commit-ready write it into `crates/camdb/data/calibrations/` with its `assets/ATTRIBUTION.md` row. A file for
 //!   the same camera, lens and editor is kept unless `--replace` (issue #1015); another lens's fit gets its own file.
@@ -250,6 +254,10 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
     let mut dry_run = false;
     let mut lens = None;
     let mut editor = calibration::Editor::Lightroom;
+    let mut base: Option<PathBuf> = None;
+    let mut replace = false;
+    let mut since_process: Option<u32> = None;
+    let mut hold_out: Option<Vec<String>> = None;
     // `--raws A B --exports C D`: plain arguments go to the list the last flag opened
     let mut list: Option<bool> = None; // Some(true) = raws, Some(false) = exports
     let mut i = 0;
@@ -260,6 +268,20 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
             "-o" | "--out" => out = take(args, &mut i, "-o")?.into(),
             "--contributor" => contributor = Some(take(args, &mut i, "--contributor")?.to_string()),
             "--dry-run" => dry_run = true,
+            "--base" => base = Some(take(args, &mut i, "--base")?.into()),
+            "--replace-looks" => replace = true,
+            "--since-process" => {
+                let v = take(args, &mut i, "--since-process")?;
+                since_process = Some(v.parse().map_err(|_| format!("--since-process: `{v}` is not a process number"))?);
+            }
+            "--hold-out" => {
+                let v = take(args, &mut i, "--hold-out")?;
+                let names: Vec<String> = v.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect();
+                if names.is_empty() {
+                    return Err("--hold-out needs names, e.g. --hold-out IMG_0012,IMG_0040".into());
+                }
+                hold_out = Some(names);
+            }
             "--lens" => lens = Some(take(args, &mut i, "--lens")?.to_string()),
             "--editor" => {
                 let v = take(args, &mut i, "--editor")?;
@@ -291,7 +313,26 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
     }
     let exports: Vec<ExportSet> = export_dirs.iter().map(|d| ExportSet { dir: d.clone() }).collect();
     eprintln!("calibrate-lightroom: {} raw file(s), {} export folder(s); pairing and sampling…", raws.len(), exports.len());
-    let (photos, report) = dataset::collect(&raws, &exports, &CollectOptions::default()).map_err(|e| e.to_string())?;
+    let base = match &base {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("--base {}: {e}", path.display()))?;
+            let cal = calibration::Calibration::parse(&text).map_err(|e| format!("--base {}: {e}", path.display()))?;
+            Some(cal)
+        }
+        None => None,
+    };
+    let (mut photos, report) = dataset::collect(&raws, &exports, &CollectOptions::default()).map_err(|e| e.to_string())?;
+    if let Some(names) = &hold_out {
+        for p in &mut photos {
+            let file = p.raw_path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+            p.held_out = names.iter().any(|n| file.contains(&n.to_lowercase()));
+        }
+        let held = photos.iter().filter(|p| p.held_out).count();
+        eprintln!("calibrate-lightroom: {held} of {} pair(s) held out by name", photos.len());
+        if held == 0 || held == photos.len() {
+            return Err("--hold-out: hold out some photos, not none or all (names are matched inside the raw file names)".into());
+        }
+    }
     eprintln!("calibrate-lightroom: {} pair(s) usable", report.paired);
     for (file, why) in &report.skipped {
         eprintln!("  skipped {file}: {why}");
@@ -315,7 +356,15 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     eprintln!("calibrate-lightroom: fitting (this can take a few minutes)…");
-    let mut cal = fit::fit(&photos, &FitOptions { contributor, editor, rounds: 0 }).map_err(|e| e.to_string())?;
+    if since_process.is_some() && base.is_none() {
+        return Err("--since-process needs --base: it adds look entries next to an existing calibration's".into());
+    }
+    let opts = FitOptions { contributor, editor, rounds: 0, since_process };
+    let mut cal = match &base {
+        Some(b) => fit::fit_on_base(&photos, b, replace, &opts),
+        None => fit::fit(&photos, &opts),
+    }
+    .map_err(|e| e.to_string())?;
     cal.tool_version = env!("CARGO_PKG_VERSION").to_string();
     cal.lens = lens;
     cal.validate().map_err(|e| format!("the fit produced an invalid calibration: {e}"))?;
@@ -330,7 +379,9 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
         // the id without its `cal:` prefix: `:` is not allowed in Windows file names
         let id = calibration::look_id(&look.name);
         let slug = id.strip_prefix(calibration::LOOK_PREFIX).unwrap_or(&id);
-        let path = out.join(format!("{stem}.{slug}.dcp"));
+        // an entry for newer processes beside the look's own: `.v8` after the slug
+        let since = look.since_process.map(|p| format!(".v{p}")).unwrap_or_default();
+        let path = out.join(format!("{stem}.{slug}{since}.dcp"));
         std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         dcps.push(path);
     }
@@ -372,8 +423,9 @@ fn print_contents(c: &Calibration) {
     );
     for l in &c.looks {
         println!(
-            "  look \"{}\": exposure offset {:+.2} EV, {}-point tone curve{}",
+            "  look \"{}\"{}: exposure offset {:+.2} EV, {}-point tone curve{}",
             l.name,
+            l.since_process.map(|p| format!(" (process {p} and newer)")).unwrap_or_default(),
             l.baseline_exposure_offset,
             l.tone_curve.len(),
             if l.look_table.is_some() { ", look table" } else { "" }
@@ -387,8 +439,15 @@ fn print_contents(c: &Calibration) {
     }
     for l in &e.looks {
         println!(
-            "  held-out ΔE00 \"{}\" ({} photos, {} held out): median {:.2} → {:.2}, p95 {:.2} → {:.2}",
-            l.name, l.photos, l.held_out, l.before.median, l.after.median, l.before.p95, l.after.p95
+            "  held-out ΔE00 \"{}\"{} ({} photos, {} held out): median {:.2} → {:.2}, p95 {:.2} → {:.2}",
+            l.name,
+            l.since_process.map(|p| format!(" (process {p} and newer)")).unwrap_or_default(),
+            l.photos,
+            l.held_out,
+            l.before.median,
+            l.after.median,
+            l.before.p95,
+            l.after.p95
         );
     }
 }

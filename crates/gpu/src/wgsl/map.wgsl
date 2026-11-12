@@ -121,7 +121,17 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
-// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0.
+// `local::wb_gain`'s clip at 0: per Rec.2020 channel, or (P[o] != 0, `local::prophoto_floor`) per linear ProPhoto
+// channel, P[o+1..o+10] into ProPhoto and P[o+10..o+19] back.
+fn wb_floor(c: vec3<f32>, o: u32) -> vec3<f32> {
+    if (pu(o) == 0u) {
+        return max(c, vec3<f32>(0.0));
+    }
+    let r = tab_mat(o + 10u, max(tab_mat(o + 1u, c), vec3<f32>(0.0)));
+    return vec3<f32>(tab_finite(r.x), tab_finite(r.y), tab_finite(r.z));
+}
+
+// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clipped at 0 (`wb_floor` at P[11]).
 @compute @workgroup_size(256)
 fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -136,7 +146,174 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
             pf(8u) * c.x + pf(9u) * c.y + pf(10u) * c.z,
         );
     }
-    put_rgb(i, max(c * 1.0, vec3<f32>(0.0)));
+    put_rgb(i, wb_floor(c, 11u));
+}
+
+// White balance, then (process V9) a camera profile's tables: `wb_k`, then `lcc_raw::profile::ProfileTables::apply`
+// (into linear ProPhoto, hue/saturation map, baseline gain, look table, back), as `lcc_pipeline::local::wb_gain` does;
+// non-finite channels become 0, then clamped at 0. P[1] = has matrix, P[2..11] the matrix, P[11..20] into ProPhoto,
+// P[20..29] out of it, P[29] the baseline gain, P[30..36] the hue/saturation map's and P[36..42] the look table's
+// header (present, hue / saturation / value divisions, sRGB-coded value, first entry in b). b: the tables' entries
+// (hue shift, saturation scale, value scale).
+fn tab_wrap(x: f32, p: f32) -> f32 {
+    return x - p * floor(x / p);
+}
+
+fn tab_l2s(v: f32) -> f32 {
+    if (v <= 0.0031308) {
+        return v * 12.92;
+    }
+    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+fn tab_s2l(v: f32) -> f32 {
+    if (v <= 0.04045) {
+        return v / 12.92;
+    }
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+
+fn tab_limited(x: f32, k: f32) -> f32 {
+    if (x <= 1.0) {
+        return min(x * k, 1.0);
+    }
+    return x * min(k, 1.0);
+}
+
+fn tab_entry(t: u32, v: u32, h: u32, s: u32) -> vec3<f32> {
+    let k = pu(t + 5u) + (v * pu(t + 1u) + h) * pu(t + 2u) + s;
+    return vec3<f32>(b[3u * k], b[3u * k + 1u], b[3u * k + 2u]);
+}
+
+fn tab_lerp(x: vec3<f32>, y: vec3<f32>, t: f32) -> vec3<f32> {
+    return x + (y - x) * t;
+}
+
+// (i0, i1, t) of a table axis with n ≥ 1 points
+fn tab_axis(x: f32, n: u32) -> vec3<f32> {
+    let f = clamp(x, 0.0, 1.0) * f32(n - 1u);
+    let i0 = min(u32(f), select(0u, n - 2u, n >= 2u));
+    let i1 = min(i0 + 1u, n - 1u);
+    return vec3<f32>(f32(i0), f32(i1), clamp(f - f32(i0), 0.0, 1.0));
+}
+
+fn tab_plane(t: u32, vi: u32, h0: u32, h1: u32, s0: u32, s1: u32, ts: f32, th: f32) -> vec3<f32> {
+    let lo = tab_lerp(tab_entry(t, vi, h0, s0), tab_entry(t, vi, h0, s1), ts);
+    let hi = tab_lerp(tab_entry(t, vi, h1, s0), tab_entry(t, vi, h1, s1), ts);
+    return tab_lerp(lo, hi, th);
+}
+
+fn tab_lookup(t: u32, h: f32, s: f32, v: f32) -> vec3<f32> {
+    let hd = pu(t + 1u);
+    let hf = clamp(tab_wrap(h, 360.0) / 360.0 * f32(hd), 0.0, f32(hd));
+    let h0 = min(u32(hf), hd - 1u);
+    let h1 = (h0 + 1u) % hd;
+    let th = clamp(hf - f32(h0), 0.0, 1.0);
+    let sa = tab_axis(s, pu(t + 2u));
+    let s0 = u32(sa.x);
+    let s1 = u32(sa.y);
+    let vd = pu(t + 3u);
+    if (vd <= 1u) {
+        return tab_plane(t, 0u, h0, h1, s0, s1, sa.z, th);
+    }
+    let va = tab_axis(v, vd);
+    let p0 = tab_plane(t, u32(va.x), h0, h1, s0, s1, sa.z, th);
+    if (u32(va.x) == u32(va.y)) {
+        return p0;
+    }
+    return tab_lerp(p0, tab_plane(t, u32(va.y), h0, h1, s0, s1, sa.z, th), va.z);
+}
+
+fn tab_hue(c: vec3<f32>, mx: f32, d: f32) -> f32 {
+    if (d <= 0.0) {
+        return 0.0;
+    }
+    var h = 0.0;
+    if (mx == c.x) {
+        h = tab_wrap((c.y - c.z) / d, 6.0);
+    } else if (mx == c.y) {
+        h = (c.z - c.x) / d + 2.0;
+    } else {
+        h = (c.x - c.y) / d + 4.0;
+    }
+    return h * 60.0;
+}
+
+fn tab_hsv_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let hp = tab_wrap(h, 360.0) / 60.0;
+    let sector = min(u32(hp), 5u);
+    let f = hp - f32(sector);
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    switch sector {
+        case 0u: { return vec3<f32>(v, t, p); }
+        case 1u: { return vec3<f32>(q, v, p); }
+        case 2u: { return vec3<f32>(p, v, t); }
+        case 3u: { return vec3<f32>(p, q, v); }
+        case 4u: { return vec3<f32>(t, p, v); }
+        default: { return vec3<f32>(v, p, q); }
+    }
+}
+
+// `HsvTable::apply` of the table whose header starts at P[t] (the colour unchanged without one)
+fn tab_apply(t: u32, c: vec3<f32>) -> vec3<f32> {
+    if (pu(t) == 0u) {
+        return c;
+    }
+    let mx = max(max(c.x, c.y), c.z);
+    if (!(mx > 0.0) || !(mx <= 3.4028235e38)) {
+        return c;
+    }
+    let mn = min(min(c.x, c.y), c.z);
+    let d = mx - mn;
+    let hue = tab_hue(c, mx, d);
+    let sat = d / mx;
+    let srgb = pu(t + 4u) != 0u;
+    let vi = select(mx, tab_l2s(min(mx, 1.0)), srgb);
+    let e = tab_lookup(t, hue, sat, vi);
+    let s2 = tab_limited(sat, e.y);
+    var v2 = 0.0;
+    if (srgb && mx <= 1.0) {
+        v2 = select(tab_s2l(min(vi * e.z, 1.0)), mx, e.z == 1.0);
+    } else if (srgb) {
+        v2 = mx * min(tab_s2l(min(e.z, 1.0)), 1.0);
+    } else {
+        v2 = tab_limited(mx, e.z);
+    }
+    return tab_hsv_rgb(hue + e.x, s2, v2);
+}
+
+fn tab_mat(o: u32, c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        pf(o) * c.x + pf(o + 1u) * c.y + pf(o + 2u) * c.z,
+        pf(o + 3u) * c.x + pf(o + 4u) * c.y + pf(o + 5u) * c.z,
+        pf(o + 6u) * c.x + pf(o + 7u) * c.y + pf(o + 8u) * c.z,
+    );
+}
+
+fn tab_finite(v: f32) -> f32 {
+    return select(0.0, v, abs(v) <= 3.4028235e38);
+}
+
+@compute @workgroup_size(256)
+fn wb_tables_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let i = lin_index(g, nw);
+    if (i >= pu(0u)) {
+        return;
+    }
+    var c = rgb_a(i);
+    if (pu(1u) != 0u) {
+        c = tab_mat(2u, c);
+    }
+    let gain = pf(29u);
+    var p = tab_mat(11u, c / gain);
+    p = tab_apply(30u, p);
+    p = p * gain;
+    p = tab_apply(36u, p);
+    c = tab_mat(20u, p);
+    c = vec3<f32>(tab_finite(c.x), tab_finite(c.y), tab_finite(c.z));
+    put_rgb(i, wb_floor(c, 42u));
 }
 
 // Luminance NR: scale by 2^((f − l)·k) (a: image, b: log luminance l, c: filtered f). P[1] = k.

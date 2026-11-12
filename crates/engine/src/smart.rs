@@ -83,6 +83,11 @@ const ENC_FIELD: &str = "enc";
 /// Crate-visible so the look-marker test pins the marker format to it instead of to a literal.
 pub(crate) const ENCODE_VERSION: u64 = 3;
 
+/// The header field that records how many stops above the sensor's clip the decode the proxy was made from rebuilt
+/// a raw's clipped highlights ([`crate::files::headroom_of`]): baked into the pixels, so a photo that wants another
+/// headroom (its process changed) has a stale proxy. Missing: 0.
+const HEADROOM_FIELD: &str = "headroom";
+
 /// The decoder facts a render interprets its settings against, stored with the proxy's pixels so
 /// an offline original edits like it did online (the catalog's header facts cannot carry them).
 /// In the proxy's tail, not its header: a real file's gain table map runs far past any header
@@ -141,6 +146,17 @@ fn stored_facts(head: &serde_json::Value, bytes: &[u8]) -> Option<(SmartFacts, M
 /// Encode a source image and its decoder facts (the camera tone curve and the [`SourceInfo`] the
 /// render interprets settings against, if given) as a smart preview.
 pub fn encode(img: &Rgb32f, info: Option<&SourceInfo>) -> Result<Vec<u8>, String> {
+    encode_with(img, info, 0.0)
+}
+
+/// [`encode`] for a source decoded with `headroom` stops of highlight headroom ([`HEADROOM_FIELD`]).
+pub fn encode_with(img: &Rgb32f, info: Option<&SourceInfo>, headroom: f32) -> Result<Vec<u8>, String> {
+    encode_for(img, info, headroom, crate::camera_preview::LOOK_VERSION)
+}
+
+/// [`encode_with`] for a source whose camera look is the fit of `look` ([`crate::camera_preview::FitGen::look_version`]:
+/// processes V1 to V8 keep an older fit than V9's).
+pub fn encode_for(img: &Rgb32f, info: Option<&SourceInfo>, headroom: f32, look: u32) -> Result<Vec<u8>, String> {
     // scale so all but the brightest 0.05 % fit into 0..1
     let mut lum: Vec<f32> = img.data.iter().map(|c| c[0].max(c[1]).max(c[2])).filter(|v| v.is_finite()).collect();
     let scale = if lum.is_empty() {
@@ -167,9 +183,12 @@ pub fn encode(img: &Rgb32f, info: Option<&SourceInfo>) -> Result<Vec<u8>, String
         "w": img.width,
         "h": img.height,
         "scale": scale,
-        LOOK_FIELD: crate::camera_preview::LOOK_VERSION,
+        LOOK_FIELD: look,
         ENC_FIELD: ENCODE_VERSION,
     });
+    if headroom.is_finite() && headroom > 0.0 {
+        head[HEADROOM_FIELD] = serde_json::json!(headroom);
+    }
     // The tail: the decoder facts (and the file's semantic mattes) after the JPEG, so the header
     // stays small. `tail` records its byte count from the end of the file, so a header rewritten
     // in place (an edited look version) keeps pointing at it.
@@ -429,6 +448,11 @@ fn header_encode_version(head: &serde_json::Value) -> u64 {
     head.get(ENC_FIELD).and_then(serde_json::Value::as_u64).unwrap_or(0)
 }
 
+/// The highlight headroom (stops) a header records: missing or malformed counts as 0.
+fn header_headroom(head: &serde_json::Value) -> f32 {
+    head.get(HEADROOM_FIELD).and_then(serde_json::Value::as_f64).filter(|v| v.is_finite()).map_or(0.0, |v| v as f32)
+}
+
 /// Whether the complete proxy at `path` is out of date for a photo and must be rebuilt: written by
 /// an older encoding of its own pixels ([`ENCODE_VERSION`], i.e. a lower JPEG quality) — this
 /// reaches every proxy — or, when the photo takes the per-file camera look (`look`,
@@ -436,8 +460,13 @@ fn header_encode_version(head: &serde_json::Value) -> u64 {
 /// its stored curve, and the colour baked into its pixels, are out of date; the fit only reaches
 /// those raws, so a JPEG's or DNG's proxy is never stale for it). A proxy from a newer build is
 /// left alone (rebuilding it here would only undo that build's work), as is one that can't be
-/// read: those are [`is_valid`]'s business.
-pub fn is_stale_for(path: &Path, look: bool) -> bool {
+/// read: those are [`is_valid`]'s business. A raw's proxy is also stale when it was made with another highlight
+/// headroom than the photo's decode now takes (`headroom`, stops; `None`: not a raw, not checked).
+///
+/// `look` is the fit the photo's decode makes ([`crate::camera_preview::FitGen::look_version`]), `None` when it takes
+/// no per-file look. A photo on processes V1 to V8 keeps the fit of [`crate::camera_preview::LOOK_VERSION_V8`]: its
+/// proxy is current only at exactly that fit (a V9 build's newer one would show a look the photo doesn't have).
+pub fn is_stale_for(path: &Path, look: Option<u32>, headroom: Option<f32>) -> bool {
     use std::io::Read;
     if !is_valid(path) {
         return false;
@@ -450,13 +479,18 @@ pub fn is_stale_for(path: &Path, look: bool) -> bool {
     let Some(rest) = head.strip_prefix(MAGIC) else { return false };
     let Some(nl) = rest.iter().position(|b| *b == b'\n') else { return false };
     rest.get(..nl).and_then(|h| serde_json::from_slice::<serde_json::Value>(h).ok()).is_some_and(|h| {
-        header_encode_version(&h) < ENCODE_VERSION || (look && header_look_version(&h) < u64::from(crate::camera_preview::LOOK_VERSION))
+        header_encode_version(&h) < ENCODE_VERSION
+            || look.is_some_and(|want| {
+                let have = header_look_version(&h);
+                if want < crate::camera_preview::LOOK_VERSION { have != u64::from(want) } else { have < u64::from(want) }
+            })
+            || headroom.is_some_and(|want| (header_headroom(&h) - want).abs() > 1e-3)
     })
 }
 
 /// [`is_stale_for`] for a photo that takes the per-file camera look: both conditions apply.
 pub fn is_stale(path: &Path) -> bool {
-    is_stale_for(path, true)
+    is_stale_for(path, Some(crate::camera_preview::LOOK_VERSION), None)
 }
 
 /// The marker file in a smart previews folder: the camera-look fit version and encode version its
@@ -476,9 +510,13 @@ pub fn look_checked(dir: &Path) -> bool {
         return false;
     }
     let mut versions = text.split_whitespace();
-    let (Some(look), Some(enc)) = (versions.next(), versions.next()) else { return false };
-    match (look.parse::<u64>(), enc.parse::<u64>()) {
-        (Ok(look), Ok(enc)) => look >= u64::from(crate::camera_preview::LOOK_VERSION) && enc >= ENCODE_VERSION,
+    // (the third: the fit processes V1 to V8 keep; a marker written before it was recorded checks the folder once more,
+    // for the proxies of those photos a build fitted with V9's look)
+    let (Some(look), Some(enc), Some(v8)) = (versions.next(), versions.next(), versions.next()) else { return false };
+    match (look.parse::<u64>(), enc.parse::<u64>(), v8.parse::<u32>()) {
+        (Ok(look), Ok(enc), Ok(v8)) => {
+            look >= u64::from(crate::camera_preview::LOOK_VERSION) && enc >= ENCODE_VERSION && v8 == crate::camera_preview::LOOK_VERSION_V8
+        }
         _ => false,
     }
 }
@@ -487,7 +525,7 @@ pub fn look_checked(dir: &Path) -> bool {
 /// version.
 pub fn mark_look_checked(dir: &Path) -> Result<(), String> {
     let path = dir.join(LOOK_MARKER);
-    let text = format!("{} {}\n", crate::camera_preview::LOOK_VERSION, ENCODE_VERSION);
+    let text = format!("{} {} {}\n", crate::camera_preview::LOOK_VERSION, ENCODE_VERSION, crate::camera_preview::LOOK_VERSION_V8);
     lcc_catalog::safe_file::write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -690,6 +728,41 @@ mod tests {
         let mean = err / (img.data.len() * 3) as f64;
         assert!(mean < 0.02, "mean encoded error {mean}");
         assert!(decode(b"nope").is_err());
+    }
+
+    /// A raw's proxy records the highlight headroom its pixels were rebuilt with, and is stale for a photo whose
+    /// decode now takes another; a photo that isn't a raw (`None`) never checks it.
+    #[test]
+    fn a_proxy_made_with_another_highlight_headroom_is_stale() {
+        let dir = temp("headroom");
+        let img = lcc_scenes::demo_library()[0].render(32, 20);
+        let (plain, bright) = (dir.join("plain.lcsp"), dir.join("bright.lcsp"));
+        std::fs::write(&plain, encode(&img, None).unwrap()).unwrap();
+        std::fs::write(&bright, encode_with(&img, None, 1.0).unwrap()).unwrap();
+        assert!(is_valid(&plain) && is_valid(&bright));
+        assert!(!is_stale_for(&plain, None, Some(0.0)) && is_stale_for(&plain, None, Some(1.0)));
+        assert!(!is_stale_for(&bright, None, Some(1.0)) && is_stale_for(&bright, None, Some(0.0)));
+        assert!(!is_stale_for(&plain, None, None) && !is_stale_for(&bright, None, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A proxy records the camera-look fit it was made with: a photo on processes V1 to V8 takes exactly the fit of
+    /// LOOK 22 (one a V9 build fitted with its newer look is stale for it), a V9 photo the current fit or a newer one.
+    #[test]
+    fn a_proxy_is_current_only_for_the_fit_of_its_photos_process() {
+        use crate::camera_preview::{LOOK_VERSION, LOOK_VERSION_V8};
+        let dir = temp("fitgen");
+        let img = lcc_scenes::demo_library()[0].render(32, 20);
+        let (old, cur, newer) = (dir.join("old.lcsp"), dir.join("cur.lcsp"), dir.join("newer.lcsp"));
+        std::fs::write(&old, encode_for(&img, None, 0.0, LOOK_VERSION_V8).unwrap()).unwrap();
+        std::fs::write(&cur, encode_for(&img, None, 0.0, LOOK_VERSION).unwrap()).unwrap();
+        std::fs::write(&newer, encode_for(&img, None, 0.0, LOOK_VERSION + 1).unwrap()).unwrap();
+        let (v8, v9) = (Some(LOOK_VERSION_V8), Some(LOOK_VERSION));
+        assert!(!is_stale_for(&old, v8, None) && is_stale_for(&old, v9, None));
+        assert!(is_stale_for(&cur, v8, None) && !is_stale_for(&cur, v9, None));
+        assert!(is_stale_for(&newer, v8, None) && !is_stale_for(&newer, v9, None), "a newer build's proxy is left alone");
+        assert!(!is_stale_for(&old, None, None) && !is_stale_for(&cur, None, None), "no per-file look: never stale for it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A smooth, deterministic stand-in for a photo: a bright, near-neutral "sky" crossing over into

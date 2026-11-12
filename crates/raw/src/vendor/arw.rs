@@ -727,6 +727,12 @@ fn raw_ifd(tiff: &Tiff) -> Option<&Ifd> {
 }
 
 pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
+    decode_levels(bytes, mode, false)
+}
+
+/// [`decode`]; `v8_levels`: a "12-bit uncompressed" file takes its scale from its brightest sample, as processes V1 to
+/// V8 read it (`crate::decode_v8_levels`).
+pub(crate) fn decode_levels(bytes: &[u8], mode: Mode, v8_levels: bool) -> Result<RawImage> {
     let tiff = Tiff::parse(bytes)?;
     let ifd0 = &tiff.ifds[0];
     let Some(raw) = raw_ifd(&tiff) else {
@@ -823,9 +829,16 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         _ => (read_image_in(mode, bytes, &info, tiff.order, Packing::Msb)?, bits),
     };
     let RawData::U16(ref samples) = data else { return Err(RawError::Unsupported("float ARW".into())) };
-    // "12-bit uncompressed" files (e.g. ILCE-7RM2) say BitsPerSample 12 but store 16-bit words on the 14-bit scale
-    // of the other modes (black 512, peaks near 16383): black and white follow the data, `bits` keeps the tag
-    let scale_bits = if info.compression == 1 && out_bits < 14 && strip_len >= (w * h * 2) as u64 && samples.iter().any(|&v| v >> (out_bits + 1) != 0)
+    // Sony's "12-bit uncompressed" mode (e.g. ILCE-7RM2, ILCA-99M2) says BitsPerSample 12 but stores 16-bit words on
+    // the 14-bit scale of the other modes (black 512, peaks near 16383), dark frames with no sample above 4095 too
+    // (upstream #3429: picking the scale from the brightest sample gave those black 128 / white 4095 and a purple
+    // render, and made header and full decodes disagree). The layout decides; `bits` keeps the tag, and genuinely
+    // packed 12-bit strips keep their 12-bit scale.
+    // (processes V1 to V8 read the scale from the brightest sample, as they always did: a saved edit never changes)
+    let scale_bits = if info.compression == 1
+        && out_bits < 14
+        && strip_len >= (w * h * 2) as u64
+        && (!v8_levels || samples.iter().any(|&v| v >> (out_bits + 1) != 0))
     {
         14
     } else {
@@ -1772,6 +1785,51 @@ mod tests {
             let mut f = TiffWriter::default().write(&[raw]).unwrap();
             crate::vendor::declare_strip_len(&mut f, 12, declared);
             assert!(matches!(decode(&f, Mode::Full), Err(RawError::Corrupt(_))), "{declared} bytes declared");
+        }
+    }
+
+    /// Verify Sony word storage uses the same levels in dark and bright frames and survives DNG export.
+    #[test]
+    fn uncompressed_12_bit_word_levels_do_not_depend_on_scene_brightness() {
+        use lcc_tiff::{IfdBuilder, ImageData, TiffWriter, Value};
+        for peak in [1024u16, 3144, 12000] {
+            let samples: Vec<u16> = (0..64).map(|i| if i == 0 { peak } else { 512 }).collect();
+            let mut raw = IfdBuilder::new();
+            raw.set(t::MAKE, Value::Ascii("SONY".into()));
+            raw.set(t::MODEL, Value::Ascii("ILCA-99M2".into()));
+            raw.set(t::IMAGE_WIDTH, Value::Long(vec![8]));
+            raw.set(t::IMAGE_LENGTH, Value::Long(vec![8]));
+            raw.set(t::BITS_PER_SAMPLE, Value::Short(vec![12]));
+            raw.set(t::SAMPLES_PER_PIXEL, Value::Short(vec![1]));
+            raw.set(t::PHOTOMETRIC, Value::Short(vec![photometric::CFA]));
+            raw.set(t::COMPRESSION, Value::Short(vec![1]));
+            raw.set_image(ImageData::Strips { rows_per_strip: 8, strips: vec![samples.iter().flat_map(|v| v.to_le_bytes()).collect()] });
+            let bytes = TiffWriter::default().write(&[raw]).unwrap();
+            // processes V1 to V8 read a dark frame (no sample above the 12-bit range) on the 12-bit scale, as before
+            let v8 = decode_levels(&bytes, Mode::Full, true).unwrap();
+            let (black, white) = if peak > 4095 { (512.0, vec![16383.0]) } else { (128.0, v8.white.clone()) };
+            assert_eq!(v8.black.mean(), black, "V8 levels, peak {peak}");
+            assert_eq!(v8.white, white, "V8 levels, peak {peak}");
+            assert!(peak > 4095 || v8.white[0] <= 4095.0, "a dark frame's V8 white is on the 12-bit scale: {:?}", v8.white);
+            for mode in [Mode::Header, Mode::Full] {
+                let decoded = decode(&bytes, mode).unwrap();
+                assert_eq!(decoded.bits, 12, "keep the recorded bit depth");
+                assert_eq!(decoded.black.mean(), 512.0, "peak {peak}, {mode:?}");
+                assert_eq!(decoded.white, vec![16383.0], "peak {peak}, {mode:?}");
+                if matches!(mode, Mode::Full) {
+                    let dng = crate::write_dng(&decoded, &crate::DngWriteOptions::default()).unwrap();
+                    let tiff = Tiff::parse(&dng).unwrap();
+                    let bits = tiff.ifds[0].u32(t::BITS_PER_SAMPLE).unwrap();
+                    let white = tiff.ifds[0].u32(t::WHITE_LEVEL).unwrap();
+                    assert!((2..=16).contains(&bits));
+                    assert!(white < (1u32 << bits), "peak {peak}: {bits} bits cannot represent white {white}");
+                    let back = crate::decode(&dng).unwrap();
+                    assert_eq!(back.white, decoded.white);
+                    assert_eq!(back.black.mean(), decoded.black.mean());
+                    let RawData::U16(back_samples) = back.data else { panic!("integer DNG samples") };
+                    assert_eq!(back_samples, samples);
+                }
+            }
         }
     }
 }

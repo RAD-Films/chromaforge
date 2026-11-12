@@ -150,11 +150,14 @@ USAGE:
   {cli} calibrate-lightroom preset -o FILE.xmp
       Write the baseline Lightroom preset to apply (on virtual copies) before exporting for a fit.
   {cli} calibrate-lightroom fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME]
-          [--lens MODEL] [--dry-run]
+          [--lens MODEL] [--dry-run] [--base FILE [--replace-looks] [--since-process N]] [--hold-out NAME,…]
       Fit a camera's colour model and looks to Lightroom's exports of your own raws (16-bit TIFF, one export
       folder per Lightroom profile). Writes <Make>_<Model>.json (the file to send: numbers only, no images) and
       one .dcp per look for your own testing. --lens: the fit is for that lens only (Exif lens model, e.g. one
       of a phone's cameras). --dry-run pairs and reports coverage without fitting.
+      --base FILE keeps that calibration's camera model and looks and fits only the other looks the exports name
+      (--replace-looks refits one it has too; --since-process N adds them as entries for process N and newer only,
+      so older edits keep the file's looks); --hold-out NAME,… holds out the raws whose file names contain a name.
   {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME] [--lens MODEL] [--replace]
       Developers: validate a contributed calibration, write it to crates/camdb/data/calibrations/ and add its
       assets/ATTRIBUTION.md row (DIR: the repository root, default .). A calibration already there for the
@@ -905,12 +908,18 @@ fn read_settings(p: &str) -> Result<SettingsFile, String> {
     }
 }
 
-/// Why `library.import` (its result `r`) brought in nothing from `input`.
+/// Why `library.import` (report `r`) gave no photo for `input`: a file still being copied, else the reason it gives
+/// for the file, else what it did instead (a skipped file, say), so a render that fails says what to fix rather than
+/// only that it failed.
 fn not_imported(input: &str, r: &Value) -> String {
     if r["still_copying"].as_array().is_some_and(|a| !a.is_empty()) {
         return format!("{input}: still being copied, try again shortly");
     }
-    format!("{input}: not a readable photo")
+    let reason = r["failed"].as_array().and_then(|f| f.iter().find_map(|e| e.get(1).and_then(Value::as_str)));
+    match reason {
+        Some(why) => format!("{input}: not imported: {why}"),
+        None => format!("{input}: not a readable photo (the import added nothing: {r})"),
+    }
 }
 
 fn render(args: &[String]) -> Result<(), String> {

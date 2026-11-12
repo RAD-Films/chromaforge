@@ -678,7 +678,7 @@ fn camera_color(temp: f64, tint: f64) -> std::sync::Arc<crate::CameraColor> {
         ],
         ..Default::default()
     };
-    std::sync::Arc::new(crate::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint) })
+    std::sync::Arc::new(crate::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint), deferred_tables_gain: None })
 }
 
 /// Every stored process number renders with a process this build knows: settings saved before
@@ -965,4 +965,51 @@ fn a_draft_has_the_large_scale_tone_of_the_full_render() {
             assert!(d <= 0.5, "{name} {:?}: the draft's large-scale tone is {d:.2}/255 off the full render's", req.window);
         }
     }
+}
+
+/// Process V9's Tone Curve gives the same picture in every export space: a Red-only curve rendered into sRGB and into
+/// ProPhoto (converted to sRGB) agrees wherever both hold the colour. Before V9 the curves ran on the output space's
+/// own encoded values, so the ProPhoto export of the same edit came out redder (round 18 charts: ΔE76 9.2 on the grey
+/// ramp between the two exports).
+#[test]
+fn a_v9_tone_curve_looks_the_same_in_srgb_and_prophoto_exports() {
+    use crate::{DeepSamples, OutputDepth, OutputSpace};
+    use lcc_geom::Point;
+    let src = scene();
+    let lift = |s: &mut DevelopSettings| {
+        s.curve.red = vec![Point::new(0.0, 0.0), Point::new(128.0 / 255.0, 160.0 / 255.0), Point::new(1.0, 1.0)];
+        s.curve.master = vec![Point::new(0.0, 0.0), Point::new(64.0 / 255.0, 48.0 / 255.0), Point::new(1.0, 1.0)];
+    };
+    let linear = |s: &DevelopSettings, space: OutputSpace| -> Vec<f32> {
+        let req = RenderRequest { space, depth: OutputDepth::F32Linear, ..RenderRequest::fit(240, 240) };
+        match render(&src, &SourceInfo::default(), s, &req).deep.map(|d| d.samples) {
+            Some(DeepSamples::F32(v)) => v,
+            _ => panic!("no linear samples"),
+        }
+    };
+    let gap = |s: &DevelopSettings| {
+        let srgb = linear(s, OutputSpace::Srgb);
+        let pro = linear(s, OutputSpace::ProPhoto);
+        let m = lcc_color::PROPHOTO.to_space(&lcc_color::SRGB).to_f32();
+        let (mut sum, mut n) = (0.0f64, 0usize);
+        for (a, q) in srgb.as_chunks::<3>().0.iter().zip(pro.as_chunks::<3>().0) {
+            let c: [f32; 3] = std::array::from_fn(|i| m[i][0] * q[0] + m[i][1] * q[1] + m[i][2] * q[2]);
+            // only colours both spaces hold (the gamut map differs outside sRGB)
+            if c.iter().chain(a).all(|v| (0.002..0.998).contains(v)) {
+                sum += a.iter().zip(&c).map(|(x, y)| f64::from((x - y).abs())).sum::<f64>();
+                n += 1;
+            }
+        }
+        assert!(n > 1000, "too few in-gamut pixels: {n}");
+        sum / (3 * n) as f64
+    };
+    let mut v9 = DevelopSettings::default();
+    assert!(crate::finish::curves_before_output(v9.process.process()), "the default process curves before the output");
+    lift(&mut v9);
+    let g9 = gap(&v9);
+    assert!(g9 < 2e-3, "V9: sRGB and ProPhoto exports of one curve differ by {g9:.4} per channel");
+    let mut v8 = v9.clone();
+    v8.process = lcc_develop::Process::V8.version();
+    let g8 = gap(&v8);
+    assert!(g8 > 5.0 * g9, "V8 keeps its output-space curves: gap {g8:.4} vs V9 {g9:.4}");
 }

@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 81;
+pub const RENDER_CACHE_VERSION: u64 = 92;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -169,6 +169,21 @@ pub struct LoadOptions {
     /// Correct the raw's hot, dead and stuck pixels (`sensor.pixelFix`): the camera body's known ones
     /// and the clear ones this photo shows (`crate::files::repair_pixels`).
     pub pixel_fix: bool,
+    /// Leave a raw's camera-profile tables (hue/saturation map, look table) out of the decoded pixels and hand them
+    /// to the pipeline, which applies them after the white balance at the chosen white (process V9,
+    /// [`lcc_pipeline::CameraColor::deferred_tables_gain`]); false: applied while decoding, at the as-shot white
+    /// (V1–V7).
+    pub defer_tables: bool,
+    /// Demosaic a raw with the AHD that blends its candidates where noise alone would pick one
+    /// ([`lcc_raw::Method::AhdBlend`], process V9); false: the outright pick of V1-V8 ([`lcc_raw::Method::Ahd`]).
+    pub ahd_blend: bool,
+    /// Process V9's highlight rebuild (`crate::files::rebuild_of`): fully clipped highlights
+    /// [`crate::files::HIGHLIGHT_HEADROOM`] stops above the sensor's clip, and partly clipped ones in their rim's hue
+    /// ([`lcc_raw::highlight::Rebuild::rim_hue`]), as Lightroom Classic shows them when Exposure goes down.
+    pub highlight_headroom: bool,
+    /// The photo's process number (`DevelopSettings::process`): picks a calibrated look's entry for newer processes
+    /// when the camera's calibration has one (`lcc_raw::dcp::resolve_at`); the latest process by default.
+    pub process: u32,
     /// The file being decoded, set by the filesystem loaders: names the camera body when the raw has
     /// no serial number (`crate::sensor_maps::body_key`). Not a setting: [`DecodedSource::serves`]
     /// ignores it.
@@ -177,7 +192,21 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        LoadOptions { colour: Default::default(), outliers: false, camera: String::new(), camera_look: true, pixel_fix: true, path: None }
+        LoadOptions {
+            colour: Default::default(),
+            outliers: false,
+            camera: String::new(),
+            camera_look: true,
+            pixel_fix: true,
+            // (baked in: callers that use the decoded pixels directly, such as chart profiling, merges and the colour
+            // fitter, see the camera profile's colours; photo renders decode with `for_photo`, which follows the process)
+            defer_tables: false,
+            ahd_blend: false,
+            highlight_headroom: false,
+            // (what the default settings decode with: `of(&DevelopSettings::default())`)
+            process: lcc_develop::Process::LATEST.version().0,
+            path: None,
+        }
     }
 }
 
@@ -189,6 +218,10 @@ impl LoadOptions {
             camera: s.profile.camera.clone(),
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
+            defer_tables: s.process.process() >= lcc_develop::Process::V9,
+            ahd_blend: s.process.process() >= lcc_develop::Process::V9,
+            highlight_headroom: s.process.process() >= lcc_develop::Process::V9,
+            process: s.process.process().version().0,
             path: None,
         }
     }
@@ -297,7 +330,11 @@ impl DecodedSource {
             || ((self.options.outliers == options.outliers || !info.is_some_and(|i| i.raw))
                 && (self.options.colour == options.colour || !info.is_some_and(|i| i.colorimetric))
                 && ((self.options.camera == options.camera && self.options.camera_look == options.camera_look) || !info.is_some_and(|i| i.raw))
-                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw)))
+                && (self.options.pixel_fix == options.pixel_fix || !info.is_some_and(|i| i.raw))
+                && (self.options.defer_tables == options.defer_tables || !info.is_some_and(|i| i.raw))
+                && (self.options.ahd_blend == options.ahd_blend || !info.is_some_and(|i| i.raw))
+                && (crate::files::rebuild_of(&self.options) == crate::files::rebuild_of(options) || !info.is_some_and(|i| i.raw))
+                && (self.options.process == options.process || !info.is_some_and(|i| i.raw)))
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -3185,6 +3222,29 @@ pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync
 mod thumbnail_hash_tests {
     use super::*;
 
+    /// Process V9's decode rebuilds a raw's clipped highlights its own way (headroom, rim hue), older processes'
+    /// don't; a decoded raw serves only the one it was made for, a decoded JPEG either.
+    #[test]
+    fn a_decoded_raw_serves_only_its_own_highlight_headroom() {
+        use lcc_develop::Process;
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let v9 = LoadOptions::of(&s);
+        s.process = Process::V7.version();
+        let v7 = LoadOptions::of(&s);
+        assert!(v9.highlight_headroom && !v7.highlight_headroom);
+        assert!(!LoadOptions::default().highlight_headroom);
+        let img = Arc::new(Rgb32f::filled(2, 2, [0.5; 3]));
+        // the same decode but for the headroom (the process is a decode option of its own)
+        let without = LoadOptions { highlight_headroom: false, ..v9.clone() };
+        let raw =
+            DecodedSource { options: without.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
+        // V9's rebuild (headroom, rim hue) changes the pixels, so it needs its own decode
+        assert!(raw.serves(&without));
+        assert!(!raw.serves(&v9));
+        let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
+        assert!(jpeg.serves(&v7) && jpeg.serves(&v9));
+    }
+
     /// A session with one JPEG. Each call names its own file: the decode share
     /// ([`crate::decode_share`]) is process-wide and keyed by path, so tests running in parallel
     /// must never share one (issue #1068: a test took another's decode, or lost its own).
@@ -3589,6 +3649,28 @@ mod thumbnail_hash_tests {
 mod tests {
     use super::*;
 
+    /// A raw decodes for the photo's process (a calibrated look can have an entry for newer processes only), so a
+    /// raw decoded for one process doesn't serve another; a rendered file has no camera profile and serves both.
+    #[test]
+    fn a_raw_decoded_for_one_process_does_not_serve_another() {
+        let latest = lcc_develop::DevelopSettings::default();
+        // a decode without a photo's settings names the latest process (its V9 decode switches stay off: callers
+        // that use the pixels directly keep the camera profile's tables in them, see `LoadOptions::default`)
+        assert_eq!(LoadOptions::default().process, LoadOptions::of(&latest).process);
+        assert_eq!(LoadOptions::of(&latest).process, lcc_develop::Process::LATEST.version().0);
+        let mut old = latest.clone();
+        old.process = lcc_develop::ProcessVersion(1);
+        assert_eq!(LoadOptions::of(&old).process, 1);
+        let image = Arc::new(Rgb32f::new(2, 2));
+        let mut raw = DecodedSource::new(image.clone(), Some(SourceInfo { raw: true, ..Default::default() }));
+        raw.options = LoadOptions::of(&latest);
+        assert!(raw.serves(&LoadOptions::of(&latest)));
+        assert!(!raw.serves(&LoadOptions::of(&old)));
+        let mut jpeg = DecodedSource::new(image, Some(SourceInfo::default()));
+        jpeg.options = LoadOptions::of(&latest);
+        assert!(jpeg.serves(&LoadOptions::of(&old)));
+    }
+
     /// A photo edited since its last view (an Auto Sync edit, its thumbnail built with the edit)
     /// steps in with the edit, never with the picture from before it.
     #[test]
@@ -3758,6 +3840,7 @@ mod tests {
         let id = s.active().unwrap();
         let mut job = s.render_job(id, 64, 64, false, true).unwrap();
         let loaded_info = info.clone();
+        let options = LoadOptions::of(&s.catalog.photo(id).unwrap().develop);
         job.source = SourceRef::File {
             path: "synthetic.arw".into(),
             max_edge: 64,
@@ -3768,7 +3851,7 @@ mod tests {
             })),
             fallback: None,
             denoise: None,
-            options: Default::default(),
+            options,
             reduced: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.

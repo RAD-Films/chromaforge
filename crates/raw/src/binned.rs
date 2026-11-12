@@ -15,6 +15,11 @@
 //! partly clipped without the block's green jumping to the clip level, which would read as a green
 //! speckle once reconstructed. [`RawImage::develop_binned`] instead gives such a channel the block's
 //! maximum sample of the colour, so that plain value thresholds see it as clipped.
+//!
+//! Process V9 ([`RawImage::develop_binned_masked_aligned`]) reads a Bayer mosaic's colour planes at the block centres,
+//! and at the edges of clipped areas red and blue follow green's shape across the blocks (`follow_green`): read
+//! between neighbouring blocks alone, a steep edge from dark branches to a bright sky took red from more of one side
+//! than green, and blue from more of the other, a lavender line that a full-size render doesn't have.
 
 use crate::{Normalized, RawData, RawImage, Result, Rgb32f};
 use rayon::prelude::*;
@@ -35,19 +40,28 @@ impl RawImage {
     /// applied, not oriented). `None` when the data cannot be binned ([`RawImage::can_bin`]) or its `OpcodeList3`
     /// holds an operation that needs every pixel ([`crate::opcodes::Opcode::binned`]); callers then demosaic.
     pub fn develop_binned(&self, k: usize, clip: f32) -> Result<Option<Rgb32f>> {
-        Ok(self.bin(k, clip, true)?.map(|(img, _)| img))
+        Ok(self.bin(k, clip, true, false)?.map(|(img, _)| img))
     }
 
     /// Like [`RawImage::develop_binned`], with every channel the mean of its block's samples, and the
     /// clip mask: per output pixel, bits [`crate::highlight::CLIPPED_R`] / `_G` / `_B` for the colours
     /// with a sample at or above `clip` in the block. Hand both to [`crate::highlight::reconstruct_masked`].
     pub fn develop_binned_masked(&self, k: usize, clip: f32) -> Result<Option<(Rgb32f, Vec<u8>)>> {
-        self.bin(k, clip, false)
+        self.bin(k, clip, false, false)
+    }
+
+    /// [`RawImage::develop_binned_masked`] with the colour planes of a Bayer mosaic moved onto the block's centre. Its red
+    /// and blue samples lie half a sensor pixel to either side of the centre, so on a hard edge one output row took its
+    /// red from the dark side and its blue from the bright side: a coloured line that a full-size render doesn't have.
+    /// At the edges of clipped areas red and blue also follow green's shape (`follow_green`); elsewhere, and in every
+    /// frame without a clipped sample, the blocks are the aligned means alone.
+    pub fn develop_binned_masked_aligned(&self, k: usize, clip: f32) -> Result<Option<(Rgb32f, Vec<u8>)>> {
+        self.bin(k, clip, false, true)
     }
 
     /// The binned image and its clip mask; `keep_max`: a channel with a clipped sample takes the
     /// block's maximum sample of the colour instead of the mean.
-    fn bin(&self, k: usize, clip: f32, keep_max: bool) -> Result<Option<(Rgb32f, Vec<u8>)>> {
+    fn bin(&self, k: usize, clip: f32, keep_max: bool, align: bool) -> Result<Option<(Rgb32f, Vec<u8>)>> {
         self.validate()?;
         if !self.can_bin(k) {
             return Ok(None);
@@ -127,6 +141,45 @@ impl RawImage {
                 }
             }
         });
+        if align
+            && cfa.is_bayer()
+            && let Some((layout, _)) = layouts.get((c.y % ph) * pw + c.x % pw)
+        {
+            let offsets = plane_offsets(layout, k);
+            let means = align_planes(&mut out, offsets);
+            // process V9, at the edges of clipped areas: red and blue follow green's shape ([`follow_green`])
+            if let Some(means) = means
+                && let Some(near) = near_clipped(&mask, bw, bh, REACH.div_ceil(k))
+            {
+                let (aw, ah) = (a.width, a.height);
+                // a normalised sample of the active area, mirror-reflected at its edges (which keeps the pattern)
+                let sample = |x: isize, y: isize| -> f32 {
+                    let (x, y) = (crate::demosaic::reflect(x, aw), crate::demosaic::reflect(y, ah));
+                    match (&norm, &self.data) {
+                        (Some(nm), _) => nm.data.get(y * nm.width + x).copied().unwrap_or(0.0),
+                        (None, RawData::U16(d)) if uniform_black => {
+                            d.get((a.y + y) * self.width + a.x + x).map_or(0.0, |&v| (f32::from(v) - black0) * scale)
+                        }
+                        (None, data) => {
+                            let i = (a.y + y) * self.width + a.x + x;
+                            if i < data.len() { (data.get(i) - self.black.at(x, y, 0, 1)) * scale } else { 0.0 }
+                        }
+                    }
+                };
+                // green estimated at block (bx, by)'s samples of `colour`, averaged
+                let (cx, cy) = (c.x, c.y);
+                let green_sites = |bx: usize, by: usize, colour: usize| -> f32 {
+                    let (x0, y0) = (cx + bx * k, cy + by * k);
+                    let (mut sum, mut n) = (0f32, 0f32);
+                    for (t, _) in layout.iter().enumerate().filter(|(_, l)| **l as usize == colour) {
+                        sum += green_at(&sample, (x0 + t % k) as isize, (y0 + t / k) as isize);
+                        n += 1.0;
+                    }
+                    if n > 0.0 { sum / n } else { 0.0 }
+                };
+                follow_green(&mut out, &means, offsets, &near, &green_sites);
+            }
+        }
         if list3.is_empty() {
             return Ok(Some((out, mask)));
         }
@@ -140,6 +193,206 @@ impl RawImage {
         let mask = (y0..y0 + ch).flat_map(|y| mask[y * bw + x0..y * bw + x0 + cw].iter().copied()).collect();
         Ok(Some((out.into_crop(x0, y0, cw, ch), mask)))
     }
+}
+
+/// How far each colour's samples lie from the centre of a `k × k` block, in blocks, `(x, y)`.
+fn plane_offsets(layout: &[u8], k: usize) -> [(f32, f32); 3] {
+    let centre = (k as f32 - 1.0) / 2.0;
+    std::array::from_fn(|c| {
+        let (mut x, mut y, mut n) = (0f32, 0f32, 0f32);
+        for (t, _) in layout.iter().enumerate().filter(|(_, l)| **l as usize == c) {
+            x += (t % k) as f32;
+            y += (t / k) as f32;
+            n += 1.0;
+        }
+        if n > 0.0 { ((x / n - centre) / k as f32, (y / n - centre) / k as f32) } else { (0.0, 0.0) }
+    })
+}
+
+/// How far (sensor pixels) from a clipped sample [`follow_green`] reaches: the reach of process V9's full-size demosaic
+/// near clipped samples (its candidates read 3 px around and their homogeneity 3 px more, `demosaic::ahd`). An edge
+/// in front of a clipped sky is often a few pixels short of the clipping: the sky dims toward it.
+const REACH: usize = 6;
+/// [`follow_green`] blends from the aligned means (below `.0` of the white) to green's shape (above `.1`) by how bright
+/// the green at a colour's sites is. A ratio to a green that noise dominates comes out too high on average: red went up
+/// about 4 % around glints on a dark noisy surface (catchlights in an eye), a magenta cast.
+const GUIDE_DARK: (f32, f32) = (0.03, 0.12);
+/// Added to both sides of [`follow_green`]'s ratio (of the white), so that it stays finite at black.
+const RATIO_FLOOR: f32 = 1e-3;
+/// Added to [`green_at`]'s gradients (of the white), so that a flat area weighs both directions alike.
+const GRADIENT_FLOOR: f32 = 1e-3;
+/// Block rows [`follow_green`] works on at a time (it estimates green at each needed block once per band).
+const BAND: usize = 16;
+
+/// Which blocks of a `w × h` binned image lie within `reach` blocks (a square) of both a block holding a clipped sample
+/// (`mask`) and one holding none: the edges of clipped areas, inside and out (deep inside one there is no edge, and the
+/// highlight rebuild sets the colour). `None` when no block holds a clipped sample.
+fn near_clipped(mask: &[u8], w: usize, h: usize, reach: usize) -> Option<Vec<bool>> {
+    if w == 0 || h == 0 || mask.len() != w * h {
+        return None;
+    }
+    // the rows holding a clipped block (the others are skipped)
+    let held: Vec<bool> = mask.par_chunks(w).map(|row| row.iter().any(|&m| m != 0)).collect();
+    if !held.contains(&true) {
+        return None;
+    }
+    // along the rows: how many clipped blocks lie within `reach`
+    let mut rows = vec![0u16; w * h];
+    rows.par_chunks_mut(w).zip(mask.par_chunks(w)).zip(held.par_iter()).for_each(|((dst, src), &held)| {
+        if !held {
+            return;
+        }
+        let clipped = |x: usize| u16::from(src.get(x).is_some_and(|&m| m != 0));
+        let mut count = (0..reach).fold(0u16, |n, x| n.saturating_add(clipped(x)));
+        for (x, d) in dst.iter_mut().enumerate() {
+            count = count.saturating_add(clipped(x + reach));
+            *d = count;
+            if x >= reach {
+                count = count.saturating_sub(clipped(x - reach));
+            }
+        }
+    });
+    // and down the columns: near where the square holds both kinds of block
+    let mut near = vec![false; w * h];
+    near.par_chunks_mut(w).enumerate().for_each_init(
+        || vec![0u16; w],
+        |sum, (y, dst)| {
+            let span = y.saturating_sub(reach)..(y + reach + 1).min(h);
+            if !held.get(span.clone()).is_some_and(|rows| rows.contains(&true)) {
+                return;
+            }
+            sum.iter_mut().for_each(|s| *s = 0);
+            let tall = span.len();
+            for yy in span.filter(|&yy| held.get(yy).copied().unwrap_or(false)) {
+                if let Some(src) = rows.get(yy * w..(yy + 1) * w) {
+                    for (s, &n) in sum.iter_mut().zip(src) {
+                        *s = s.saturating_add(n);
+                    }
+                }
+            }
+            for (x, (d, &n)) in dst.iter_mut().zip(sum.iter()).enumerate() {
+                let wide = (x + reach + 1).min(w) - x.saturating_sub(reach);
+                *d = n > 0 && usize::from(n) < wide * tall;
+            }
+        },
+    );
+    Some(near)
+}
+
+#[inline]
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Green estimated at the red or blue site `(x, y)` of a Bayer mosaic read through `at`: the horizontal and the vertical
+/// estimate (the mean of the two greens on either side), each weighted by how smooth its direction is (green's step
+/// across the site and the site colour's second difference), so that next to an edge it follows the side the site
+/// lies on.
+fn green_at(at: &impl Fn(isize, isize) -> f32, x: isize, y: isize) -> f32 {
+    let (l, r, u, d) = (at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1));
+    let own = 2.0 * at(x, y);
+    let dh = (l - r).abs() + (own - at(x - 2, y) - at(x + 2, y)).abs();
+    let dv = (u - d).abs() + (own - at(x, y - 2) - at(x, y + 2)).abs();
+    let (wh, wv) = (1.0 / (dh + GRADIENT_FLOOR), 1.0 / (dv + GRADIENT_FLOOR));
+    let g = ((l + r) * 0.5 * wh + (u + d) * 0.5 * wv) / (wh + wv);
+    if g.is_finite() { g } else { 0.0 }
+}
+
+/// Process V9, the blocks `near` marks (the edges of clipped areas, [`near_clipped`]): red and blue take green's shape.
+/// [`align_planes`] reads each of them between its own block's samples and the next block's, which on a steep edge
+/// takes red from more of one side than green and blue from more of the other: a lavender line where dark branches
+/// cross a bright sky at fit size (the sky near its clip, the edge's blocks holding no clipped sample themselves). Here
+/// each is the block's green (`means`, before alignment) times its ratio to green at its own sites, both read at the
+/// block's centre with [`align_planes`]' weights (`green_sites(x, y, c)`: green estimated at block `(x, y)`'s sites of
+/// colour `c`), kept within the neighbouring blocks' means and blended in by [`GUIDE_DARK`]. A ratio, not a difference:
+/// across an edge from dark to near-clip the colour's ratio to green stays put, its difference doesn't.
+fn follow_green(
+    img: &mut Rgb32f,
+    means: &Rgb32f,
+    offsets: [(f32, f32); 3],
+    near: &[bool],
+    green_sites: &(dyn Fn(usize, usize, usize) -> f32 + Sync),
+) {
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 || near.len() != w * h || means.data.len() != w * h {
+        return;
+    }
+    let at = |x: usize, y: usize| means.data.get(y * w + x).copied().unwrap_or([0.0; 3]);
+    img.data.par_chunks_mut(w * BAND).zip(near.par_chunks(w * BAND)).enumerate().for_each(|(band, (rows, near_rows))| {
+        if !near_rows.contains(&true) {
+            return;
+        }
+        // green at the sites of each block the band reads (its rows and one either side), estimated once:
+        // [red's sites, blue's sites], NaN until needed
+        let y0 = band * BAND;
+        let g0 = y0.saturating_sub(1);
+        let mut guides = vec![[f32::NAN; 2]; (BAND + 2) * w];
+        for (r, (row, near_row)) in rows.chunks_mut(w).zip(near_rows.chunks(w)).enumerate() {
+            let y = y0 + r;
+            for (x, (px, _)) in row.iter_mut().zip(near_row).enumerate().filter(|(_, (_, near))| **near) {
+                let green = at(x, y)[1];
+                for (slot, c) in [(0usize, 0usize), (1, 2)] {
+                    let Some(&(dx, dy)) = offsets.get(c) else { continue };
+                    if dx == 0.0 && dy == 0.0 {
+                        continue;
+                    }
+                    let nx = if dx > 0.0 { x.saturating_sub(1) } else { (x + 1).min(w - 1) };
+                    let ny = if dy > 0.0 { y.saturating_sub(1) } else { (y + 1).min(h - 1) };
+                    let (ax, ay) = (dx.abs(), dy.abs());
+                    let taps = [(x, y, (1.0 - ax) * (1.0 - ay)), (nx, y, ax * (1.0 - ay)), (x, ny, (1.0 - ax) * ay), (nx, ny, ax * ay)];
+                    let (mut own, mut guide, mut lo, mut hi) = (0f32, 0f32, f32::INFINITY, f32::NEG_INFINITY);
+                    for (tx, ty, k) in taps {
+                        let v = at(tx, ty)[c];
+                        own += k * v;
+                        let g = match ty.checked_sub(g0).and_then(|row| guides.get_mut(row * w + tx)) {
+                            Some(cached) if !cached[slot].is_nan() => cached[slot],
+                            Some(cached) => {
+                                cached[slot] = green_sites(tx, ty, c);
+                                cached[slot]
+                            }
+                            None => green_sites(tx, ty, c),
+                        };
+                        guide += k * g;
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                    let v = green * (own + RATIO_FLOOR) / (guide.max(0.0) + RATIO_FLOOR);
+                    if v.is_finite() {
+                        let v = crate::demosaic::clamp_between(v, lo, hi);
+                        px[c] += (v - px[c]) * smoothstep(GUIDE_DARK.0, GUIDE_DARK.1, guide);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Each colour plane read at the blocks' centres: between a block's own value (which lies `offsets` away from its
+/// centre) and the neighbouring block's on the other side of it. Returns the block means as they were (`None`: nothing
+/// to align).
+fn align_planes(img: &mut Rgb32f, offsets: [(f32, f32); 3]) -> Option<Rgb32f> {
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 || offsets.iter().all(|&(x, y)| x == 0.0 && y == 0.0) {
+        return None;
+    }
+    let src = img.clone();
+    let at = |x: usize, y: usize, c: usize| src.data.get(y * w + x).map_or(0.0, |p| p[c]);
+    img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.iter_mut().enumerate() {
+            for (c, &(dx, dy)) in offsets.iter().enumerate() {
+                if dx == 0.0 && dy == 0.0 {
+                    continue;
+                }
+                let nx = if dx > 0.0 { x.saturating_sub(1) } else { (x + 1).min(w - 1) };
+                let ny = if dy > 0.0 { y.saturating_sub(1) } else { (y + 1).min(h - 1) };
+                let (ax, ay) = (dx.abs(), dy.abs());
+                px[c] =
+                    at(x, y, c) * (1.0 - ax) * (1.0 - ay) + at(nx, y, c) * ax * (1.0 - ay) + at(x, ny, c) * (1.0 - ax) * ay + at(nx, ny, c) * ax * ay;
+            }
+        }
+    });
+    Some(src)
 }
 
 /// Colours of the `k × k` samples of a block whose corner sits at pattern position `(i, j)`
@@ -184,6 +437,22 @@ mod tests {
             metadata: Metadata::default(),
             lens_metadata: Default::default(),
         }
+    }
+
+    /// A hard edge through the middle of the blocks: the plain block has its red from above the edge and its blue from
+    /// below (the coloured line of a reduced-size render), the aligned one nearly the same in both.
+    #[test]
+    fn aligned_binning_keeps_a_hard_edge_free_of_colour() {
+        let img = Rgb32f::from_fn(24, 24, |_, y| if y < 9 { [0.02; 3] } else { [0.8; 3] });
+        let raw = raw_from(&mosaic_from_rgb(&img, &Cfa::bayer("RGGB").unwrap()), 0.0, 16383.0);
+        let plain = raw.develop_binned_masked(2, 0.99).unwrap().unwrap().0;
+        let aligned = raw.develop_binned_masked_aligned(2, 0.99).unwrap().unwrap().0;
+        let spread = |i: &Rgb32f| (i.get(5, 4)[2] - i.get(5, 4)[0]).abs();
+        assert!(spread(&plain) > 0.7, "{:?}", plain.get(5, 4));
+        assert!(spread(&aligned) < 0.6 * spread(&plain), "{:?}", aligned.get(5, 4));
+        // away from the edge nothing moves
+        assert_eq!(aligned.get(5, 1), plain.get(5, 1));
+        assert_eq!(aligned.get(5, 9), plain.get(5, 9));
     }
 
     #[test]
@@ -266,6 +535,181 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// [`RawImage::develop_binned_masked_aligned`] as it was before red and blue followed green near clipped samples:
+    /// the block means, their colour planes aligned (default crop and active area at the origin).
+    fn plain_aligned(raw: &RawImage, k: usize) -> (Rgb32f, Vec<u8>) {
+        let (mut img, mask) = raw.develop_binned_masked(k, 0.99).unwrap().unwrap();
+        let (layout, _) = super::block_layout(raw.cfa.as_ref().unwrap(), 0, 0, k);
+        super::align_planes(&mut img, super::plane_offsets(&layout, k));
+        (img, mask)
+    }
+
+    /// A dark beam across a pale blue sky that brightens away from it until green, then blue clip a few pixels from its
+    /// edges (red never does), as at the edge of a clipped sky. The edges are soft, as a lens draws them, and slanted,
+    /// so they cross the blocks at every phase, sky above one and below the other. `peak` 0.65: nothing clips.
+    fn beam(peak: f32) -> Rgb32f {
+        let (sky, dark) = ([0.38f32, 1.0, 0.82], [0.02f32, 0.045, 0.03]);
+        Rgb32f::from_fn(64, 64, |x, y| {
+            // distance out of the 10 px beam (negative inside)
+            let d = (y as f32 + 0.5 - (30.0 + x as f32 / 8.0)).abs() - 5.0;
+            let t = 0.5 + 0.5 * (d / 0.8).tanh();
+            let level = peak * (0.92 + 0.08 * d.clamp(0.0, 6.0));
+            std::array::from_fn(|c| (dark[c] + (sky[c] * level - dark[c]) * t).min(1.0))
+        })
+    }
+
+    /// Blocks on an edge (green between 15 % and 85 % of the sky's nearby) whose red or blue ratio to green lies more
+    /// than 8 % outside the range the two surfaces' samples span: colour that neither side has (the line of a fit-size
+    /// render), and the count of edge blocks.
+    fn false_colour(img: &Rgb32f) -> (usize, usize) {
+        let (mut bad, mut n) = (0, 0);
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let p = img.get(x, y);
+                let sky = (y.saturating_sub(4)..(y + 5).min(img.height)).map(|yy| img.get(x, yy)[1]).fold(1e-3, f32::max);
+                if !(0.15..0.85).contains(&(p[1] / sky)) {
+                    continue;
+                }
+                n += 1;
+                // red / green: sky 0.38 (unclipped) to 0.53 (green clipped), ceiling 0.44; blue / green: 0.67 to 1.0
+                let (rg, bg) = (p[0] / p[1], p[2] / p[1]);
+                if !(0.38 / 1.08..=0.53 * 1.08).contains(&rg) || !(0.67 / 1.08..=1.08).contains(&bg) {
+                    bad += 1;
+                }
+            }
+        }
+        (bad, n)
+    }
+
+    /// Next to a clipped sky an edge's blocks (which hold no clipped sample themselves) took red and blue from either
+    /// side of it (a lavender line at fit size); following green's shape they keep the colours of the two sides. Deep
+    /// inside the clipped sky the blocks bin exactly as before.
+    #[test]
+    fn next_to_a_clipped_sky_an_edge_keeps_its_colours() {
+        let (mut before, mut total) = (0, 0);
+        for pattern in ["RGGB", "BGGR", "GRBG", "GBRG"] {
+            let raw = raw_from(&mosaic_from_rgb(&beam(1.0), &Cfa::bayer(pattern).unwrap()), 0.0, 16383.0);
+            let (plain, mask) = plain_aligned(&raw, 2);
+            let (fixed, mask_fixed) = raw.develop_binned_masked_aligned(2, 0.99).unwrap().unwrap();
+            assert_eq!(mask, mask_fixed, "{pattern}: the clip mask is the same");
+            assert!(mask.iter().filter(|&&m| m != 0).count() > 100, "{pattern}: the sky clips");
+            let (was, n) = false_colour(&plain);
+            let (after, _) = false_colour(&fixed);
+            eprintln!("{pattern}: false colour on the edges {was} -> {after} of {n}");
+            assert!(n >= 60, "{pattern}: {n} edge blocks");
+            assert!(after * 30 <= n, "{pattern}: {after} of {n}");
+            (before, total) = (before + was, total + n);
+            // deep inside the clipped sky (every block within reach clipped): bit for bit
+            let reach = super::REACH.div_ceil(2);
+            let (w, h) = (plain.width, plain.height);
+            let mut deep = 0;
+            for y in reach..h - reach {
+                for x in reach..w - reach {
+                    if (y - reach..=y + reach).all(|yy| (x - reach..=x + reach).all(|xx| mask[yy * w + xx] != 0)) {
+                        deep += 1;
+                        assert_eq!(fixed.get(x, y), plain.get(x, y), "{pattern} ({x}, {y})");
+                    }
+                }
+            }
+            assert!(deep > 50, "{pattern}: {deep} blocks deep in the clipped sky");
+        }
+        assert!(before * 10 >= total, "plain aligned binning draws the line: {before} of {total}");
+    }
+
+    /// A frame without a clipped sample bins exactly as before, edges and all.
+    #[test]
+    fn an_unclipped_frame_bins_as_before() {
+        for pattern in ["RGGB", "GBRG"] {
+            let raw = raw_from(&mosaic_from_rgb(&beam(0.65), &Cfa::bayer(pattern).unwrap()), 0.0, 16383.0);
+            let (plain, mask) = plain_aligned(&raw, 2);
+            assert!(mask.iter().all(|&m| m == 0));
+            for k in [2, 4] {
+                let (plain, _) = if k == 2 { (plain.clone(), mask.clone()) } else { plain_aligned(&raw, k) };
+                assert_eq!(raw.develop_binned_masked_aligned(k, 0.99).unwrap().unwrap().0.data, plain.data, "{pattern} ×{k}");
+            }
+        }
+    }
+
+    /// Small clipped glints on a dark, noisy surface (catchlights in an eye): the dark blocks around them keep their
+    /// colour on average (red and blue as a ratio to a green that noise dominates would come out too high: magenta), and
+    /// blocks out of reach of every clipped sample bin exactly as before.
+    #[test]
+    fn dark_noise_around_glints_keeps_its_colour() {
+        let img = Rgb32f::from_fn(96, 64, |x, y| if x % 16 == 7 && y % 16 == 7 { [1.0; 3] } else { [0.012, 0.025, 0.018] });
+        let mut n = mosaic_from_rgb(&img, &Cfa::bayer("RGGB").unwrap());
+        // deterministic noise, about 0.004 of white per sample
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for v in n.data.iter_mut().filter(|v| **v < 0.5) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *v += ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.014;
+        }
+        let raw = raw_from(&n, 512.0, 16383.0);
+        let (plain, mask) = plain_aligned(&raw, 2);
+        let (fixed, _) = raw.develop_binned_masked_aligned(2, 0.99).unwrap().unwrap();
+        let (w, h) = (plain.width, plain.height);
+        let (mut sum_plain, mut sum_fixed, mut count) = ([0f64; 3], [0f64; 3], 0);
+        for y in 0..h {
+            for x in 0..w {
+                let near = (y.saturating_sub(3)..(y + 4).min(h)).any(|yy| (x.saturating_sub(3)..(x + 4).min(w)).any(|xx| mask[yy * w + xx] != 0));
+                let at_glint = (y.saturating_sub(1)..(y + 2).min(h)).any(|yy| (x.saturating_sub(1)..(x + 2).min(w)).any(|xx| mask[yy * w + xx] != 0));
+                if near && !at_glint {
+                    count += 1;
+                    for c in 0..3 {
+                        sum_plain[c] += plain.get(x, y)[c] as f64;
+                        sum_fixed[c] += fixed.get(x, y)[c] as f64;
+                    }
+                }
+            }
+        }
+        assert!(count > 200, "{count} dark blocks near the glints");
+        for c in [0, 2] {
+            let ratio = sum_fixed[c] / sum_plain[c];
+            eprintln!("channel {c}: mean {ratio:.4} of plain aligned");
+            assert!((ratio - 1.0).abs() < 0.01, "channel {c}: {ratio}");
+        }
+        // out of reach: bit for bit
+        let reach = super::REACH.div_ceil(2);
+        let mut far = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let near = (y.saturating_sub(reach)..(y + reach + 1).min(h))
+                    .any(|yy| (x.saturating_sub(reach)..(x + reach + 1).min(w)).any(|xx| mask[yy * w + xx] != 0));
+                if !near {
+                    far += 1;
+                    assert_eq!(fixed.get(x, y), plain.get(x, y), "({x}, {y})");
+                }
+            }
+        }
+        assert!(far > 300, "{far} blocks out of reach");
+    }
+
+    /// Clipped samples in tiny or odd-sized frames, and a float raw with non-finite samples: binning never panics.
+    #[test]
+    fn clipped_samples_in_odd_frames_never_panic() {
+        for (w, h) in [(2, 2), (4, 2), (2, 4), (6, 6), (10, 4), (4, 10)] {
+            for pattern in ["RGGB", "GBRG"] {
+                let img = Rgb32f::from_fn(w, h, |x, y| if (x + 2 * y) % 3 == 0 { [1.0; 3] } else { [0.05, 0.1, 0.07] });
+                let raw = raw_from(&mosaic_from_rgb(&img, &Cfa::bayer(pattern).unwrap()), 0.0, 4095.0);
+                for k in [2, 4] {
+                    if let Some((b, _)) = raw.develop_binned_masked_aligned(k, 0.99).unwrap() {
+                        assert!(b.data.iter().all(|p| p.iter().all(|v| v.is_finite())), "{w}×{h} {pattern} ×{k}");
+                    }
+                }
+            }
+        }
+        let n = mosaic_from_rgb(&beam(1.0), &Cfa::bayer("RGGB").unwrap());
+        let mut raw = raw_from(&n, 0.0, 16383.0);
+        let mut data = n.data.clone();
+        for (i, v) in data.iter_mut().enumerate().filter(|(i, _)| i % 97 == 0) {
+            *v = if i % 2 == 0 { f32::NAN } else { f32::INFINITY };
+        }
+        raw.data = RawData::F32(data);
+        raw.white = vec![1.0];
+        assert!(raw.develop_binned_masked_aligned(2, 0.99).unwrap().is_some());
     }
 }
 

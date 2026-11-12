@@ -75,6 +75,7 @@ pub(crate) fn ranges(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame
             crate::optics::fingerprint(src),
             format!("{frame:?}"),
             [t.to_bits(), tint.to_bits(), info.as_shot_temp.to_bits(), info.as_shot_tint.to_bits()],
+            crate::local::white_balance_key(info, s),
             ev.to_bits(),
             exposures,
         ))

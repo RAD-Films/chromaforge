@@ -65,6 +65,67 @@ fn camera_tone_and_relative_wb() {
     check("camera chroma curve edited", &src, &info, &s, &RenderRequest::fit(320, 240));
 }
 
+/// Process V9 tones a raw under a profile without a tone curve with Lightroom Classic's base curve on each linear
+/// ProPhoto channel (`FinishParams::tone_per_channel`), the middle channel kept in its place between the other two and
+/// each channel clipped at the output: the kernel must follow it (exposure +1.5 takes bright colours past the range).
+#[test]
+fn v9_lrc_base_tone_per_channel() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(2, 320, 240);
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap()
+    .under_default_curve();
+    let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+    let mut s = DevelopSettings::default();
+    assert_eq!(s.process.process(), Process::V9);
+    check("V9 base tone per channel", &src, &info, &s, &RenderRequest::fit(320, 240));
+    for (ev, contrast) in [(-1.0, 0.0), (-3.0, 25.0), (1.5, -20.0)] {
+        s.light.exposure = ev;
+        s.light.contrast = contrast;
+        s.color.saturation = 30.0;
+        check(&format!("V9 base tone per channel, exposure {ev}, contrast {contrast}"), &src, &info, &s, &RenderRequest::fit(320, 240));
+    }
+}
+
+/// Process V9's per-channel tone pulls a colour toward its own brightest channel near white (`finish::near_white`),
+/// warm hues only (magenta and blue-led ones, and those with blue well over green, are gated out): a sweep of every
+/// hue at every brightness up to past white, so the pull, its start, its fade and both gates all show in the comparison.
+#[test]
+fn v9_near_white_pull() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (360, 200);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let hue = 6.0 * x as f32 / w as f32;
+        let v = 0.05 + 1.6 * y as f32 / h as f32;
+        let s = if (y / 25) % 2 == 0 { 0.9 } else { 0.6 };
+        let f = |n: f32| {
+            let k = (n + hue) % 6.0;
+            v * (1.0 - s * (k.min(4.0 - k).clamp(0.0, 1.0)))
+        };
+        [f(5.0), f(3.0), f(1.0)]
+    }));
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap()
+    .under_default_curve();
+    let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+    let mut s = DevelopSettings::default();
+    for (ev, sat) in [(0.0, 0.0), (0.7, 0.0), (1.2, 25.0), (-0.5, 40.0)] {
+        s.light.exposure = ev;
+        s.color.saturation = sat;
+        check(&format!("V9 near white, exposure {ev}, saturation {sat}"), &src, &info, &s, &RenderRequest::fit(w, h));
+    }
+}
+
 fn scene(i: usize, w: usize, h: usize) -> Arc<Rgb32f> {
     Arc::new(lcc_scenes::demo_library()[i].render(w, h))
 }
@@ -243,6 +304,13 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.mixer.orange.hue = 30.0;
             s.mixer.green.lum = 40.0;
         }),
+        // V1–V8's band mixer (V9 measures Lightroom Classic's: the case above)
+        ("colour mixer (V8)", |s| {
+            s.process = Process::V8.version();
+            s.mixer.blue.sat = -60.0;
+            s.mixer.orange.hue = 30.0;
+            s.mixer.green.lum = 40.0;
+        }),
         ("point color", |s| {
             use lcc_develop::PointColor;
             s.point_colors = vec![
@@ -298,6 +366,32 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.hsl_curves.hue = vec![Point::new(0.55, -0.4), Point::new(0.8, 0.3)];
             s.hsl_curves.sat = vec![Point::new(0.3, -0.6)];
             s.hsl_curves.lum = vec![Point::new(0.65, 0.5)];
+        }),
+        ("colour grading (V9 split, Blending 75 and 100)", |s| {
+            s.process = lcc_develop::Process::V9.version();
+            s.grading.shadows = Wheel { hue: 18.0, sat: 30.0, lum: 0.0 };
+            s.grading.highlights = Wheel { hue: 200.0, sat: 25.0, lum: 0.0 };
+            s.grading.blending = 75.0;
+            s.grading.balance = 21.0;
+        }),
+        ("colour grading (V9 split, Blending 100)", |s| {
+            s.process = lcc_develop::Process::V9.version();
+            s.grading.shadows = Wheel { hue: 18.0, sat: 12.0, lum: 0.0 };
+            s.grading.highlights = Wheel { hue: 42.0, sat: 9.0, lum: 0.0 };
+            s.grading.blending = 100.0;
+            s.grading.balance = 21.0;
+            // the split goes on after the curves: a steep one must agree too
+            s.curve.master = vec![Point::new(0.0, 0.0), Point::new(0.3, 0.15), Point::new(0.6, 0.75), Point::new(1.0, 1.0)];
+        }),
+        ("highlights/shadows ±100 (V9 curve)", |s| {
+            s.process = lcc_develop::Process::V9.version();
+            s.light.shadows = 100.0;
+            s.light.highlights = -100.0;
+        }),
+        ("highlights/shadows (V7 response)", |s| {
+            s.process = lcc_develop::Process::V7.version();
+            s.light.shadows = 70.0;
+            s.light.highlights = -70.0;
         }),
         ("tone curves", |s| {
             s.curve.highlights = -30.0;
@@ -715,6 +809,11 @@ fn cases() -> Vec<(&'static str, Edit)> {
                 },
             ];
         }),
+        ("masks (local color mixer, V8)", |s| {
+            let edit = cases().into_iter().find(|(name, _)| *name == "masks (local color mixer)").map(|c| c.1).expect("the V9 case");
+            edit(s);
+            s.process = Process::V8.version();
+        }),
         ("masks (Lightroom brush)", |s| {
             use lcc_develop::BrushStroke;
             // overlapping soft strokes add up, a hard one, an eraser and a legacy stroke in one component
@@ -976,6 +1075,129 @@ fn clipped_highlights_stay_neutral_on_both() {
             let p = img.get(90, 120);
             assert!(p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]) <= 1, "{name} {who}: clipped light {p:?}");
         }
+    }
+}
+
+/// Process V9's extra Highlights pull next to clipped areas (`lcc_pipeline::hl_edge`): the GPU reads the same plane
+/// as the CPU, on the whole frame and on a zoomed window of it, at Highlights −100 and −50.
+#[test]
+fn v9_highlights_pull_next_to_clipped_areas_matches() {
+    if !gpu() {
+        return;
+    }
+    // a dark ground under a bright sky whose middle clips, with a cloud edge running through it
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        if y > 460 {
+            return [0.02, 0.025, 0.018];
+        }
+        let d = ((x as f32 - 480.0) / 300.0).powi(2) + ((y as f32 - 200.0) / 160.0).powi(2);
+        let cloud = if x + y / 2 > 520 { 1.0 } else { 0.55 };
+        let v = (2.6 - 2.0 * d).max(0.2) * cloud;
+        [0.9 * v, 0.95 * v, 1.1 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 300, y: 80, w: 320, h: 240 };
+    for hl in [-100.0, -50.0] {
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        s.light.highlights = hl;
+        let req = RenderRequest::fit(w, h);
+        let plan = lcc_pipeline::plan(&src, &info, &s, &req);
+        assert!(plan.edge_pull.is_some(), "Highlights {hl}: the pull is on");
+        check(&format!("V9 edge pull {hl}"), &src, &info, &s, &req);
+        check(&format!("V9 edge pull {hl} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+    }
+}
+
+/// Process V9's Highlights pull across a soft step (`hl_edge::EdgePull::across_step`): a dark beam over a clipped sky,
+/// slanted, with a few pixels of tones between them, so the edge pixels grade their pull on both renderers.
+#[test]
+fn v9_highlights_pull_grades_across_a_soft_edge() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        // the edge falls 1 px every 7, with an 8-px ramp from the beam (0.04) to the clipped sky (3.0)
+        let t = ((y as f32 - 280.0 - x as f32 / 7.0) / 8.0).clamp(0.0, 1.0);
+        let v = 0.04 + (3.0 - 0.04) * t;
+        [0.9 * v, 0.95 * v, 1.1 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 200, y: 260, w: 320, h: 160 };
+    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    s.light.highlights = -100.0;
+    let req = RenderRequest::fit(w, h);
+    assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
+    check("V9 pull across a soft edge", &src, &info, &s, &req);
+    check("V9 pull across a soft edge, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+}
+
+/// Process V9's Highlights pull inside a clipped lamp on a dim ceiling, with a glow around it: each grid cell reads
+/// its own neighbourhood by tone and the reads blend bilinearly (`hl_edge::EdgePull::at`), on both renderers.
+#[test]
+fn v9_highlights_pull_reads_a_clipped_lamp_by_cell() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (960usize, 640usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let r = ((x as f32 - 470.0).powi(2) / 1.6 + (y as f32 - 300.0).powi(2)).sqrt();
+        // a clipped disc 300 px across, a short glow, a dark ceiling
+        let v = if r < 150.0 { 1.3 } else { 0.01 + 0.3 * (-(r - 150.0) / 12.0).exp() };
+        [0.95 * v, 0.9 * v, 0.8 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 330, y: 200, w: 280, h: 200 };
+    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    s.light.highlights = -100.0;
+    let req = RenderRequest::fit(w, h);
+    assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
+    check("V9 pull in a clipped lamp", &src, &info, &s, &req);
+    check("V9 pull in a clipped lamp, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+}
+
+/// Process V9's highlight lift under a negative Exposure (`lcc_pipeline::negev_lift`): the GPU lifts the same pixels
+/// by the same table as the CPU, at −0.5, −1, −2 and −3 EV, at Highlights 0 and −50, on the whole frame, a window and
+/// under a mask's Exposure.
+#[test]
+fn v9_negative_exposure_highlight_lift_matches() {
+    if !gpu() {
+        return;
+    }
+    // a dark ground under a bright warm sky whose middle clips: every headroom from deep to past the clip
+    let (w, h) = (640usize, 480usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        if y > 380 {
+            return [0.02, 0.025, 0.018];
+        }
+        let d = ((x as f32 - 320.0) / 220.0).powi(2) + ((y as f32 - 160.0) / 130.0).powi(2);
+        let v = (6.0 * (1.0 - d)).exp2().max(0.05) * 0.2;
+        [1.1 * v, 0.95 * v, 0.8 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 200, y: 60, w: 240, h: 180 };
+    for (ev, hl) in [(-0.5, 0.0), (-1.0, 0.0), (-2.0, 0.0), (-3.0, 0.0), (-1.0, -50.0), (-3.0, -50.0)] {
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        s.light.exposure = ev;
+        s.light.highlights = hl;
+        let tone = lcc_pipeline::finish::base_tone(&s, &info, 1.0);
+        assert!(lcc_pipeline::negev_lift::NegEvLift::new(&tone, ev as f32, hl as f32).is_some(), "Exposure {ev}: the lift is on");
+        let req = RenderRequest::fit(w, h);
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl}"), &src, &info, &s, &req);
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+        s.masks = vec![Mask {
+            components: vec![MaskComponent {
+                anchor: None,
+                name: None,
+                op: MaskOp::Add,
+                invert: false,
+                shape: MaskShape::Linear { start: Point::new(0.5, 0.0), end: Point::new(0.5, 0.9) },
+            }],
+            adjust: lcc_develop::LocalAdjustments { exposure: 0.5, ..Default::default() },
+            ..Default::default()
+        }];
+        check(&format!("V9 negative-Exposure lift {ev} highlights {hl} with a mask"), &src, &info, &s, &req);
     }
 }
 
@@ -1755,6 +1977,11 @@ fn overrange_colours_match_on_every_process() {
         s.color.saturation = 40.0;
         check(&format!("{p:?} pushed past white"), &src, &raw, &s, &req);
     }
+    // a saturated ramp through the shoulder and the lightness it may not take
+    let ramp = Arc::new(Rgb32f::from_fn(640, 64, |x, _| [1.0, 0.125, 0.015].map(|t| t * (0.3 + x as f32 / 640.0 * 3.0))));
+    for p in [Process::V8, Process::V9] {
+        check(&format!("{p:?} saturated ramp"), &ramp, &raw, &DevelopSettings { process: p.version(), ..DevelopSettings::default() }, &req);
+    }
 }
 
 /// The loupe's display fit done on the device (`try_render_fitted`) gives the pixels the CPU's
@@ -2117,5 +2344,98 @@ fn dithered_gradients_match_in_phase() {
         let share = differ as f64 / cpu.data.len() as f64;
         eprintln!("dithered gradient ({:?}): {:.2} % of pixels differ", req.window, share * 100.0);
         assert!(share < 0.05, "{:.1} % of the pixels differ: the dither is out of phase", share * 100.0);
+    }
+}
+
+/// A raw source of process V9 whose camera-profile tables wait for the white balance: a hue/saturation map that
+/// shifts and saturates by hue, and a value-indexed, sRGB-coded look table (the shapes real profiles use).
+fn deferred_tables_source(gain: f32) -> SourceInfo {
+    use lcc_raw::profile::HsvTable;
+    let (h, s) = (18usize, 5usize);
+    let mut map = Vec::new();
+    for hi in 0..h {
+        for si in 0..s {
+            let a = hi as f64 / h as f64 * std::f64::consts::TAU;
+            map.extend_from_slice(&[8.0 * a.sin(), 1.0 + 0.5 * (si as f64 / (s - 1) as f64) * (1.0 + a.cos()) / 2.0, 1.0]);
+        }
+    }
+    let (lh, ls, lv) = (12usize, 4usize, 6usize);
+    let mut look = Vec::new();
+    for vi in 0..lv {
+        for hi in 0..lh {
+            for si in 0..ls {
+                let a = hi as f64 / lh as f64 * std::f64::consts::TAU;
+                look.extend_from_slice(&[-4.0 * a.cos(), 0.9 + 0.08 * si as f64, 0.92 + 0.03 * vi as f64]);
+            }
+        }
+    }
+    let mut tags = lcc_raw::ColorData {
+        illuminant: [17, 21],
+        color_matrix: [
+            Some(lcc_color::Mat3([[0.9, 0.2, -0.15], [-0.3, 1.25, 0.08], [0.02, -0.12, 0.85]])),
+            Some(lcc_color::Mat3([[0.7, 0.3, -0.1], [-0.35, 1.3, 0.1], [0.05, -0.2, 1.0]])),
+        ],
+        ..Default::default()
+    };
+    let table = HsvTable::from_tags(&[h as u64, s as u64, 1], &map, 0).expect("valid map");
+    tags.profile.hue_sat_map = [Some(table.clone()), Some(table)];
+    tags.profile.look_table = HsvTable::from_tags(&[lh as u64, ls as u64, lv as u64], &look, 1);
+    assert!(tags.profile.look_table.is_some());
+    let (temp, tint) = (5500.0, 0.0);
+    let cc = lcc_pipeline::CameraColor { tags, developed_for: lcc_color::cct::temp_tint_to_xy(temp, tint), deferred_tables_gain: Some(gain) };
+    SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, camera_color: Some(Arc::new(cc)), ..Default::default() }
+}
+
+/// Process V9 toned per ProPhoto channel: the white-balance stage clips the scene colour at ProPhoto's edge, not
+/// Rec.2020's (`local::prophoto_floor`), so a magenta light beyond ProPhoto keeps a green of exactly 0. Saturated
+/// magentas and purples with a negative Rec.2020 green, through `wb_k` and (with a profile's tables) `wb_tables_k`.
+#[test]
+fn v9_prophoto_floor_matches() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (320, 160);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let t = x as f32 / w as f32;
+        let v = 0.03 + 1.4 * y as f32 / h as f32;
+        // red-led magenta to blue-led purple, green from −0.25 of the brightest channel to +0.1
+        let g = -0.25 + 0.35 * ((y / 8) % 5) as f32 / 4.0;
+        [v * (1.0 - 0.6 * t), v * g, v * (0.4 + 0.6 * t)]
+    }));
+    let curve = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap()
+    .under_default_curve();
+    let req = RenderRequest::fit(w, h);
+    let plain = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+    let tables = SourceInfo { camera_tone: Some(curve), ..deferred_tables_source(1.0) };
+    for (name, info) in [("matrix", &plain), ("tables", &tables)] {
+        let mut s = DevelopSettings::for_raw(5500.0, 0.0);
+        assert!(lcc_pipeline::local::prophoto_floor(info, &s).is_some(), "{name}: toned per channel");
+        check(&format!("V9 ProPhoto floor, {name}"), &src, info, &s, &req);
+        s.light.exposure = 1.0;
+        (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 4200.0, 15.0);
+        check(&format!("V9 ProPhoto floor, {name}, +1 EV at 4200 K"), &src, info, &s, &req);
+    }
+}
+
+#[test]
+fn deferred_profile_tables_render_on_the_gpu() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(0, 320, 240);
+    let req = RenderRequest::fit(320, 240);
+    for gain in [1.0f32, 1.6] {
+        let info = deferred_tables_source(gain);
+        assert!(!lcc_pipeline::lin_needs_cpu(&DevelopSettings::for_raw(5500.0, 0.0), &info), "the tables have a kernel");
+        let mut s = DevelopSettings::for_raw(5500.0, 0.0);
+        check(&format!("V9 tables as shot ×{gain}"), &src, &info, &s, &req);
+        (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 3200.0, 12.0);
+        check(&format!("V9 tables 3200 K ×{gain}"), &src, &info, &s, &req);
+        typical(&mut s);
+        check(&format!("V9 tables edited ×{gain}"), &src, &info, &s, &req);
     }
 }

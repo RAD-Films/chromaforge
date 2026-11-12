@@ -1,7 +1,7 @@
 //! The per-pixel stage: everything after the spatial planes are ready, in one parallel pass.
 
 use lcc_color::luminance_2020;
-use lcc_color::spline::{Lut1, MonotoneCurve};
+use lcc_color::spline::{Lut1, MonotoneCurve, NaturalCurve};
 use lcc_color::transfer::linear_to_srgb;
 use lcc_develop::{DevelopSettings, LocalAdjustments, PointCurves, Process, ToneCurve, VignetteStyle};
 use lcc_geom::Point;
@@ -82,7 +82,7 @@ fn eval_curves(l: &[Lut1; 3], e: [f32; 3], hdr: bool) -> [f32; 3] {
 }
 
 /// Parametric region curve (encoded domain) composed with the master point curve.
-fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
+fn curve_luts(c: &ToneCurve, process: Process) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
     let master = !ToneCurve::point_curve_is_identity(&c.master);
     let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
@@ -90,7 +90,7 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         return None;
     }
     const N: usize = CURVE_LUT_N;
-    let mut base = crate::curve::ParametricCurve::new(c).to_lut();
+    let mut base = crate::curve::ParametricCurve::for_process(c, process).to_lut();
     let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
     if master {
         base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);
@@ -104,6 +104,78 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
             base.clone()
         }
     }))
+}
+
+/// Whether `process` runs the Tone Curve before the output transform, in ProPhoto ([`curves_in_prophoto`]): V9 on.
+pub fn curves_before_output(process: Process) -> bool {
+    process >= Process::V9
+}
+
+/// Process V9's Tone Curve tables: `[parametric ∘ master, red, green, blue]` (identity tables for curves left
+/// linear), or `None` while every curve is linear. Point curves are natural cubic splines, as Lightroom
+/// Classic's measure (round 18 charts); the parametric regions are V9's own table.
+pub fn curve_luts_pp(c: &ToneCurve, process: Process) -> Option<[Lut1; 4]> {
+    let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
+    let master = !ToneCurve::point_curve_is_identity(&c.master);
+    let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
+    if !parametric && !master && !chans.iter().any(|b| *b) {
+        return None;
+    }
+    const N: usize = CURVE_LUT_N;
+    let natural = |p: &[Point]| NaturalCurve::new(&p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()).to_lut(N);
+    let mut base = crate::curve::ParametricCurve::for_process(c, process).to_lut();
+    if master {
+        base = natural(&c.master).compose(&base);
+    }
+    let per = [&c.red, &c.green, &c.blue];
+    let chan = |i: usize| match per.get(i) {
+        Some(p) if chans.get(i).copied().unwrap_or(false) => natural(p),
+        _ => Lut1::identity(N),
+    };
+    Some([base, chan(0), chan(1), chan(2)])
+}
+
+/// Linear Rec.2020 (the working space) → linear ProPhoto RGB, and back.
+pub fn prophoto_matrices() -> &'static ([[f32; 3]; 3], [[f32; 3]; 3]) {
+    static M: std::sync::OnceLock<([[f32; 3]; 3], [[f32; 3]; 3])> = std::sync::OnceLock::new();
+    M.get_or_init(|| (lcc_color::REC2020.to_space(&lcc_color::PROPHOTO).to_f32(), lcc_color::PROPHOTO.to_space(&lcc_color::REC2020).to_f32()))
+}
+
+/// `l` on `v` with the HDR extension of [`eval_curves`] (slope 1 above SDR white).
+#[inline]
+fn lut_hdr(l: &Lut1, v: f32, hdr: bool) -> f32 {
+    if hdr && v > 1.0 { l.eval(1.0) + (v - 1.0) } else { l.eval(v) }
+}
+
+/// The master curve on encoded `e`, keeping its hue: the largest and smallest channels go through `l` and the middle
+/// one keeps its place between them (Lightroom Classic's RGB curve: hue shift 0.17° on the round 18 colour chart,
+/// against 1.09° when each channel takes the curve, and ΔE76 0.14 instead of 0.74).
+fn hue_keeping(l: &Lut1, e: [f32; 3], hdr: bool) -> [f32; 3] {
+    let [a, b, c] = e;
+    let (hi, lo) = (a.max(b).max(c), a.min(b).min(c));
+    let (fhi, flo) = (lut_hdr(l, hi, hdr), lut_hdr(l, lo, hdr));
+    if hi - lo <= 1e-7 {
+        return [fhi; 3];
+    }
+    let k = (fhi - flo) / (hi - lo);
+    e.map(|v| flo + (v - lo) * k)
+}
+
+/// Process V9's Tone Curve on linear Rec.2020 `d` ([`curve_luts_pp`]): to ProPhoto, sRGB-encode, the master curve
+/// keeping hue, each channel's curve, Refine Saturation, and back. Lightroom Classic's curves measure in this space
+/// (round 18: ΔE76 ≤ 0.07 on one-channel curves, against 0.8–2.4 in ProPhoto's own gamma 1.8).
+pub fn curves_in_prophoto(l: &[Lut1; 4], d: [f32; 3], hdr: bool, refine_sat: f32) -> [f32; 3] {
+    let (to_pp, from_pp) = prophoto_matrices();
+    let enc = |v: f32| if hdr && v > 1.0 { linear_to_srgb(v) } else { linear_to_srgb(v.clamp(0.0, 1.0)) };
+    let e0 = mul3(to_pp, d).map(enc);
+    let [m, r, g, b] = l;
+    let k = hue_keeping(m, e0, hdr);
+    let mut e = [lut_hdr(r, k[0], hdr), lut_hdr(g, k[1], hdr), lut_hdr(b, k[2], hdr)];
+    if refine_sat < 1.0 {
+        e = refine_saturation(e0, e, refine_sat);
+    }
+    let dec = |v: f32| if v > 1.0 { ((v + 0.055) / 1.055).powf(2.4) } else { lcc_color::transfer::srgb_to_linear(v.max(0.0)) };
+    mul3(from_pp, e.map(dec))
 }
 
 /// Vignette (post-crop) parameters.
@@ -281,12 +353,17 @@ pub struct FinishParams {
     pub local_points: Vec<Vec<crate::colorops::PointK>>,
     /// The masks' local Color Mixers, one per evaluated mask (empty when none has one,
     /// [`crate::colorops::mask_mixer_ks`]); applied before the mask's Point Color.
-    pub local_mixers: Vec<Option<crate::colorops::MixerK>>,
+    pub local_mixers: Vec<Option<crate::colorops::Mixer>>,
     /// Calibration: primaries matrix (row-major, linear Rec.2020) and shadows tint (−1..1).
     pub calib: Option<[[f32; 3]; 3]>,
     pub shadow_tint: f32,
-    /// Tone curves (parametric ∘ point, per channel) on encoded values, 1024 entries each.
+    /// Tone curves (parametric ∘ point, per channel) on encoded values, 1024 entries each. Before
+    /// process V9 only: they run on the output space's sRGB-encoded values, after the output transform.
     pub curves: Option<[Lut1; 3]>,
+    /// Process V9's tone curves ([`curve_luts_pp`]): `[parametric ∘ master, red, green, blue]`, run before the
+    /// output transform on sRGB-encoded ProPhoto values, so every export space gets the same picture
+    /// ([`curves_in_prophoto`]).
+    pub curves_pp: Option<[Lut1; 4]>,
     /// Refine Saturation as 0..1 (1 = the curves' own saturation).
     pub refine_sat: f32,
     pub vig: Option<Vig>,
@@ -299,6 +376,15 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     pub hl: f32,
     pub sh: f32,
+    /// Process V9's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
+    /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
+    /// render's plan.
+    pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
+    /// Process V9's extra Highlights pull next to clipped areas ([`crate::hl_edge`]), added to the table's shift.
+    pub edge_pull: Option<std::sync::Arc<crate::hl_edge::EdgePull>>,
+    /// Process V9's highlight lift under a negative Exposure for raws ([`crate::negev_lift`]): a lightness lift at the
+    /// tone map by each pixel's headroom under the clip, keeping its colour. `None` at Exposure 0 and above (renders bit-identical there).
+    pub negev_lift: Option<std::sync::Arc<crate::negev_lift::NegEvLift>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -312,6 +398,9 @@ pub struct FinishParams {
     pub hue_clip: bool,
     /// 8-bit output is dithered with [`bayer_dither_offset`] (process V8) instead of rounded.
     pub dither: bool,
+    /// Bright colours take the tone curve per channel ([`top_shoulder`], process V9), so they keep
+    /// their saturation near white instead of fading to it.
+    pub top_shoulder: bool,
     pub sharpen: f32,
     pub sharpen_mask: f32,
     /// Soft-clip limit (stops) of the sharpening detail term: small damps halos (Detail 0), large keeps all (100).
@@ -339,6 +428,12 @@ pub struct FinishParams {
     /// Peak linear output relative to SDR white: 1 for SDR renders; `2^max_ev` for an HDR render
     /// ([`OutputDepth::F32Hdr`] with HDR on), which keeps values above 1 instead of clipping them.
     pub peak: f32,
+    /// Process V9 tones a raw under a profile without a tone curve as Lightroom Classic does: [`ToneMap::camera_lrc`]'s
+    /// base curve on each channel in linear ProPhoto (these matrices: working space to ProPhoto and back) instead of on
+    /// luminance with the colour scaled along ([`tone_per_channel`]). `None`: on luminance. The curve takes the
+    /// brightest and darkest channel; the middle one keeps its place between them ([`tone_keeping_hue`]). Such a
+    /// render keeps a colour past the output's range as it is until the output, where each channel is clipped.
+    pub tone_per_channel: Option<[[[f32; 3]; 3]; 2]>,
 }
 
 impl FinishParams {
@@ -389,20 +484,26 @@ impl FinishParams {
         });
         let calibration = s.section_enabled("calibration");
         let peak = s.hdr.peak();
+        let per_channel = tone_per_channel(s, info, peak);
+        let tone = base_tone(s, info, peak);
+        let negev_lift = (s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info) && peak <= 1.0)
+            .then(|| crate::negev_lift::NegEvLift::new(&tone, ev, s.light.highlights as f32))
+            .flatten()
+            .map(std::sync::Arc::new);
         FinishParams {
+            // a render toned per channel already has the shoulder this step adds
+            top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info),
+            tone_per_channel: per_channel,
             peak,
-            calib: if calibration {
-                crate::colorops::calibration_matrix(&s.calibration, s.process.process() >= lcc_develop::Process::V9)
-            } else {
-                None
-            },
+            calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
-            tone: base_tone(s, info, peak),
+            tone,
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
             local_points: crate::colorops::mask_point_ks(s),
             local_mixers: crate::colorops::mask_mixer_ks(s),
-            curves: curve_luts(&s.curve),
+            curves: if curves_before_output(s.process.process()) { None } else { curve_luts(&s.curve, s.process.process()) },
+            curves_pp: if curves_before_output(s.process.process()) { curve_luts_pp(&s.curve, s.process.process()) } else { None },
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),
@@ -411,6 +512,9 @@ impl FinishParams {
             proof: None,
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
+            lift: None,
+            edge_pull: None,
+            negev_lift,
             clar,
             tex,
             dehaze,
@@ -457,21 +561,81 @@ impl FinishParams {
 /// lifts its highlights past white ([`ToneMap::camera_hdr`]), so it matches the SDR render below them.
 pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
     // the SDR rendition of an HDR edit: the HDR curve, its highlights rolled off into SDR white
-    // (issue #69); SDR edits never get here (their rolloff peak is 1)
+    // (issue #69); SDR edits never get here (their rolloff peak is 1). It keeps the HDR curve it was
+    // tuned on under every process: V9 changes only the HDR render, and this rendition already matches
+    // Lightroom Classic's SDR version of an HDR edit on real raws within 0.16 EV rms
     let rolloff = s.hdr.rolloff_peak();
     if peak <= 1.0 && rolloff > 1.0 {
-        return base_tone_at(s, info, rolloff).sdr_rolloff(rolloff);
+        return base_tone_at(s, info, rolloff, false).sdr_rolloff(rolloff);
     }
-    base_tone_at(s, info, peak)
+    base_tone_at(s, info, peak, true)
 }
 
-fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
-    let l = &s.light;
-    // a Source filter that renders a finished picture (a negative conversion) is shown as it is,
-    // like a JPEG, not toned again as a raw
-    let raw = info.raw
+/// Whether `s` tones `info`'s source as a raw (scene-referred): a Source filter that renders a finished picture (a
+/// negative conversion) is shown as it is, like a JPEG, not toned again as a raw.
+fn tones_as_raw(s: &DevelopSettings, info: &SourceInfo) -> bool {
+    info.raw
         && !(crate::plugin_filters::any_active(s)
-            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone());
+            && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone())
+}
+
+/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V9's
+/// Highlights / Shadows curve is applied in ([`crate::tone_lift`]); `None` for a display-referred source.
+pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
+    if !tones_as_raw(s, info) {
+        return None;
+    }
+    let mut d = s.clone();
+    d.light.contrast = 0.0;
+    d.light.whites = 0.0;
+    d.light.blacks = 0.0;
+    Some(base_tone_at(&d, info, 1.0, true))
+}
+
+/// [`FinishParams::tone_per_channel`]: process V9's SDR render of a raw whose tone is Lightroom Classic's base curve
+/// ([`ToneMap::camera_lrc`] under a profile without a tone curve). On LrC exports of our own R5 C frames (8 Nov 2026)
+/// the tone on each linear ProPhoto channel keeps LrC's colour where the tone on luminance did not: with the base
+/// curve, chroma within 2 % of LrC's in every tone band of 13 held-out frames (0.58–1.34 before), sunlit grass
+/// C* 32.5 vs LrC 34.1 (28.3 before), and Exposure −1 EV's partly clipped highlights keep LrC's share of colour
+/// (0.22 vs 0.25; 0.40 before). Lightness is unchanged. HDR renders keep the tone on luminance (not measured). A raw
+/// without a camera tone takes the same base curve ([`ToneMap::lrc_default`]) on luminance: its colour isn't measured.
+fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option<[[[f32; 3]; 3]; 2]> {
+    let lrc_base = s.process.process() == Process::V9
+        && peak <= 1.0
+        && tones_as_raw(s, info)
+        && info.camera_tone.as_ref().is_some_and(crate::tone::CameraTone::has_default_curve);
+    if !lrc_base {
+        return None;
+    }
+    let to = lcc_color::PROPHOTO.from_xyz().mul(&lcc_color::bradford(lcc_color::D65, lcc_color::D50)).mul(&lcc_color::REC2020.to_xyz());
+    Some([to.to_f32(), to.inverse()?.to_f32()])
+}
+
+/// Prototype (magenta near the clip): for a render toned per ProPhoto channel, the white-balance stage clips the
+/// scene colour at zero in linear ProPhoto instead of Rec.2020. Straight from the raw (the profile's matrix), a
+/// saturated magenta light has a negative ProPhoto green (−0.05 to −0.16 of its brightest channel); Lightroom Classic
+/// renders that green as exactly 0, while a clip in the narrower Rec.2020 left it 0.01–0.35 of the brightest channel.
+pub(crate) fn prophoto_floor(s: &DevelopSettings, info: &SourceInfo) -> Option<[[[f32; 3]; 3]; 2]> {
+    tone_per_channel(s, info, 1.0)
+}
+
+/// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
+/// ([`ToneMap::hdr_from_sdr`] of V9's SDR tone map); `false` keeps V9's own curves at `peak`.
+fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool) -> ToneMap {
+    let l = &s.light;
+    let raw = tones_as_raw(s, info);
+    // V9's tone at `peak`: V8's roll-off curves with Lightroom Classic's Whites on a raw and kept camera-JPEG tone
+    let v9 = |peak: f32| {
+        // a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
+        let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
+        match info.camera_tone.as_ref().filter(|_| raw) {
+            // a camera JPEG's tone kept under a profile without a curve, in Lightroom's default look
+            Some(curve) => ToneMap::camera_lrc(curve, l.contrast, whites, l.blacks, peak),
+            // a raw without a camera tone (float or merged DNGs, …): Lightroom Classic's base tone as well
+            None if raw => ToneMap::lrc_default(l.contrast, whites, l.blacks, peak),
+            None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
+        }
+    };
     match s.process.process() {
         // V2 changes the Highlights/Shadows base (`local::tone_base`), V5 the over-range colours
         // ([`hue_clip`]), V6 Denoise, V7 grain: not the tone map
@@ -484,11 +648,18 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
         }
         // a raw's tone curve rolls off into white in stops: a camera curve past its last knot, the
         // generic curve from half a stop below its white point instead of clipping (upstream #3783)
-        Process::V8 | Process::V9 => match info.camera_tone.as_ref().filter(|_| raw) {
+        Process::V8 => match info.camera_tone.as_ref().filter(|_| raw) {
             Some(curve) => ToneMap::camera_rolloff_hdr(curve, l.contrast, l.whites, l.blacks, peak),
             None if raw => ToneMap::rolloff_hdr(l.contrast, l.whites, l.blacks, peak),
             None => ToneMap::display_hdr(l.contrast, l.whites, l.blacks, peak),
         },
+        // V9: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
+        Process::V9 if !raw && peak <= 1.0 => ToneMap::display_lrc(l.contrast, l.whites, l.blacks, l.exposure),
+        // an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom. Display-referred sources
+        // (float TIFFs, JPEGs) keep the older HDR curve: it already matched LrC's within 0.2 EV on float TIFF charts,
+        // and the LrC raw tone put them 0.4-0.7 EV too bright
+        Process::V9 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&v9(1.0), peak),
+        Process::V9 => v9(peak),
     }
 }
 
@@ -555,6 +726,8 @@ pub(crate) fn finish(
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
+    fp.edge_pull = p.edge_pull.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -589,6 +762,8 @@ pub(crate) fn finish_deep(
     use lcc_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.lift = p.tone_lift.clone();
+    fp.edge_pull = p.edge_pull.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -630,6 +805,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         tone,
         ops,
         curves,
+        curves_pp,
         vig,
         to_out,
         out_luma,
@@ -652,16 +828,19 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         particles,
         ..
     } = fp;
+    // process V9's Split Toning works on the final display colour (after the curves), as LrC's does
+    let split_out = ops.split.zip(inv3(to_out));
     let dehaze_v3 = *dehaze_v3;
     let sharpen_v4 = *sharpen_v4;
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
+    let lift = fp.lift.as_deref();
     let (sharpen_limit, sharpen_fade) = (*sharpen_limit, *sharpen_fade);
     let mut terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     with_tone(&mut terms, &p.mask_tone);
     // (only when it lines up with the evaluated masks, which it does unless a caller mixed settings)
     let local_points: &[Vec<crate::colorops::PointK>] = if fp.local_points.len() == p.masks.len() { &fp.local_points } else { &[] };
-    let local_mixers: &[Option<crate::colorops::MixerK>] = if fp.local_mixers.len() == p.masks.len() { &fp.local_mixers } else { &[] };
+    let local_mixers: &[Option<crate::colorops::Mixer>] = if fp.local_mixers.len() == p.masks.len() { &fp.local_mixers } else { &[] };
     let local_curves: Vec<_> = p.masks.iter().filter_map(|m| Some((m, m.curve.as_ref()?))).collect();
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
@@ -783,7 +962,13 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let shift = l1 - l0;
             let base = p.base.data[i] + ev + shift;
             let mut delta = 0.0f32;
-            let (hh, ss) = (hl + l_hl, sh + l_sh);
+            // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
+            let (hh, ss) = if let Some(lf) = lift {
+                delta += lf.at(base) + fp.edge_pull.as_deref().map_or(0.0, |e| e.at(x, y, shift, base));
+                (l_hl, l_sh)
+            } else {
+                (hl + l_hl, sh + l_sh)
+            };
             if hh != 0.0 || ss != 0.0 {
                 let ws = 1.0 - smooth(-4.8, 0.3, base);
                 // Highlights reach down into the upper midtones and ease off towards white (fitted to
@@ -849,6 +1034,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let det = l_pre - b.data[i];
                 delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
             }
+            // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+            let lift = fp.negev_lift.as_deref().map_or(0.0, |nl| nl.at(raw));
             if delta != 0.0 {
                 let g = delta.exp2();
                 c = c.map(|v| v * g);
@@ -859,19 +1046,39 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
             }
 
-            // --- tone map on luminance, highlight desaturation
-            let yl = luminance_2020(c);
-            let o = tone.apply(yl);
-            let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
-            let k = tone.chroma_scale(o);
-            if k != 1.0 {
-                d = d.map(|v| o + (v - o) * k);
-            }
-            let mx = d[0].max(d[1]).max(d[2]);
-            if mx > peak {
-                let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
-                let grey = d.map(|v| v + (o - v) * t);
-                d = if fp.hue_clip { keep_hue(d, grey, o, peak) } else { grey };
+            // --- tone map on luminance (or per ProPhoto channel), highlight desaturation
+            let tone_map = |c: [f32; 3]| {
+                let (o, d) = match &fp.tone_per_channel {
+                    Some([to, from]) => {
+                        let d = mul3(from, near_white(tone_keeping_hue(mul3(to, c), |v| tone.apply(v)), peak));
+                        (luminance_2020(d), d)
+                    }
+                    None => {
+                        let yl = luminance_2020(c);
+                        let o = tone.apply(yl);
+                        let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
+                        let k = tone.chroma_scale(o);
+                        if k != 1.0 {
+                            d = d.map(|v| o + (v - o) * k);
+                        }
+                        (o, d)
+                    }
+                };
+                if fp.top_shoulder {
+                    let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
+                    let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
+                    hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
+                } else if fp.tone_per_channel.is_some() {
+                    // clipped per channel at the output instead (see below)
+                    d
+                } else {
+                    over_range(d, o, peak, fp.hue_clip)
+                }
+            };
+            let mut d = tone_map(c);
+            if lift > 0.0 {
+                // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+                d = crate::negev_lift::keep_colour(d, tone_map(c.map(|v| v * lift.exp2())));
             }
 
             // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
@@ -920,6 +1127,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
             }
 
+            // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+            if let Some(l) = curves_pp {
+                d = curves_in_prophoto(l, d, hdr, fp.refine_sat);
+            }
+
             // --- gamut map to the output space (desaturate towards luminance until in range);
             // soft proofing maps into the proof space first and shows that in the output space
             let mut warn = None;
@@ -940,6 +1152,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     }
                     mul3(&pp.proof_to_out, q)
                 }
+                // toned per channel: each output channel clipped, as Lightroom Classic shows bright warm light (its
+                // red at the top, green and blue as they are) instead of pulling the colour towards its luminance
+                None if fp.tone_per_channel.is_some() => mul3(to_out, d).map(|v| v.clamp(0.0, peak)),
                 None => mul3(to_out, d),
             };
             let (mapped, t) = gamut_map_to(r, *out_luma, peak);
@@ -971,6 +1186,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 if fp.refine_sat < 1.0 {
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
+            }
+            if let Some((k, from_out)) = &split_out {
+                e = split_display(k, from_out, to_out, e);
             }
             // --- the masks' local Curves, in mask order, each weighted by its mask (feather, Amount, invert and
             // combined components are all in the alpha)
@@ -1038,19 +1256,22 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 
 /// The masks' local Color Mixer and Point Color on display-linear Rec.2020 colour `d` of pixel `i`:
 /// each mask's mixer, then its samples, at the mask's opacity there (at most 1). `mixers` and
-/// `local` are each empty or one entry per mask.
+/// `local` are each empty or one entry per mask. A V9 mixer acts on the linear colour (blended by
+/// the opacity), a V1–V8 one in OkLCh like the samples.
 #[inline]
 fn local_point_colors(
     d: [f32; 3],
     i: usize,
     masks: &[crate::masks::Evaluated],
-    mixers: &[Option<crate::colorops::MixerK>],
+    mixers: &[Option<crate::colorops::Mixer>],
     local: &[Vec<crate::colorops::PointK>],
 ) -> [f32; 3] {
+    use crate::colorops::Mixer;
     use lcc_color::perceptual::{lab_to_lch, lch_to_lab, oklab_from_2020, oklab_to_2020};
-    let mut lch: Option<[f32; 3]> = None;
+    // the colour so far: linear (`d`), or in OkLCh once a sample or a V1–V8 mixer has worked on it
+    let (mut d, mut lch): ([f32; 3], Option<[f32; 3]>) = (d, None);
     for (mi, m) in masks.iter().enumerate() {
-        let mixer = mixers.get(mi).copied().flatten();
+        let mixer = mixers.get(mi).and_then(Option::as_ref);
         let points: &[crate::colorops::PointK] = local.get(mi).map_or(&[], Vec::as_slice);
         if points.is_empty() && mixer.is_none() {
             continue;
@@ -1059,8 +1280,17 @@ fn local_point_colors(
         if a <= 0.0 {
             continue;
         }
+        if let Some(Mixer::Measured(t)) = mixer {
+            if let Some(v) = lch.take() {
+                d = oklab_to_2020(lch_to_lab(v));
+            }
+            d = t.apply(d, a);
+            if points.is_empty() {
+                continue;
+            }
+        }
         let mut v = lch.unwrap_or_else(|| lab_to_lch(oklab_from_2020(d)));
-        if let Some(mk) = mixer {
+        if let Some(Mixer::Bands(mk)) = mixer {
             v = mk.apply_scaled(v, a);
         }
         for k in points {
@@ -1081,6 +1311,48 @@ const GAMUT_WARN: f32 = 0.995;
 fn out_of_gamut(r: [f32; 3], t: f32) -> bool {
     let (lo, hi) = (r[0].min(r[1]).min(r[2]), r[0].max(r[1]).max(r[2]));
     t < GAMUT_WARN && (hi - lo) > 0.02 * hi.abs().max(1e-3) && hi - lo > 1e-3 && (lo < -1e-3 || (hi > 1.0 && lo < 1.0))
+}
+
+/// Inverse of a 3×3 matrix (`None` when it is singular or not finite).
+pub fn inv3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *m;
+    let co = [e * i - f * h, f * g - d * i, d * h - e * g];
+    let det = a * co[0] + b * co[1] + c * co[2];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    let r = [
+        [co[0] / det, (c * h - b * i) / det, (b * f - c * e) / det],
+        [co[1] / det, (a * i - c * g) / det, (c * d - a * f) / det],
+        [co[2] / det, (b * g - a * h) / det, (a * e - b * d) / det],
+    ];
+    r.as_flattened().iter().all(|v| v.is_finite()).then_some(r)
+}
+
+/// The sRGB curve, odd and unbounded (curved values may leave 0..1).
+#[inline]
+fn srgb_dec_odd(v: f32) -> f32 {
+    lcc_color::transfer::srgb_to_linear(v.abs()).copysign(v)
+}
+#[inline]
+fn srgb_enc_odd(v: f32) -> f32 {
+    linear_to_srgb(v.abs()).copysign(v)
+}
+
+/// Process V9 Split Toning on a curved, sRGB-encoded colour `e` in the output primaries: its OkLab offset at the
+/// colour's own lightness (`from_out` / `to_out`: output ↔ linear Rec.2020). The GPU mirrors it in `finish.wgsl`.
+pub fn split_display(k: &crate::split_v9::SplitK, from_out: &[[f32; 3]; 3], to_out: &[[f32; 3]; 3], e: [f32; 3]) -> [f32; 3] {
+    use lcc_color::perceptual::{oklab_from_2020, oklab_to_2020};
+    let lab = oklab_from_2020(mul3(from_out, e.map(srgb_dec_odd)));
+    let o = k.offset(lab[0]);
+    let r = mul3(to_out, oklab_to_2020([lab[0] + o[0], lab[1] + o[1], lab[2] + o[2]])).map(srgb_enc_odd);
+    if r.iter().all(|v| v.is_finite()) { r } else { e }
+}
+
+/// [`mul3`] for tests in other modules.
+#[cfg(test)]
+pub(crate) fn mul3_pub(m: &[[f32; 3]; 3], d: [f32; 3]) -> [f32; 3] {
+    mul3(m, d)
 }
 
 #[inline]
@@ -1112,6 +1384,148 @@ pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
         }
     }
     if t < 1.0 { (r.map(|c| yy + (c - yy) * t), t) } else { (r, 1.0) }
+}
+
+/// Where [`top_shoulder`] acts: from nothing to full as the brightest channel after the tone map
+/// goes from the first to the second (relative to the peak), as the colour's luminance goes from
+/// the third to the fourth (relative to the peak), and as its brightest scene channel goes from
+/// the fifth to the sixth, which keeps it off colours well below the sensor's white. Fitted to Lightroom Classic exports of the user's own charts
+/// (1,704 patches, chroma by brightness; lightness held within about 0.5 L*). Mirrored in `finish.wgsl`.
+pub const TOP_SHOULDER: [f32; 6] = [0.7, 1.5, 0.6, 1.0, 0.9, 1.4];
+
+/// Process V9's bright colours: `d` (scene colour `c` tone mapped on its luminance `o`, ratios kept)
+/// moved toward `c` tone mapped per channel, as far as [`TOP_SHOULDER`] says. Per channel, the
+/// curve's shoulder compresses the brightest channel more than the others, so a bright colour
+/// keeps its saturation at about its brightness; on luminance alone its brightest channel went
+/// over white and the over-range step faded it to white (yellows and reds near white lost two
+/// thirds of their chroma against Lightroom Classic's). Greys and darker colours are unchanged.
+#[inline]
+pub fn top_shoulder(d: [f32; 3], c: [f32; 3], o: f32, peak: f32, tone: impl Fn(f32) -> f32) -> [f32; 3] {
+    let hi = d[0].max(d[1]).max(d[2]);
+    if !peak.is_finite() || peak <= 0.0 || !hi.is_finite() || !o.is_finite() {
+        return d;
+    }
+    let [k0, k1, o0, o1, s0, s1] = TOP_SHOULDER;
+    let b = smooth(k0 * peak, k1 * peak, hi) * smooth(o0 * peak, o1 * peak, o) * smooth(s0, s1, c[0].max(c[1]).max(c[2]));
+    if b <= 0.0 {
+        return d;
+    }
+    let pc = c.map(|v| tone(v.max(0.0)));
+    [d[0] + (pc[0] - d[0]) * b, d[1] + (pc[1] - d[1]) * b, d[2] + (pc[2] - d[2]) * b]
+}
+
+/// How much of a colour's luminance [`top_shoulder`] may take, against the render without it: nothing at the
+/// scene's brightest channel `[1]`, the share `[0]` from `[2]`. Slow enough that the render's own rise along an
+/// exposure ramp covers it, so lightness can't fall as the input rises. Fitted on a saturated red's ramp against
+/// Lightroom Classic exports (L* at the top of the ramp 90.2, against 90.0). Mirrored in `finish.wgsl`.
+pub const TOP_SHOULDER_HOLD: [f32; 3] = [0.12, 0.9, 1.8];
+
+/// `after` (a colour through [`top_shoulder`] and the over-range step) with the lightness it may not lose back from
+/// `before` (the same colour without the shoulder): per channel a saturated colour is darker than on luminance, and
+/// where the shoulder came in over a short stretch of an exposure ramp the brighter side rendered darker.
+#[inline]
+pub fn hold_lightness(before: [f32; 3], after: [f32; 3], scene_top: f32) -> [f32; 3] {
+    let [share, s0, s1] = TOP_SHOULDER_HOLD;
+    let (kept, got) = (luminance_2020(before), luminance_2020(after));
+    let floor = kept * (1.0 - share * smooth(s0, s1, scene_top));
+    let below = got < floor && floor.is_finite();
+    if !below {
+        return after;
+    }
+    let a = ((floor - got) / (kept - got).max(1e-6)).clamp(0.0, 1.0);
+    [after[0] + (before[0] - after[0]) * a, after[1] + (before[1] - after[1]) * a, after[2] + (before[2] - after[2]) * a]
+}
+
+/// A colour's channels brought to `peak` at most, toward its luminance `o`.
+#[inline]
+/// `p` (linear ProPhoto) through `tone` with its hue kept: the brightest and darkest channel take the curve, the middle
+/// one keeps its place between them. On each channel alone, the middle one of bright warm light (green) rose to white
+/// with red: on Lightroom Classic exports of our R5 C frames under a profile without a tone curve, warm light within a
+/// stop of clip showed L* 98–99 and C* 4–16 where Lightroom shows 80–94 and 22–64 (with the output clipped per channel,
+/// now within 1–4 L*, C* matched up to 45; above, 68–78 against 55–64).
+pub(crate) fn tone_keeping_hue(p: [f32; 3], tone: impl Fn(f32) -> f32) -> [f32; 3] {
+    let p = p.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 });
+    let mut t = p.map(&tone);
+    let hi = if p[0] >= p[1] && p[0] >= p[2] {
+        0
+    } else if p[1] >= p[2] {
+        1
+    } else {
+        2
+    };
+    let lo = if p[0] < p[1] && p[0] < p[2] {
+        0
+    } else if p[1] < p[2] {
+        1
+    } else {
+        2
+    };
+    if hi == lo {
+        return t;
+    }
+    let mid = 3 - hi - lo;
+    let (Some(&a), Some(&b), Some(&m)) = (p.get(lo), p.get(hi), p.get(mid)) else { return t };
+    let (Some(&ta), Some(&tb)) = (t.get(lo), t.get(hi)) else { return t };
+    if b > a {
+        let share = ((m - a) / (b - a)).clamp(0.0, 1.0);
+        if let Some(v) = t.get_mut(mid) {
+            *v = ta + (tb - ta) * share;
+        }
+    }
+    t
+}
+
+/// [`near_white`]: the largest pull, the brightest toned channel (relative to the peak) over which it comes in, and
+/// the colour's luminance as a share of that channel over which it comes in. Fitted on Lightroom Classic exports with
+/// the same matrix profile: 16 R5 C chart frames under amber, red, warm and magenta light (two bodies) and 92 real
+/// frames (one body), pixel pairs against our render.
+pub const NEAR_WHITE: [f32; 5] = [0.035, 0.8, 1.0, 0.28, 0.4];
+/// [`near_white`] spares magenta-led colours by their blue over green (stops, toned linear ProPhoto): none of them at
+/// `.0`, all at `.1`. The luminance gate let a bright magenta-red through (round24's magenta chart at +3.35 EV, patch
+/// 18: luminance 0.40 of its red, blue 2.2 stops over green), which Lightroom Classic keeps more saturated (C* 118; the
+/// pull left ours at 108). The pull also put its green on sRGB's edge, where noise came out as pale specks through the
+/// per-channel output clip (78 % of its pixels under sRGB green 0 and 22 % over, Lightroom's all under); spared, it
+/// comes out at C* 114 with all of them under. Its pixels' own blue over green runs from 2.0 stops (1 %) up, so the
+/// whole spare lies under that: ending it at 2.1 left 0.2 % of them pulled into pale specks, at 1.9 0.04 %. A
+/// magenta-red near white with blue 1.5 stops over green, paler in Lightroom than ours, keeps the pull (frame 4941 at
+/// +1.33 EV, patch 13); warm and red light have blue under green or about it.
+pub const NEAR_WHITE_MAGENTA: [f32; 2] = [1.6, 1.9];
+
+/// ProPhoto's luminance weights (D50 Y of its primaries).
+const PROPHOTO_Y: [f32; 3] = [0.288_040_2, 0.711_874_1, 0.000_085_7];
+
+/// A colour toned per channel in linear ProPhoto (`p`, after [`tone_keeping_hue`]) pulled toward its own brightest
+/// channel as that channel nears white: Lightroom Classic lifts the other two there (lighter and a little less
+/// saturated, hue kept), where ours stayed up to 8 C* more saturated and 2 L* darker. Colours below
+/// [`NEAR_WHITE`]'s start are unchanged, and so are colours whose luminance is small for their brightest channel
+/// (blue- and magenta-led) or whose blue lies well over green ([`NEAR_WHITE_MAGENTA`]): Lightroom keeps those as
+/// saturated as ours or more.
+#[inline]
+pub(crate) fn near_white(p: [f32; 3], peak: f32) -> [f32; 3] {
+    let hi = p[0].max(p[1]).max(p[2]);
+    if !p.iter().all(|v| v.is_finite()) || !peak.is_finite() || peak <= 0.0 || hi <= 0.0 {
+        return p;
+    }
+    let [a, k0, k1, y0, y1] = NEAR_WHITE;
+    let [m0, m1] = NEAR_WHITE_MAGENTA;
+    let y = PROPHOTO_Y[0] * p[0] + PROPHOTO_Y[1] * p[1] + PROPHOTO_Y[2] * p[2];
+    let magenta = smooth(m0, m1, (p[2].max(1e-9) / p[1].max(1e-9)).log2());
+    let t = a * smooth(k0 * peak, k1 * peak, hi) * smooth(y0, y1, y / hi) * (1.0 - magenta);
+    if t <= 0.0 {
+        return p;
+    }
+    let top = hi.min(peak);
+    p.map(|v| v + (top - v) * t)
+}
+
+fn over_range(d: [f32; 3], o: f32, peak: f32, hue_clip: bool) -> [f32; 3] {
+    let mx = d[0].max(d[1]).max(d[2]);
+    if mx <= peak {
+        return d;
+    }
+    let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+    let grey = d.map(|v| v + (o - v) * t);
+    if hue_clip { keep_hue(d, grey, o, peak) } else { grey }
 }
 
 /// Luminance (relative to the peak) from which an over-range colour fades from keeping its hue
@@ -1264,6 +1678,154 @@ fn enc(v: f32, dither: f32) -> u8 {
 mod tests {
     use super::*;
 
+    /// Process V9 tones a raw under a profile without a tone curve on each ProPhoto channel (SDR only); every other
+    /// process, source and curve keeps the tone on luminance. A grey comes out the same either way.
+    #[test]
+    fn v9_tones_lightrooms_base_curve_per_prophoto_channel() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let plain = crate::tone::CameraTone::new(knots).unwrap();
+        let raw = SourceInfo { raw: true, camera_tone: Some(plain.under_default_curve()), ..Default::default() };
+        let v9 = DevelopSettings::default();
+        assert_eq!(v9.process.process(), Process::V9);
+        let [to, from] = tone_per_channel(&v9, &raw, 1.0).expect("V9 raw under a profile without a curve");
+        let v8 = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
+        assert!(tone_per_channel(&v8, &raw, 1.0).is_none(), "V8 unchanged");
+        assert!(tone_per_channel(&v9, &raw, 4.0).is_none(), "HDR keeps the tone on luminance");
+        assert!(tone_per_channel(&v9, &SourceInfo { camera_tone: Some(plain), ..raw.clone() }, 1.0).is_none(), "a profile's own curve");
+        assert!(
+            tone_per_channel(&v9, &SourceInfo { camera_tone: None, ..raw.clone() }, 1.0).is_none(),
+            "a raw without a camera tone: base curve on luminance"
+        );
+        assert!(tone_per_channel(&v9, &SourceInfo { raw: false, ..raw.clone() }, 1.0).is_none(), "a JPEG");
+        // white stays neutral through ProPhoto, so a grey's tone is the luminance tone
+        let tone = base_tone(&v9, &raw, 1.0);
+        for g in [0.01f32, 0.18, 0.7] {
+            let d = mul3(&from, mul3(&to, [g; 3]).map(|v| tone.apply(v)));
+            for v in d {
+                assert!((v - tone.apply(g)).abs() < 1e-4, "{g}: {d:?} vs {}", tone.apply(g));
+            }
+        }
+        // a saturated colour keeps its hue's order of channels and stays in range
+        let d = mul3(&from, mul3(&to, [0.05f32, 0.2, 0.03]).map(|v| tone.apply(v.max(0.0))));
+        assert!(d[1] > d[0] && d[0] > d[2] && d.iter().all(|v| v.is_finite() && *v <= 1.0), "{d:?}");
+    }
+
+    /// Process V9 draws a raw without a camera tone (a float or merged DNG, a DNG whose profile has no curve, a body
+    /// without a fitted look) with Lightroom Classic's base tone, as it does a camera tone kept under a profile without
+    /// a curve: mid grey near LrC's display 0.45 (L* ≈ 73, measured on the hdr1 float DNG ramp), not the generic
+    /// roll-off's 0.19. V8 keeps the roll-off, a JPEG keeps its display tone.
+    #[test]
+    fn v9_raw_without_a_camera_tone_takes_lightrooms_base_tone() {
+        let dng = SourceInfo { raw: true, camera_tone: None, ..Default::default() };
+        let v9 = DevelopSettings::default();
+        assert_eq!(v9.process.process(), Process::V9);
+        let g = crate::tone::GREY;
+        let lrc = crate::tone::lrc_base(g);
+        let tone = base_tone(&v9, &dng, 1.0);
+        assert!((tone.apply(g) - lrc).abs() < 2e-3, "V9 grey {} vs base tone {lrc}", tone.apply(g));
+        assert!((0.40..0.50).contains(&tone.apply(g)), "LrC's float DNG grey is about 0.45: {}", tone.apply(g));
+        // the same tone as a camera tone kept under a profile without a curve
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let kept = SourceInfo { camera_tone: Some(crate::tone::CameraTone::new(knots).unwrap().under_default_curve()), ..dng.clone() };
+        let with_sliders = DevelopSettings { light: lcc_develop::Light { contrast: 30.0, blacks: -20.0, ..Default::default() }, ..v9.clone() };
+        for s in [&v9, &with_sliders] {
+            let (a, b) = (base_tone(s, &dng, 1.0), base_tone(s, &kept, 1.0));
+            for y in [0.002f32, 0.05, 0.18, 0.7, 3.0] {
+                assert!((a.apply(y) - b.apply(y)).abs() < 1e-6, "{y}: {} vs {}", a.apply(y), b.apply(y));
+            }
+        }
+        // V8 and a JPEG are unchanged
+        let v8 = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
+        let rolloff = crate::tone::ToneMap::rolloff_hdr(0.0, 0.0, 0.0, 1.0);
+        assert!((base_tone(&v8, &dng, 1.0).apply(g) - rolloff.apply(g)).abs() < 1e-6, "V8 keeps the roll-off");
+        assert!(rolloff.apply(g) < 0.3, "the roll-off's grey is far darker: {}", rolloff.apply(g));
+        let jpeg = SourceInfo { raw: false, ..dng };
+        assert!((base_tone(&v9, &jpeg, 1.0).apply(g) - lrc).abs() > 0.05, "a JPEG keeps its display tone");
+    }
+
+    #[test]
+    fn near_white_lifts_the_other_channels_of_a_colour_near_white_only() {
+        // below the start: unchanged
+        assert_eq!(near_white([0.7, 0.3, 0.05], 1.0), [0.7, 0.3, 0.05]);
+        // at white: the other two pulled toward the brightest by the full share, the brightest kept
+        let [a, ..] = NEAR_WHITE;
+        let r = near_white([1.0, 0.4, 0.1], 1.0);
+        assert!((r[0] - 1.0).abs() < 1e-6 && (r[1] - (0.4 + 0.6 * a)).abs() < 1e-6 && (r[2] - (0.1 + 0.9 * a)).abs() < 1e-6);
+        // over white: toward the peak, never above the brightest
+        let r = near_white([1.4, 0.5, 0.2], 1.0);
+        assert!(r[1] > 0.5 && r[1] < 1.0 && r[0] < 1.4);
+        assert_eq!(near_white([f32::NAN, 0.1, 0.2], 1.0)[1], 0.1);
+        // blue-led (little luminance for its brightest channel): unchanged
+        assert_eq!(near_white([0.3, 0.05, 1.0], 1.0), [0.3, 0.05, 1.0]);
+        // a raised peak moves the start with it
+        assert_eq!(near_white([1.0, 0.4, 0.1], 2.0), [1.0, 0.4, 0.1]);
+    }
+
+    #[test]
+    fn near_white_spares_magenta_and_blue_led_colours() {
+        // the pull on a warm colour at white, against magenta at the same brightest channel
+        let pull = |p: [f32; 3]| near_white(p, 1.0)[1] - p[1];
+        let warm = pull([1.0, 0.5, 0.0]);
+        assert!((warm - 0.5 * NEAR_WHITE[0]).abs() < 1e-6, "{warm}");
+        // red-led magenta: luminance just over the gate's start, a sliver of the pull at most
+        let magenta = pull([1.0, 0.0, 0.6]);
+        assert!((0.0..0.05 * warm).contains(&magenta), "{magenta} vs {warm}");
+        // blue-led magenta and purple: under the gate, unchanged
+        for p in [[0.8, 0.0, 1.0], [0.5, 0.05, 1.0], [0.6, 0.1, 1.2]] {
+            assert_eq!(near_white(p, 1.0), p);
+        }
+        // a bright magenta-red whose luminance passes the gate (0.40 of its red) but whose blue lies 2.2 stops over its
+        // green: unchanged (round24's patch 18, which Lightroom Classic keeps more saturated); one with blue 1.5 stops over
+        // green (paler in Lightroom) and red light with blue under green take the pull
+        assert_eq!(near_white([1.0, 0.15, 0.69], 1.0), [1.0, 0.15, 0.69]);
+        assert!(pull([1.0, 0.14, 0.39]) > 0.3 * NEAR_WHITE[0], "{}", pull([1.0, 0.14, 0.39]));
+        assert!(pull([1.0, 0.15, 0.1]) > 0.5 * NEAR_WHITE[0], "{}", pull([1.0, 0.15, 0.1]));
+    }
+
+    /// The brightest and darkest channel take the curve and the middle one keeps its place between them: on each
+    /// channel alone, the green of bright warm light rose to white with its red.
+    #[test]
+    fn tone_keeping_hue_keeps_the_middle_channels_place() {
+        let tone = |v: f32| 1.0 - (-2.0 * v).exp();
+        let p = [2.0f32, 0.9, 0.2];
+        let t = tone_keeping_hue(p, tone);
+        assert_eq!((t[0], t[2]), (tone(2.0), tone(0.2)));
+        let want = tone(0.2) + (tone(2.0) - tone(0.2)) * (0.7 / 1.8);
+        assert!((t[1] - want).abs() < 1e-6 && t[1] < tone(0.9) - 0.1, "{t:?}");
+        // a grey, two equal channels and any order of channels
+        assert_eq!(tone_keeping_hue([0.4; 3], tone), [tone(0.4); 3]);
+        assert_eq!(tone_keeping_hue([0.9, 0.9, 0.1], tone), [tone(0.9), tone(0.9), tone(0.1)]);
+        let r = tone_keeping_hue([0.2, 0.9, 2.0], tone);
+        assert!((r[1] - want).abs() < 1e-6 && r[0] == tone(0.2) && r[2] == tone(2.0), "{r:?}");
+        assert!(tone_keeping_hue([f32::NAN, -1.0, f32::INFINITY], tone).iter().all(|v| v.is_finite()));
+    }
+
+    /// Bright warm light in a V9 render under a profile without a tone curve stays coloured: red at the top, green and
+    /// blue well below it, where the tone on each channel and the pull towards luminance made it nearly white. V8
+    /// renders it exactly as before.
+    #[test]
+    fn v9_bright_warm_light_keeps_its_colour_and_v8_is_unchanged() {
+        let knots = std::array::from_fn(|i| {
+            let x = 0.002 * 1.25f32.powi(i as i32);
+            [x, 1.0 - (-2.0 * x).exp()]
+        });
+        let curve = crate::tone::CameraTone::new(knots).unwrap().under_default_curve();
+        let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
+        let src = lcc_raster::Rgb32f::filled(8, 8, [2.4, 0.9, 0.18]);
+        let at = |s: &DevelopSettings| crate::render(&src, &info, s, &crate::RenderRequest::fit(8, 8)).image.get(4, 4);
+        let v9 = at(&DevelopSettings::default());
+        // before: [255, 249, 236]
+        assert!(v9[0] == 255 && v9[1] < 225 && v9[2] < v9[1] - 15, "V9 {v9:?}");
+        let v8 = at(&DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() });
+        assert_eq!(v8, [255, 242, 239, 255], "V8 render pinned");
+    }
+
     #[test]
     fn grain_noise_is_finite_for_degenerate_coordinates() {
         for (x, y) in [(f32::NAN, 1.0), (1.0, f32::INFINITY), (f32::NEG_INFINITY, f32::NAN)] {
@@ -1284,6 +1846,47 @@ mod tests {
         assert_eq!(encode_srgb(lut, -1.0), 0.0);
         assert!((encode_srgb(lut, 2.0) - 1.0).abs() < 1e-6);
     }
+    #[test]
+    fn hold_lightness_gives_back_only_what_the_shoulder_may_not_take() {
+        let before = [1.0, 0.8, 0.8];
+        let dark = [1.0, 0.2, 0.1];
+        // below the scene gate nothing may go, and from its top the share may
+        let lum = luminance_2020;
+        assert!((lum(hold_lightness(before, dark, 0.5)) - lum(before)).abs() < 1e-5);
+        let held = hold_lightness(before, dark, 3.0);
+        assert!((lum(held) - lum(before) * (1.0 - TOP_SHOULDER_HOLD[0])).abs() < 1e-5, "{held:?}");
+        // a colour that kept its lightness is left as the shoulder made it
+        let close = [1.0, 0.75, 0.82];
+        assert_eq!(hold_lightness(before, close, 3.0), close);
+        // bad input does not spread
+        assert_eq!(hold_lightness([f32::NAN; 3], dark, 3.0), dark);
+        assert!(hold_lightness(before, dark, f32::NAN).iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn top_shoulder_moves_only_bright_colours_and_survives_bad_input() {
+        let tone = |v: f32| v / (1.0 + v) * 2.0;
+        // a grey: per channel and on luminance agree, unchanged
+        let t = tone(0.9);
+        let g = top_shoulder([t; 3], [0.9; 3], t, 1.0, tone);
+        assert!(g.iter().all(|v| (v - t).abs() < 1e-6), "{g:?}");
+        // a dark colour: untouched
+        assert_eq!(top_shoulder([0.5, 0.3, 0.1], [0.4, 0.2, 0.05], 0.3, 1.0, tone), [0.5, 0.3, 0.1]);
+        // a bright one moves toward the per-channel curve
+        let (d, c) = ([1.4, 0.9, 0.2], [2.0, 0.8, 0.12]);
+        let pc = c.map(tone);
+        let got = top_shoulder(d, c, 0.95, 1.0, tone);
+        assert!((0..3).all(|i| (got[i] - d[i]) * (pc[i] - d[i]) >= 0.0 && (got[i] - d[i]).abs() <= (pc[i] - d[i]).abs() + 1e-6), "{got:?}");
+        assert_ne!(got, d);
+        // NaN, infinities and a zero peak give the colour back
+        for (d, o, peak) in
+            [([f32::NAN, 0.5, 0.1], 0.9, 1.0), ([f32::INFINITY, 0.5, 0.1], 0.9, 1.0), ([1.4, 0.9, 0.2], f32::NAN, 1.0), ([1.4, 0.9, 0.2], 0.9, 0.0)]
+        {
+            let r = top_shoulder(d, [2.0, 0.8, 0.1], o, peak, tone);
+            assert!(r.iter().zip(d).all(|(a, b)| a.to_bits() == b.to_bits()), "{d:?} {o} {peak}: {r:?}");
+        }
+    }
+
     #[test]
     fn hue_clip_limits_the_brightest_channel_and_keeps_hue() {
         assert_eq!(hue_clip([0.9, 0.5, 0.1], 1.0), [0.9, 0.5, 0.1], "in range: unchanged");

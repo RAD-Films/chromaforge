@@ -1729,6 +1729,7 @@ fn smart_previews_keep_the_decoder_facts_offline_edits_need() {
             ..Default::default()
         },
         developed_for: lcc_color::Xy { x: 0.32, y: 0.35 },
+        deferred_tables_gain: None,
     };
     let mut mattes = Mattes::default();
     mattes.push(
@@ -3196,6 +3197,7 @@ fn smart_preview_look_marker_is_read_safely() {
     assert!(!crate::smart::look_checked(&dir), "no marker");
     let cur = crate::camera_preview::LOOK_VERSION;
     let enc = crate::smart::ENCODE_VERSION;
+    let v8 = crate::camera_preview::LOOK_VERSION_V8;
     for (text, checked) in [
         (String::new(), false),
         ("banana".into(), false),
@@ -3207,8 +3209,11 @@ fn smart_preview_look_marker_is_read_safely() {
         (format!("{cur}\n"), false),
         (format!("{cur} {}\n", enc.saturating_sub(1)), false),
         (format!("{cur} banana\n"), false),
-        (format!("{cur} {enc}\n"), true),
-        (format!(" {} {}\n", cur + 1, enc + 1), true),
+        // written before the fit of processes V1 to V8 was recorded: scanned once more, for their photos' proxies
+        (format!("{cur} {enc}\n"), false),
+        (format!("{cur} {enc} {}\n", v8 + 1), false),
+        (format!("{cur} {enc} {v8}\n"), true),
+        (format!(" {} {} {v8}\n", cur + 1, enc + 1), true),
     ] {
         std::fs::write(dir.join("look-version"), &text).unwrap();
         assert_eq!(crate::smart::look_checked(&dir), checked, "{text:?}");
@@ -4744,4 +4749,26 @@ fn reload_relinked_virtual_copy(from_copy: bool) {
         assert_eq!(s.catalog.photo(old.id).unwrap(), old, "reload remains one undo step");
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The public Panasonic DC-G9 (raw format 5, 12-bit) and DC-S1 (raw format 6, 14-bit) samples (skipped without the
+/// corpus) import as photos: the raw decoder reads them, so the import must not turn them away.
+#[test]
+fn corpus_panasonic_format_5_and_6_raws_import() {
+    let dir = lcc_brand::env_os("CORPUS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
+        .join("raw");
+    for name in ["rw2-panasonic-g9.rw2", "rw2-panasonic-s1.rw2"] {
+        let path = dir.join(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            lcc_testkit::skip!(Corpus, "{} absent", path.display());
+            return;
+        };
+        let probe = crate::files::probe_bytes(name, &bytes);
+        assert!(probe.is_ok(), "{name}: probe: {probe:?}");
+        let mut s = Session::new().with_fs();
+        let r = s.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+        assert_eq!(ids(&r, "imported"), 1, "{name}: {r}");
+    }
 }

@@ -50,6 +50,185 @@ fn lut_at(o: u32, x: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// Process V9's Highlights / Shadows shift at base tone `ev` (`tone_lift::Lift::at`).
+fn lift_at(ev: f32) -> f32 {
+    let o = pu(F_LIFT_OFF);
+    let n = pu(F_LIFT_N);
+    var f = clamp((ev - pf(F_LIFT_LO)) / pf(F_LIFT_STEP), 0.0, f32(n - 1u));
+    if (!(f == f)) {
+        f = 0.0;
+    }
+    let i = min(u32(f), n - 2u);
+    let t = f - f32(i);
+    return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
+// Grid cell `i`'s read for a pixel of tone `own`: its surroundings' tone (with `shift`) and edge pull over the 3×3 cells
+// around it, each by how close its tone is to `own`, and across a large step not scaled to a whole, the rest to the
+// pixel's own tone (`hl_edge::EdgePull::cell_read`).
+fn edge_cell_read(i: u32, wo: u32, eo: u32, so: u32, pw: u32, ph: u32, shift: f32, own: f32) -> vec2<f32> {
+    let fallback = vec2<f32>(aux[wo + i] + shift, aux[eo + i]);
+    let cx = i % pw;
+    let cy = i / pw;
+    let side = pf(F_EDGE_CELL_SIDE);
+    var sum = 0.0;
+    var s_n = 0.0;
+    var e_n = 0.0;
+    var all = 0.0;
+    var held = 0.0;
+    var s_h = 0.0;
+    var e_h = 0.0;
+    for (var dy = 0u; dy < 3u; dy++) {
+        if (cy + dy < 1u || cy + dy - 1u >= ph) {
+            continue;
+        }
+        let yy = cy + dy - 1u;
+        for (var dx = 0u; dx < 3u; dx++) {
+            if (cx + dx < 1u || cx + dx - 1u >= pw) {
+                continue;
+            }
+            let j = yy * pw + cx + dx - 1u;
+            let a = select(side, 1.0 - 2.0 * side, dx == 1u) * select(side, 1.0 - 2.0 * side, dy == 1u);
+            let t = aux[wo + j] + shift;
+            let e = aux[eo + j];
+            if (!(t == t && e == e && abs(t) < 1e30 && abs(e) < 1e30)) {
+                continue;
+            }
+            let z = min(abs((t - own) / pf(F_EDGE_READ_TONE)), 8.0);
+            let g = exp(-0.5 * z * z);
+            let k = a * (g + pf(F_EDGE_READ_FLOOR));
+            sum += k;
+            s_n += k * t;
+            e_n += k * e;
+            all += a;
+            held += a * g;
+            s_h += a * g * t;
+            e_h += a * g * e;
+        }
+    }
+    if (!(sum > 1e-30) || !(all > 0.0)) {
+        return fallback;
+    }
+    var r = vec2<f32>(s_n / sum, e_n / sum);
+    if (so != 0u) {
+        let n = pw * ph;
+        let lo = aux[so + i];
+        let hi0 = aux[so + n + i];
+        let gap = pf(F_EDGE_STEP_GAP);
+        let mix = smoothstep(gap - 0.5, gap + 0.5, hi0 - lo);
+        if (mix > 0.0) {
+            let hi = hi0 + shift;
+            let rest = max(all - held, 0.0);
+            let own_side = own + (hi - own) * smoothstep(hi - pf(F_EDGE_STEP_RAMP), hi - pf(F_EDGE_STEP_TOP), own);
+            let u = vec2<f32>((s_h + rest * own_side) / all, (e_h + rest * aux[eo + i]) / all);
+            if (u.x == u.x && u.y == u.y && abs(u.x) < 1e30 && abs(u.y) < 1e30) {
+                r += (u - r) * mix;
+            }
+        }
+    }
+    return r;
+}
+
+// Process V9's highlight lift under a negative Exposure (`negev_lift::NegEvLift::at`) for the white-balanced colour
+// `raw` before the Exposure: the table at its brightest channel's headroom under white and that channel's gap over
+// its luminance.
+fn negev_at(raw: vec3<f32>) -> f32 {
+    let m = max(raw.x, max(raw.y, raw.z));
+    if (!(m > 0.0) || !is_finite(m)) {
+        return 0.0;
+    }
+    let n = pu(F_NEGEV_N);
+    let gs = pu(F_NEGEV_GAPS);
+    let last_gap = f32(gs - 1u);
+    let y = lum2020(raw);
+    var g = last_gap;
+    if (y > 0.0) {
+        g = min(max(log2(m / y), 0.0) / pf(F_NEGEV_GAP_STEP), last_gap);
+    }
+    if (!(g == g) || !is_finite(g)) {
+        g = last_gap;
+    }
+    let h = pf(F_NEGEV_WHITE) - log2(m / GREY);
+    var f = min(max(h, 0.0) / pf(F_NEGEV_STEP), f32(n - 1u));
+    if (!(f == f)) {
+        f = f32(n - 1u);
+    }
+    let i = min(u32(f), n - 2u);
+    let j = min(u32(g), gs - 2u);
+    let t = f - f32(i);
+    let u = g - f32(j);
+    let o = pu(F_NEGEV_OFF);
+    let r0 = o + i * gs + j;
+    let r1 = r0 + gs;
+    let a = aux[r0] + (aux[r0 + 1u] - aux[r0]) * u;
+    let b = aux[r1] + (aux[r1 + 1u] - aux[r1]) * u;
+    return a + (b - a) * t;
+}
+
+// Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
+// `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V9 Highlights grid (EDGE_W × EDGE_H in aux), each
+// read by tone over its own neighbourhood (`edge_cell_read`), blended bilinearly.
+fn edge_at(x: u32, y: u32, shift: f32, own: f32) -> f32 {
+    let pw = pu(F_EDGE_W);
+    let ph = pu(F_EDGE_H);
+    if (pw == 0u || ph == 0u) {
+        return 0.0;
+    }
+    var fx = clamp((f32(pu(F_EDGE_OX) + x) + 0.5) * pf(F_EDGE_SX) - 0.5, 0.0, f32(pw - 1u));
+    var fy = clamp((f32(pu(F_EDGE_OY) + y) + 0.5) * pf(F_EDGE_SY) - 0.5, 0.0, f32(ph - 1u));
+    if (!(fx == fx)) {
+        fx = 0.0;
+    }
+    if (!(fy == fy)) {
+        fy = 0.0;
+    }
+    let x0 = u32(fx);
+    let y0 = u32(fy);
+    let x1 = min(x0 + 1u, pw - 1u);
+    let y1 = min(y0 + 1u, ph - 1u);
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let idx = array<u32, 4>(y0 * pw + x0, y0 * pw + x1, y1 * pw + x0, y1 * pw + x1);
+    let bil = array<f32, 4>((1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty);
+    let wo = pu(F_EDGE_WIDE_OFF);
+    let guided = wo != 0u && own == own && abs(own) < 1e30;
+    let eo = pu(F_EDGE_OFF);
+    let so = pu(F_EDGE_SPAN_OFF);
+    // each cell reads its own neighbourhood by tone, the four reads blend bilinearly (`hl_edge::EdgePull::at`)
+    var edge = 0.0;
+    var surround = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        if (guided) {
+            let r = edge_cell_read(idx[k], wo, eo, so, pw, ph, shift, own);
+            surround += bil[k] * r.x;
+            edge += bil[k] * r.y;
+        } else {
+            edge += bil[k] * aux[eo + idx[k]];
+            if (wo != 0u) {
+                surround += bil[k] * (aux[wo + idx[k]] + shift);
+            }
+        }
+    }
+    var v = pf(F_EDGE_GAIN) * edge;
+    if (wo != 0u) {
+        v += table_at(pu(F_EDGE_TABLE_OFF), surround);
+    }
+    return select(0.0, v, v == v);
+}
+
+// The picture's Highlights pull table (LIFT grid, at `o` in aux) at tone `ev` (`tone_lift::Lift::at`).
+fn table_at(o: u32, ev: f32) -> f32 {
+    let n = pu(F_LIFT_N);
+    var f = clamp((ev - pf(F_LIFT_LO)) / pf(F_LIFT_STEP), 0.0, f32(n - 1u));
+    if (!(f == f)) {
+        f = 0.0;
+    }
+    let i = min(u32(f), n - 2u);
+    let t = f - f32(i);
+    return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
+
 // `finish::eval_curves` on one channel: for HDR renders (`hdr`) a value above SDR white continues
 // with slope 1 from the curve's end point.
 fn lut_hdr(o: u32, x: f32, hdr: bool) -> f32 {
@@ -63,12 +242,61 @@ fn curve(ch: u32, x: f32, hdr: bool) -> f32 {
     return lut_hdr(pu(F_CURVE_OFF) + ch * CURVE_N, x, hdr);
 }
 
+// `finish::curves_in_prophoto`: process V9's Tone Curve on linear Rec.2020 `d`, before the output transform. To
+// ProPhoto and sRGB-encoded, the master table (0) keeping hue (largest and smallest channel through it, the middle
+// one keeping its place between them), each channel's table (1-3), Refine Saturation, and back.
+fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
+    let o = pu(F_PPCURVE_OFF);
+    let q = mul3(mat_at(F_PP_M), d);
+    var e0: vec3<f32>;
+    if (hdr) {
+        let c = max(q, vec3<f32>(0.0));
+        e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
+    } else {
+        let c = clamp(q, vec3<f32>(0.0), vec3<f32>(1.0));
+        e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
+    }
+    let hi = max(e0.x, max(e0.y, e0.z));
+    let lo = min(e0.x, min(e0.y, e0.z));
+    let fhi = lut_hdr(o, hi, hdr);
+    let flo = lut_hdr(o, lo, hdr);
+    var k: vec3<f32>;
+    if (hi - lo <= 1e-7) {
+        k = vec3<f32>(fhi);
+    } else {
+        k = vec3<f32>(flo) + (e0 - vec3<f32>(lo)) * ((fhi - flo) / (hi - lo));
+    }
+    var e = vec3<f32>(lut_hdr(o + CURVE_N, k.x, hdr), lut_hdr(o + 2u * CURVE_N, k.y, hdr), lut_hdr(o + 3u * CURVE_N, k.z, hdr));
+    let rs = pf(F_REFINE_SAT);
+    if (rs < 1.0) {
+        e = refine_saturation(e0, e, rs);
+    }
+    var l: vec3<f32>;
+    for (var c = 0u; c < 3u; c++) {
+        let v = e[c];
+        if (v > 1.0) {
+            l[c] = pow((v + 0.055) / 1.055, 2.4);
+        } else {
+            l[c] = srgb_to_lin(max(v, 0.0));
+        }
+    }
+    return mul3(mat_at(F_PP_INV), l);
+}
+
 // The exact sRGB curve (`lcc_color::transfer`), unbounded above 1 as HDR renders encode.
 fn lin_to_srgb(v: f32) -> f32 {
     if (v <= 0.0031308) {
         return v * 12.92;
     }
     return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+fn srgb_dec_odd(v: f32) -> f32 {
+    return sign(v) * srgb_to_lin(abs(v));
+}
+
+fn srgb_enc_odd(v: f32) -> f32 {
+    return sign(v) * lin_to_srgb(abs(v));
 }
 
 fn srgb_to_lin(v: f32) -> f32 {
@@ -156,21 +384,129 @@ fn local_mixer(o: u32, lch: vec3<f32>, strength: f32) -> vec3<f32> {
     return vec3<f32>(l, c, h);
 }
 
+// `mixer_measured::Measured::lookup`: the step whose nodes start at `aux[t]`, at hue `h`, saturation `s`, value `v`.
+fn mt_lookup(t: u32, h: f32, s: f32, v: f32) -> vec3<f32> {
+    let hw = h - 360.0 * floor(h / 360.0);
+    let fh = clamp(hw / 360.0 * f32(MT_HUES), 0.0, f32(MT_HUES));
+    let fs = clamp(s, 0.0, 1.0) * f32(MT_SATS - 1u);
+    let fv = clamp(v, 0.0, 1.0) * f32(MT_VALS - 1u);
+    let ih = min(u32(fh), MT_HUES - 1u);
+    let is_ = min(u32(fs), MT_SATS - 2u);
+    let iv = min(u32(fv), MT_VALS - 2u);
+    let th = fh - f32(ih);
+    let ts = fs - f32(is_);
+    let tv = fv - f32(iv);
+    var d = vec3<f32>(0.0);
+    for (var a = 0u; a < 2u; a++) {
+        let wh = select(1.0 - th, th, a == 1u);
+        for (var b = 0u; b < 2u; b++) {
+            let ws = select(1.0 - ts, ts, b == 1u);
+            for (var c = 0u; c < 2u; c++) {
+                let wv = select(1.0 - tv, tv, c == 1u);
+                let k = t + ((((ih + a) % MT_HUES) * MT_SATS + is_ + b) * MT_VALS + iv + c) * 3u;
+                d += (wh * ws * wv) * vec3<f32>(aux[k], aux[k + 1u], aux[k + 2u]);
+            }
+        }
+    }
+    return d;
+}
+
+// `mixer_measured::Measured::apply`: process V9's Color Mixer whose block (`Measured::matrices`, then
+// `Measured::words`) starts at `aux[o]`, on display-linear Rec.2020 `rgb` at `strength`.
+fn measured_mixer(o: u32, rgb: vec3<f32>, strength: f32) -> vec3<f32> {
+    if (strength <= 0.0) {
+        return rgb;
+    }
+    let pp = vec3<f32>(
+        aux[o] * rgb.x + aux[o + 1u] * rgb.y + aux[o + 2u] * rgb.z,
+        aux[o + 3u] * rgb.x + aux[o + 4u] * rgb.y + aux[o + 5u] * rgb.z,
+        aux[o + 6u] * rgb.x + aux[o + 7u] * rgb.y + aux[o + 8u] * rgb.z,
+    );
+    let c = max(pp, vec3<f32>(0.0));
+    let mx = max(c.x, max(c.y, c.z));
+    let dd = mx - min(c.x, min(c.y, c.z));
+    var h0 = 0.0;
+    if (dd > 0.0) {
+        if (mx == c.x) {
+            h0 = (c.y - c.z) / dd;
+            if (h0 < 0.0) {
+                h0 += 6.0;
+            }
+        } else if (mx == c.y) {
+            h0 = (c.z - c.x) / dd + 2.0;
+        } else {
+            h0 = (c.x - c.y) / dd + 4.0;
+        }
+    }
+    h0 *= 60.0;
+    var s = select(0.0, dd / mx, mx > 0.0);
+    var v = mx;
+    if (v <= 1e-6 || s <= 1e-4) {
+        return rgb;
+    }
+    var h = h0;
+    var changed = false;
+    for (var k = 0u; k < 3u; k++) {
+        let t = o + 18u + k * MT_STEP;
+        if (aux[t] == 0.0) {
+            continue;
+        }
+        let d = mt_lookup(t + 1u, h0, s, v);
+        if (all(d == vec3<f32>(0.0))) {
+            continue;
+        }
+        changed = true;
+        h += d.x;
+        s = clamp(s + d.y, 0.0, 1.0);
+        v *= exp(clamp(d.z, -20.0, 20.0));
+    }
+    if (!changed) {
+        return rgb;
+    }
+    let kk = vec3<f32>(5.0, 3.0, 1.0) + h / 60.0;
+    let km = kk - 6.0 * floor(kk / 6.0);
+    let out = v - v * s * clamp(min(km, 4.0 - km), vec3<f32>(0.0), vec3<f32>(1.0));
+    if (!all(abs(out) < vec3<f32>(1e30))) {
+        return rgb;
+    }
+    let back = vec3<f32>(
+        aux[o + 9u] * out.x + aux[o + 10u] * out.y + aux[o + 11u] * out.z,
+        aux[o + 12u] * out.x + aux[o + 13u] * out.y + aux[o + 14u] * out.z,
+        aux[o + 15u] * out.x + aux[o + 16u] * out.y + aux[o + 17u] * out.z,
+    );
+    if (strength >= 1.0) {
+        return back;
+    }
+    return rgb + (back - rgb) * strength;
+}
+
 // `finish::local_point_colors`: each mask's Color Mixer, then its Point Color samples at the mask's opacity (at most 1).
+// A V9 mixer (record word 1 = 2, its block's offset in word 2) acts on the linear colour, a V1–V8 one (word 1 = 1) in OkLCh.
 // `i`, `n`: the pixel's index in the mask planes and their stride (`main`'s `mi`, `mn`).
-fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
+fn local_point_colors(d0: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
+    var d = d0;
     var lch = vec3<f32>(0.0);
     var any = false;
     for (var m = 0u; m < pu(F_NMASK); m++) {
         let rec = pu(F_LPOINT_OFF) + m * LOCAL_POINT_WORDS;
         let np = min(u32(aux[rec]), 8u);
-        let has_mixer = aux[rec + 1u] != 0.0;
-        if (np == 0u && !has_mixer) {
+        let kind = aux[rec + 1u];
+        if (np == 0u && kind == 0.0) {
             continue;
         }
         let a = min(masks[m * n + i], 1.0);
         if (a <= 0.0) {
             continue;
+        }
+        if (kind == 2.0) {
+            if (any) {
+                d = oklab_inv(vec3<f32>(lch.x, lch.y * cos(lch.z), lch.y * sin(lch.z)));
+                any = false;
+            }
+            d = measured_mixer(bitcast<u32>(aux[rec + 2u]), d, a);
+            if (np == 0u) {
+                continue;
+            }
         }
         if (!any) {
             let lab = oklab(d);
@@ -179,7 +515,7 @@ fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
             lch = vec3<f32>(lab.x, c0, select(atan2(lab.z, lab.y), 0.0, c0 == 0.0));
             any = true;
         }
-        if (has_mixer) {
+        if (kind == 1.0) {
             lch = local_mixer(rec + 2u, lch, a);
         }
         for (var k = 0u; k < np; k++) {
@@ -229,9 +565,13 @@ fn primaries(rgb: vec3<f32>) -> vec3<f32> {
 }
 
 // `ColorOps::apply`.
-fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
+fn color_ops(rgb0: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     if (pu(F_OPS_IDENTITY) != 0u && local_sat == 0.0 && local_hue == 0.0) {
-        return rgb;
+        return rgb0;
+    }
+    var rgb = rgb0;
+    if (pu(F_MIXT) != 0u) {
+        rgb = measured_mixer(pu(F_MIXT_OFF), rgb0, 1.0);
     }
     let lab0 = oklab(rgb);
     var l = lab0.x;
@@ -318,6 +658,30 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
         }
     }
     return oklab_inv(lab);
+}
+
+// `split_v9::zone`: a profile (`SPLIT_N` floats from parameter `at`) read at lightness `x`.
+fn split_zone(at: u32, x: f32) -> f32 {
+    let f = clamp((x - SPLIT_L0) / SPLIT_DL, 0.0, f32(SPLIT_N - 1u));
+    let i = min(u32(f), SPLIT_N - 2u);
+    let u = f - f32(i);
+    let a = pf(at + i);
+    return a + (pf(at + i + 1u) - a) * u;
+}
+
+// `split_v9::SplitK::offset`: process V9's shadows and highlights wheels as an OkLab offset (L, a, b).
+fn split_offset(l: f32) -> vec3<f32> {
+    let k = F_SPLIT_K;
+    let ws = split_zone(F_SPLIT_ZSH, SPLIT_CENTRE + (l - pf(k + 6u) - SPLIT_CENTRE) / pf(k + 8u));
+    let wh = split_zone(F_SPLIT_ZHL, SPLIT_CENTRE + (l - pf(k + 7u) - SPLIT_CENTRE) / pf(k + 8u));
+    var o = ws * vec3<f32>(pf(k), pf(k + 1u), pf(k + 2u)) + wh * vec3<f32>(pf(k + 3u), pf(k + 4u), pf(k + 5u));
+    if (pf(k + 9u) > 0.0) {
+        let a = split_zone(F_SPLIT_ZMIX, l);
+        let t = clamp((l - pf(k + 16u)) / max(pf(k + 17u), 1e-3), -60.0, 60.0);
+        let s = 1.0 / (1.0 + exp(-t));
+        o += a * ((1.0 - s) * vec3<f32>(pf(k + 10u), pf(k + 11u), pf(k + 12u)) + s * vec3<f32>(pf(k + 13u), pf(k + 14u), pf(k + 15u)));
+    }
+    return o;
 }
 
 // `colorops::calibrate`: primaries matrix, then the shadows tint (luminance kept).
@@ -872,8 +1236,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shift = l1 - l0;
     let base = base_p[i] + ev + shift;
     var delta = 0.0;
-    let hh = pf(F_HL) + lt[4];
-    let ss = pf(F_SH) + lt[5];
+    var hh = pf(F_HL) + lt[4];
+    var ss = pf(F_SH) + lt[5];
+    // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
+    if (pu(F_LIFT) != 0u) {
+        delta += lift_at(base);
+        if (pu(F_EDGE_PULL) != 0u) {
+            delta += edge_at(x, y, shift, base);
+        }
+        hh = lt[4];
+        ss = lt[5];
+    }
     if (hh != 0.0 || ss != 0.0) {
         let ws = 1.0 - sstep(-4.8, 0.3, base);
         let wh = sstep(-2.4, 1.0, base) * (1.0 - 0.7 * sstep(1.4, 3.2, base));
@@ -950,6 +1323,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let det = l_pre - tex[i];
         delta -= clamp(l_noise, -1.0, 1.0) * 0.9 * det * (1.0 - sstep(0.1, 0.5, abs(det)));
     }
+    // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+    var lift = 0.0;
+    if (pu(F_NEGEV) != 0u) {
+        lift = negev_at(vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]));
+    }
     if (delta != 0.0) {
         c = c * exp2(delta);
     }
@@ -959,30 +1337,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = calibrate(c);
     }
 
-    // --- tone map on luminance, highlight desaturation
-    let yl = lum2020(c);
-    let o = tone_apply(yl);
-    var d = vec3<f32>(0.0);
-    if (yl > 1e-9) {
-        d = c * o / yl;
-    }
-    let k = chroma_scale(o);
-    if (k != 1.0) {
-        d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
-    }
+    // --- tone map on luminance (or per ProPhoto channel), highlight desaturation (`tone_map`)
     let peak = pf(F_PEAK);
     let hdr = peak > 1.0;
     let deep = pu(F_DEEP) != 0u;
-    let mx = max(d.x, max(d.y, d.z));
-    if (mx > peak) {
-        let t = clamp((mx - peak) / max(mx - o, 1e-6), 0.0, 1.0);
-        let grey = d + (o - d) * t;
-        if (pu(F_HUE_CLIP) != 0u) {
-            let kept = hue_clip(d, peak);
-            d = kept + (grey - kept) * hue_fade(o, mx, peak);
-        } else {
-            d = grey;
-        }
+    var d = tone_map(c);
+    if (lift > 0.0) {
+        // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+        d = negev_keep_colour(d, tone_map(c * exp2(lift)));
     }
 
     // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
@@ -1058,6 +1420,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+    if (pu(F_PPCURVES) != 0u) {
+        d = curves_in_prophoto(d, hdr);
+    }
+
     // --- gamut map to the output space (desaturate towards luminance until in range);
     // soft proofing maps into the proof space first and shows that in the output space
     // (warn: 0 none, 1 destination gamut, 2 display gamut)
@@ -1073,6 +1440,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         r = mul3(mat_at(F_PROOF_OUT), keep_hue_in_gamut(q0, gamut_apply(q0, py, tq, peak), py, peak));
     } else {
         r = mul3(mat_at(F_OUT_M), d);
+        if (pu(F_TONE_PC) != 0u) {
+            r = clamp(r, vec3<f32>(0.0), vec3<f32>(peak));
+        }
     }
     let oy = vec3<f32>(pf(F_OUT_Y), pf(F_OUT_Y + 1u), pf(F_OUT_Y + 2u));
     let tg = gamut_scale(r, oy, peak);
@@ -1099,6 +1469,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rs = pf(F_REFINE_SAT);
         if (rs < 1.0) {
             e = refine_saturation(e0, e, rs);
+        }
+    }
+    // --- process V9 Split Toning on the curved display colour (`finish::split_display`)
+    if (pu(F_SPLIT) != 0u) {
+        let lin = vec3<f32>(srgb_dec_odd(e.x), srgb_dec_odd(e.y), srgb_dec_odd(e.z));
+        let lab = oklab(mul3(mat_at(F_OUT_INV), lin));
+        let q = mul3(mat_at(F_OUT_M), oklab_inv(lab + split_offset(lab.x)));
+        let s = vec3<f32>(srgb_enc_odd(q.x), srgb_enc_odd(q.y), srgb_enc_odd(q.z));
+        if (all(s == s) && all(abs(s) < vec3<f32>(1e30))) {
+            e = s;
         }
     }
     // --- the masks' local Curves, in mask order, each weighted by its mask (`finish::local_curve_luts`)
@@ -1239,6 +1619,152 @@ fn nan_min(a: f32, b: f32) -> f32 {
 // `finish::HUE_FADE_FROM` and `HUE_FADE_EV` (keep in step)
 const HUE_FADE_FROM: f32 = 0.35;
 const HUE_FADE_EV: f32 = 0.5;
+
+// `finish::TOP_SHOULDER`
+const TOP_SHOULDER: vec4<f32> = vec4<f32>(0.7, 1.5, 0.6, 1.0);
+const TOP_SHOULDER_SCENE: vec2<f32> = vec2<f32>(0.9, 1.4);
+
+// `finish::tone_keeping_hue`: the brightest and darkest channel take the tone curve, the middle one keeps its place
+// The tone map of scene colour `c` on luminance (or per ProPhoto channel, `FinishParams::tone_per_channel`), with the
+// highlight desaturation (`finish`'s `tone_map` on the CPU).
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    var o = 0.0;
+    var d = vec3<f32>(0.0);
+    if (pu(F_TONE_PC) != 0u) {
+        let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
+        d = mul3(mat_at(F_TONE_PC_FROM), near_white(tone_keeping_hue(q), pf(F_PEAK)));
+        o = lum2020(d);
+    } else {
+        let yl = lum2020(c);
+        o = tone_apply(yl);
+        if (yl > 1e-9) {
+            d = c * o / yl;
+        }
+        let k = chroma_scale(o);
+        if (k != 1.0) {
+            d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+        }
+    }
+    let peak = pf(F_PEAK);
+    if (pu(F_TOP_SHOULDER) != 0u) {
+        let moved = top_shoulder(d, c, o, peak);
+        d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
+    } else if (pu(F_TONE_PC) == 0u) {
+        // (toned per channel: clipped per channel at the output instead)
+        d = over_range(d, o, peak);
+    }
+    return d;
+}
+
+// `negev_lift::keep_colour`: `plain` brightened to the luminance of `lifted`, moving over to `lifted` past white.
+fn negev_keep_colour(plain: vec3<f32>, lifted: vec3<f32>) -> vec3<f32> {
+    let y0 = lum2020(plain);
+    let y1 = lum2020(lifted);
+    let top = max(plain.x, max(plain.y, plain.z));
+    if (!is_finite(y0) || !is_finite(y1) || !is_finite(top) || y0 <= 1e-9 || y1 <= y0) {
+        return lifted;
+    }
+    let k = y1 / y0;
+    let w = clamp((top * k - 0.95) / 0.1, 0.0, 1.0);
+    return plain * k + (lifted - plain * k) * w;
+}
+
+fn tone_keeping_hue(p: vec3<f32>) -> vec3<f32> {
+    var t = vec3<f32>(tone_apply(p.x), tone_apply(p.y), tone_apply(p.z));
+    var hi = 2u;
+    if (p.x >= p.y && p.x >= p.z) {
+        hi = 0u;
+    } else if (p.y >= p.z) {
+        hi = 1u;
+    }
+    var lo = 2u;
+    if (p.x < p.y && p.x < p.z) {
+        lo = 0u;
+    } else if (p.y < p.z) {
+        lo = 1u;
+    }
+    if (hi == lo) {
+        return t;
+    }
+    let mid = 3u - hi - lo;
+    let a = p[lo];
+    let b = p[hi];
+    if (b > a) {
+        let share = clamp((p[mid] - a) / (b - a), 0.0, 1.0);
+        t[mid] = t[lo] + (t[hi] - t[lo]) * share;
+    }
+    return t;
+}
+
+// `finish::NEAR_WHITE` (largest pull; brightest channel over which it comes in, times the peak; luminance share)
+const NEAR_WHITE_A: f32 = 0.035;
+const NEAR_WHITE_K: vec2<f32> = vec2<f32>(0.8, 1.0);
+const NEAR_WHITE_Y: vec2<f32> = vec2<f32>(0.28, 0.4);
+// `finish::NEAR_WHITE_MAGENTA` (blue over green in stops: from none to all of the pull spared)
+const NEAR_WHITE_MAGENTA: vec2<f32> = vec2<f32>(1.6, 1.9);
+// `finish::PROPHOTO_Y`
+const PROPHOTO_Y: vec3<f32> = vec3<f32>(0.2880402, 0.7118741, 0.0000857);
+
+// `finish::near_white`: a colour toned per channel pulled toward its own brightest channel as that nears white
+fn near_white(p: vec3<f32>, peak: f32) -> vec3<f32> {
+    let hi = max(p.x, max(p.y, p.z));
+    let finite = all(p == p) && all(abs(p) <= vec3<f32>(3.4e38)) && peak == peak && peak <= 3.4e38;
+    if (!finite || !(peak > 0.0) || !(hi > 0.0)) {
+        return p;
+    }
+    let magenta = sstep(NEAR_WHITE_MAGENTA.x, NEAR_WHITE_MAGENTA.y, log2(max(p.z, 1e-9) / max(p.y, 1e-9)));
+    let t = NEAR_WHITE_A * sstep(NEAR_WHITE_K.x * peak, NEAR_WHITE_K.y * peak, hi)
+        * sstep(NEAR_WHITE_Y.x, NEAR_WHITE_Y.y, dot(PROPHOTO_Y, p) / hi) * (1.0 - magenta);
+    if (!(t > 0.0)) {
+        return p;
+    }
+    return p + (vec3<f32>(min(hi, peak)) - p) * t;
+}
+
+// `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V9)
+fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
+    let hi = max(d.x, max(d.y, d.z));
+    if (!(peak > 0.0)) {
+        return d;
+    }
+    let b = sstep(TOP_SHOULDER.x * peak, TOP_SHOULDER.y * peak, hi) * sstep(TOP_SHOULDER.z * peak, TOP_SHOULDER.w * peak, o)
+        * sstep(TOP_SHOULDER_SCENE.x, TOP_SHOULDER_SCENE.y, max(c.x, max(c.y, c.z)));
+    if (!(b > 0.0)) {
+        return d;
+    }
+    let pc = vec3<f32>(tone_apply(max(c.x, 0.0)), tone_apply(max(c.y, 0.0)), tone_apply(max(c.z, 0.0)));
+    return d + (pc - d) * b;
+}
+
+// `finish::TOP_SHOULDER_HOLD`
+const TOP_SHOULDER_HOLD: vec3<f32> = vec3<f32>(0.12, 0.9, 1.8);
+
+// `finish::hold_lightness`
+fn hold_lightness(before: vec3<f32>, after: vec3<f32>, scene_top: f32) -> vec3<f32> {
+    let kept = lum2020(before);
+    let got = lum2020(after);
+    let floor_y = kept * (1.0 - TOP_SHOULDER_HOLD.x * sstep(TOP_SHOULDER_HOLD.y, TOP_SHOULDER_HOLD.z, scene_top));
+    if (!(got < floor_y)) {
+        return after;
+    }
+    let a = clamp((floor_y - got) / max(kept - got, 1e-6), 0.0, 1.0);
+    return after + (before - after) * a;
+}
+
+// `finish::over_range`
+fn over_range(d: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
+    let mx = max(d.x, max(d.y, d.z));
+    if (!(mx > peak)) {
+        return d;
+    }
+    let t = clamp((mx - peak) / max(mx - o, 1e-6), 0.0, 1.0);
+    let grey = d + (o - d) * t;
+    if (pu(F_HUE_CLIP) != 0u) {
+        let kept = hue_clip(d, peak);
+        return kept + (grey - kept) * hue_fade(o, mx, peak);
+    }
+    return grey;
+}
 
 // `finish::hue_fade`
 fn hue_fade(y: f32, hi: f32, peak: f32) -> f32 {

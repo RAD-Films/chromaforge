@@ -25,7 +25,8 @@ const MAX_PIXELS: usize = crate::run::MAX_PIXELS;
 /// Rows per strip: about a megapixel of three planes at 24 MP widths.
 const STRIP_ROWS: usize = 128;
 /// Bumped when the meaning of a product changes (included in keys by the caller).
-pub const ALGORITHM: u32 = 1;
+/// 2: products of Sony "12-bit uncompressed" ARWs normalized on the brightness-dependent scale are refreshed (upstream #3429).
+pub const ALGORITHM: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProductError {

@@ -541,6 +541,9 @@ fn all_masks_overlay_outlines_every_visible_mask_but_only_the_selected_one_is_dr
 #[test]
 fn all_masks_overlay_paints_the_outline_of_an_unselected_mask() {
     let mut h = detail("panel.masking");
+    // a darkened photo: under process V9's base tone the demo's sky is near white, which hides a white outline and
+    // which the overlay's red fill takes white pixels away from
+    exec(&mut h, "develop.set", json!({"control": "light.exposure", "value": -2.0}));
     exec(&mut h, "mask.add", json!({"kind": "radial", "center": [0.3, 0.5], "rx": 0.12, "ry": 0.12}));
     exec(&mut h, "mask.add", json!({"kind": "radial", "center": [0.7, 0.5], "rx": 0.12, "ry": 0.12}));
     assert_eq!(h.app.session.active_mask, Some(2));

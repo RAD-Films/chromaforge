@@ -2,10 +2,10 @@
 //! mixer, B&W mix, and 3-way colour grading; plus the camera-calibration matrix (scene linear).
 
 use std::f32::consts::{PI, TAU};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use lcc_color::perceptual::{hsv_to_rgb, lab_to_lch, lch_to_lab, oklab_from_2020, oklab_to_2020};
-use lcc_color::{Mat3, REC2020, SRGB};
+use lcc_color::{D50, D65, Mat3, PROPHOTO, REC2020, SRGB, Xy, bradford};
 use lcc_develop::{Calibration, DevelopSettings, MIXER_HUES, PointColor};
 
 /// OkLCh hue angle (radians) of a pure sRGB colour with HSV hue `deg`.
@@ -268,14 +268,38 @@ pub fn mixer_apply(hue: &[f32; 8], sat: &[f32; 8], lum: &[f32; 8], lch: [f32; 3]
     [l, c, h]
 }
 
+/// A Color Mixer as a rendering process applies it: V1–V8's band shifts in OkLCh ([`MixerK`]),
+/// from V9 Lightroom Classic's measured response ([`crate::mixer_measured`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mixer {
+    Bands(MixerK),
+    Measured(Arc<crate::mixer_measured::Measured>),
+}
+
+impl Mixer {
+    /// The mixer `m` as `process` renders it; `None` when it changes nothing.
+    pub fn new(m: &lcc_develop::Mixer, process: lcc_develop::Process) -> Option<Mixer> {
+        if m.is_neutral() {
+            return None;
+        }
+        if process >= lcc_develop::Process::V9 {
+            let bands = m.bands();
+            let fin = |v: f64| if v.is_finite() { (v / 100.0) as f32 } else { 0.0 };
+            return crate::mixer_measured::measured(&bands.map(|b| fin(b.hue)), &bands.map(|b| fin(b.sat)), &bands.map(|b| fin(b.lum)))
+                .map(Mixer::Measured);
+        }
+        Some(Mixer::Bands(MixerK::new(m)))
+    }
+}
+
 /// The masks' local Color Mixers, one per mask the per-pixel stage evaluates (`None`: neutral);
 /// empty when no mask has one, and in a black-and-white rendition (as the global mixer).
-pub fn mask_mixer_ks(s: &DevelopSettings) -> Vec<Option<MixerK>> {
+pub fn mask_mixer_ks(s: &DevelopSettings) -> Vec<Option<Mixer>> {
     if crate::is_bw(s) {
         return Vec::new();
     }
-    let v: Vec<Option<MixerK>> =
-        s.masks.iter().filter(|m| m.visible && !m.components.is_empty()).map(|m| (!m.mixer.is_neutral()).then(|| MixerK::new(&m.mixer))).collect();
+    let process = s.process.process();
+    let v: Vec<Option<Mixer>> = s.masks.iter().filter(|m| m.visible && !m.components.is_empty()).map(|m| Mixer::new(&m.mixer, process)).collect();
     if v.iter().all(Option::is_none) { Vec::new() } else { v }
 }
 
@@ -287,7 +311,10 @@ pub struct ColorOps {
     pub hue: [f32; 8],
     pub sat: [f32; 8],
     pub lum: [f32; 8],
+    /// A V1–V8 mixer ([`MixerK`]: `hue`, `sat`, `lum`) changes something.
     pub mixer: bool,
+    /// A V9 mixer (applied first, to the linear colour).
+    pub measured: Option<Arc<crate::mixer_measured::Measured>>,
     /// Point Color samples that change something (applied after the mixer).
     pub points: Vec<PointK>,
     pub bw: Option<[f32; 8]>,
@@ -298,6 +325,10 @@ pub struct ColorOps {
     pub primaries: Option<PrimariesK>,
     /// The HSL curves ([`HslK`]), applied after the colour mixer on the same OkLCh values.
     pub hsl: Option<HslK>,
+    /// Process V9: the shadows and highlights wheels' colour as Lightroom Classic applies it
+    /// ([`crate::split_v9`]); their colour terms in [`Self::grading`] are then zero. Not applied by
+    /// [`Self::apply`]: the finish adds it to the final display colour, after the tone curves.
+    pub split: Option<crate::split_v9::SplitK>,
     /// OkLCh hue of skin tones (protected by vibrance).
     pub skin: f32,
 }
@@ -310,26 +341,33 @@ pub fn wheel(w: &lcc_develop::Wheel) -> WheelK {
 
 impl ColorOps {
     pub fn new(s: &DevelopSettings) -> ColorOps {
-        let mk = MixerK::new(&s.mixer);
+        let (mk, measured) = match Mixer::new(&s.mixer, s.process.process()) {
+            Some(Mixer::Bands(k)) => (k, None),
+            Some(Mixer::Measured(m)) => (MixerK::default(), Some(m)),
+            None => (MixerK::new(&s.mixer), None),
+        };
         let g = &s.grading;
+        let split = if s.process.process() >= lcc_develop::Process::V9 { crate::split_v9::SplitK::new(g) } else { None };
         ColorOps {
             vibrance: (s.color.vibrance / 100.0) as f32,
             saturation: (s.color.saturation / 100.0) as f32,
             hue: mk.hue,
             sat: mk.sat,
             lum: mk.lum,
-            mixer: !s.mixer.is_neutral(),
+            mixer: !s.mixer.is_neutral() && measured.is_none(),
+            measured,
             points: if crate::is_bw(s) { Vec::new() } else { point_ks(&s.point_colors) },
             bw: crate::is_bw(s).then(|| s.bw_mix.bands().map(|v| (v / 100.0) as f32)),
             grading: (!g.is_neutral()).then(|| {
-                (
-                    [wheel(&g.shadows), wheel(&g.midtones), wheel(&g.highlights), wheel(&g.global)],
-                    (g.blending / 100.0) as f32,
-                    (g.balance / 100.0) as f32,
-                )
+                let (mut sh, mut hl) = (wheel(&g.shadows), wheel(&g.highlights));
+                if split.is_some() {
+                    (sh.a, sh.b, hl.a, hl.b) = (0.0, 0.0, 0.0, 0.0);
+                }
+                ([sh, wheel(&g.midtones), hl, wheel(&g.global)], (g.blending / 100.0) as f32, (g.balance / 100.0) as f32)
             }),
             primaries: PrimariesK::new(&s.primaries),
             hsl: if crate::is_bw(s) { None } else { HslK::new(&s.hsl_curves) },
+            split,
             skin: oklch_hue_of_srgb_hue(25.0),
         }
     }
@@ -338,6 +376,7 @@ impl ColorOps {
         self.vibrance == 0.0
             && self.saturation == 0.0
             && !self.mixer
+            && self.measured.is_none()
             && self.points.is_empty()
             && self.bw.is_none()
             && self.grading.is_none()
@@ -351,6 +390,10 @@ impl ColorOps {
         if self.is_identity() && local_sat == 0.0 && local_hue == 0.0 {
             return rgb;
         }
+        let rgb = match &self.measured {
+            Some(m) => m.apply(rgb, 1.0),
+            None => rgb,
+        };
         let lab = oklab_from_2020(rgb);
         // only chroma changes (vibrance / saturation, maybe grading): scale a, b directly — the same
         // result as the OkLCh round trip without its sin / cos (and atan2 unless vibrance needs the hue)
@@ -412,7 +455,8 @@ impl ColorOps {
     #[inline]
     fn grade(&self, mut lab: [f32; 3]) -> [f32; 3] {
         if let Some((wheels, blending, balance)) = &self.grading {
-            let [ws, wm, wh] = grade_zones(lab[0], *blending, *balance);
+            let l = lab[0];
+            let [ws, wm, wh] = grade_zones(l, *blending, *balance);
             for (k, wt) in wheels.iter().zip([ws, wm, wh, 1.0]) {
                 lab[1] += k.a * wt;
                 lab[2] += k.b * wt;
@@ -631,19 +675,23 @@ pub const CALIB_HUE: f32 = 0.5;
 /// Chroma scale of a calibration primary at ±100 (`1 ± CALIB_SAT`).
 pub const CALIB_SAT: f32 = 0.6;
 
-/// The calibration panel's primaries as a white-preserving 3×3 matrix on linear Rec.2020 (row-major):
-/// each primary is rotated in OkLCh hue and scaled in chroma at constant OkLab lightness, then the
-/// columns are rescaled so that neutral (1, 1, 1) maps to itself. `None` when neutral.
-///
-/// From process V9 (`linear_sat`) Saturation instead scales the primary's distance from the grey of
-/// its own luminance in linear light (fork issue #1031). In OkLab the line from Rec.2020 blue to white
-/// bends towards cyan/violet, so scaling the primary's OkLab chroma moved every blue mixture in hue
-/// about as much as the Hue slider did, and barely changed its chroma. In linear light the
-/// primary and all its mixtures with grey stay on one straight line, so they keep their hue.
-pub fn calibration_matrix(c: &Calibration, linear_sat: bool) -> Option<[[f32; 3]; 3]> {
+/// Hue rotation (degrees in CIE xy around the white point) of a ProPhoto primary at ±100 (process V9).
+pub const CALIB_XY_HUE: f64 = 30.0;
+/// Saturation ±100 (process V9) scales a ProPhoto primary's xy distance from white by `1 + a·v + b·v²`
+/// (`v` = slider / 100), per primary (red, green, blue): fitted to Lightroom Classic's round-17 charts.
+pub const CALIB_XY_SAT: [(f64, f64); 3] = [(1.367, 0.732), (1.656, 0.959), (0.96, 0.329)];
+
+/// The calibration panel's primaries as a white-preserving 3×3 matrix on linear Rec.2020 (row-major),
+/// `None` when neutral. V1–V8: each Rec.2020 primary is rotated in OkLCh hue and scaled in chroma at
+/// constant OkLab lightness. V9 follows Lightroom Classic ([`calibration_matrix_xy`]). Both rescale the
+/// columns so that neutral (1, 1, 1) maps to itself.
+pub fn calibration_matrix(c: &Calibration, process: lcc_develop::Process) -> Option<[[f32; 3]; 3]> {
     let prim = c.primaries();
     if prim.iter().all(|(h, s)| *h == 0.0 && *s == 0.0) {
         return None;
+    }
+    if process >= lcc_develop::Process::V9 {
+        return calibration_matrix_xy(&prim);
     }
     let mut p = [[0.0f64; 3]; 3];
     for (i, (hue, sat)) in prim.iter().enumerate() {
@@ -651,7 +699,7 @@ pub fn calibration_matrix(c: &Calibration, linear_sat: bool) -> Option<[[f32; 3]
         e[i] = 1.0;
         let [l, ch, h] = lab_to_lch(oklab_from_2020(e));
         let h2 = h + (hue.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_HUE;
-        let gain = if linear_sat { 1.0 } else { 1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT };
+        let gain = 1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT;
         let q = oklab_to_2020(lch_to_lab([l, ch * gain, h2]));
         for (r, row) in p.iter_mut().enumerate() {
             row[i] = q[r] as f64;
@@ -659,34 +707,45 @@ pub fn calibration_matrix(c: &Calibration, linear_sat: bool) -> Option<[[f32; 3]
     }
     let m = Mat3(p);
     let k = m.inverse()?.apply([1.0, 1.0, 1.0]);
-    let mut out: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|col| p[r][col] * k[col]));
-    if linear_sat {
-        // S_i = I + g (e_i − Y_i·1)(e_i − y)ᵀ, y the luminance weights: it moves a colour along its
-        // primary's line through grey by g × how far its channel i stands above its luminance. Grey
-        // and luminance stay; the primary itself gets (1 + g) × its distance from grey.
-        let y: [f64; 3] = std::array::from_fn(|i| {
-            let mut e = [0.0f32; 3];
-            e[i] = 1.0;
-            lcc_color::luminance_2020(e) as f64
-        });
-        for (i, (_, sat)) in prim.iter().enumerate() {
-            let g = sat.clamp(-100.0, 100.0) / 100.0 * CALIB_SAT as f64;
-            if g == 0.0 {
-                continue;
-            }
-            let yi = y.get(i).copied().unwrap_or(0.0);
-            let s: [[f64; 3]; 3] = std::array::from_fn(|r| {
-                std::array::from_fn(|col| {
-                    let u = if r == i { 1.0 - yi } else { -yi };
-                    let v = if col == i { 1.0 - y[col] } else { -y[col] };
-                    let id = if r == col { 1.0 } else { 0.0 };
-                    id + g * u * v
-                })
-            });
-            out = std::array::from_fn(|r| std::array::from_fn(|col| (0..3).map(|t| s[r][t] * out[t][col]).sum()));
+    let out: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|col| p[r][col] * k[col]));
+    Some(out.map(|row| row.map(|v| v as f32)))
+}
+
+/// Process V9 calibration, as measured on Lightroom Classic (round 17 charts): each ProPhoto primary,
+/// adapted to D65, moves in CIE xy around the white point: hue turns it by up to ±[`CALIB_XY_HUE`]°,
+/// saturation scales its distance from white ([`CALIB_XY_SAT`]). The moved primaries, rescaled to keep
+/// white, replace the old ones: the matrix maps a colour's ProPhoto coordinates onto them.
+fn calibration_matrix_xy(prim: &[(f64, f64); 3]) -> Option<[[f32; 3]; 3]> {
+    let to_xyz = bradford(D50, D65).mul(&PROPHOTO.to_xyz());
+    let from_xyz = to_xyz.inverse()?;
+    let white = to_xyz.apply([1.0, 1.0, 1.0]);
+    let w = Xy::from_xyz(white);
+    let mut p = [[0.0f64; 3]; 3];
+    for (i, (hue, sat)) in prim.iter().enumerate() {
+        let col = Xy::from_xyz([to_xyz.0[0][i], to_xyz.0[1][i], to_xyz.0[2][i]]);
+        let (dx, dy) = (col.x - w.x, col.y - w.y);
+        let a = (hue.clamp(-100.0, 100.0) / 100.0 * CALIB_XY_HUE).to_radians();
+        let v = sat.clamp(-100.0, 100.0) / 100.0;
+        let (ka, kb) = CALIB_XY_SAT.get(i).copied().unwrap_or((0.0, 0.0));
+        let scale = (1.0 + ka * v + kb * v * v).max(0.0);
+        let (rx, ry) = ((dx * a.cos() - dy * a.sin()) * scale, (dx * a.sin() + dy * a.cos()) * scale);
+        let (x, y) = (w.x + rx, w.y + ry);
+        // A primary moved past the spectral locus can land at y ≤ 0 (ProPhoto blue sits at y ≈ 0.0001): it's still a
+        // direction in XYZ, and the white-keeping column scale below fixes its sign. Only y ≈ 0 has no direction.
+        if !(y.abs() > 1e-6 && x.is_finite()) {
+            return None;
+        }
+        let q = Xy::new(x, y).to_xyz();
+        for (r, row) in p.iter_mut().enumerate() {
+            row[i] = q[r];
         }
     }
-    Some(out.map(|row| row.map(|v| v as f32)))
+    let m = Mat3(p);
+    let k = m.inverse()?.apply(white);
+    let moved = Mat3(std::array::from_fn(|r| std::array::from_fn(|c| p[r][c] * k[c])));
+    let rec = REC2020.from_xyz().mul(&moved).mul(&from_xyz).mul(&REC2020.to_xyz());
+    let out = rec.to_f32();
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
 
 /// Shadows-tint strength at ±100: the green channel's relative change in deep shadows.
@@ -759,23 +818,148 @@ mod tests {
 
     #[test]
     fn mixer_targets_its_band() {
-        let mut s = DevelopSettings::default();
-        s.mixer.blue.sat = -100.0;
+        // V8 greys the band out; V9, as Lightroom Classic, leaves a vivid blue a trace of colour
+        for (process, most) in [(lcc_develop::Process::V8, 0.02), (lcc_develop::Process::V9, 0.04)] {
+            let mut s = DevelopSettings { process: process.version(), ..Default::default() };
+            s.mixer.blue.sat = -100.0;
+            let ops = ColorOps::new(&s);
+            let blue = [0.02, 0.05, 0.4];
+            let red = [0.4, 0.03, 0.02];
+            let cb0 = lab_to_lch(oklab_from_2020(blue))[1];
+            let cb = lab_to_lch(oklab_from_2020(ops.apply(blue, 0.0, 0.0)))[1];
+            let cr0 = lab_to_lch(oklab_from_2020(red))[1];
+            let cr = lab_to_lch(oklab_from_2020(ops.apply(red, 0.0, 0.0)))[1];
+            assert!(cb < most && cb < 0.2 * cb0, "{process:?}: {cb} of {cb0}");
+            assert!((cr - cr0).abs() < 0.01, "{process:?}");
+        }
+    }
+
+    /// Settings with one Color Mixer slider (`band`, `kind` 0 hue / 1 saturation / 2 luminance) at `v` (−1 … 1).
+    fn one_slider(process: lcc_develop::Process, band: usize, kind: usize, v: f32) -> DevelopSettings {
+        let mut s = DevelopSettings { process: process.version(), ..Default::default() };
+        let b = [
+            &mut s.mixer.red,
+            &mut s.mixer.orange,
+            &mut s.mixer.yellow,
+            &mut s.mixer.green,
+            &mut s.mixer.aqua,
+            &mut s.mixer.blue,
+            &mut s.mixer.purple,
+            &mut s.mixer.magenta,
+        ]
+        .into_iter()
+        .nth(band)
+        .expect("8 bands");
+        *[&mut b.hue, &mut b.sat, &mut b.lum].into_iter().nth(kind).expect("3 kinds") = f64::from(v) * 100.0;
+        s
+    }
+
+    /// Process V9's mixer against Lightroom Classic's own exports of our round-12 colour charts (one slider at a time,
+    /// 8 Nov 2026; patches read through the files' embedded profiles): the chart's baseline colour in, and what
+    /// Lightroom Classic made of it at that slider out. The measured tables
+    /// ([`crate::mixer_measured`]) keep every patch close and the average hue within about 2° (8 Nov 2026: 2.3°, chroma
+    /// 3 %, L 0.003), where V8 missed by 13°.
+    #[test]
+    fn v9_mixer_follows_lightroom_classic_on_our_charts() {
+        // (band, kind 0 hue / 1 sat / 2 lum, slider, linear Rec.2020 in, Lightroom Classic's OkLCh out (L, C, hue °))
+        const LRC: [(usize, usize, f32, [f32; 3], [f32; 3]); 48] = [
+            (2, 0, -1.00, [0.10981, 0.08999, 0.03370], [0.4114, 0.0722, 39.77]),
+            (2, 0, -1.00, [0.11301, 0.08761, 0.01165], [0.3979, 0.1039, 47.35]),
+            (2, 0, -1.00, [0.11947, 0.08728, 0.00955], [0.3954, 0.1083, 48.03]),
+            (2, 0, -1.00, [0.27291, 0.23852, 0.11997], [0.5816, 0.0707, 38.54]),
+            (2, 0, -1.00, [0.29927, 0.23459, 0.03210], [0.5520, 0.1412, 47.00]),
+            (2, 0, -1.00, [0.30016, 0.22667, 0.02902], [0.5514, 0.1481, 47.91]),
+            (2, 0, -0.50, [0.10981, 0.08999, 0.03370], [0.4347, 0.0603, 63.88]),
+            (2, 0, -0.50, [0.11301, 0.08761, 0.01165], [0.4297, 0.0912, 68.23]),
+            (2, 0, -0.50, [0.11947, 0.08728, 0.00955], [0.4279, 0.0940, 71.86]),
+            (2, 0, -0.50, [0.27291, 0.23852, 0.11997], [0.6056, 0.0610, 61.80]),
+            (2, 0, -0.50, [0.29927, 0.23459, 0.03210], [0.5929, 0.1235, 69.30]),
+            (2, 0, -0.50, [0.30016, 0.22667, 0.02902], [0.5922, 0.1293, 68.70]),
+            (2, 0, 0.50, [0.09473, 0.09614, 0.03343], [0.4445, 0.0720, 122.51]),
+            (2, 0, 0.50, [0.10083, 0.09354, 0.01140], [0.4433, 0.1100, 121.44]),
+            (2, 0, 0.50, [0.10346, 0.09602, 0.01243], [0.4434, 0.1082, 121.59]),
+            (2, 0, 0.50, [0.24460, 0.24815, 0.12538], [0.6127, 0.0719, 123.48]),
+            (2, 0, 0.50, [0.26502, 0.25261, 0.04037], [0.6102, 0.1427, 122.84]),
+            (2, 0, 0.50, [0.26697, 0.25276, 0.02632], [0.6109, 0.1556, 120.53]),
+            (3, 0, -1.00, [0.07572, 0.10514, 0.04736], [0.4597, 0.0424, 93.79]),
+            (3, 0, -1.00, [0.06401, 0.11768, 0.01636], [0.4715, 0.0801, 96.19]),
+            (3, 0, -1.00, [0.06401, 0.11768, 0.01636], [0.4714, 0.0839, 96.63]),
+            (3, 0, -1.00, [0.20929, 0.26617, 0.15549], [0.6301, 0.0398, 89.68]),
+            (3, 0, -1.00, [0.18517, 0.29013, 0.08527], [0.6411, 0.0812, 95.64]),
+            (3, 0, -1.00, [0.16730, 0.30506, 0.04200], [0.6505, 0.1140, 96.98]),
+            (1, 0, -1.00, [0.12541, 0.08133, 0.03745], [0.4120, 0.0926, 17.95]),
+            (1, 0, -1.00, [0.14980, 0.07063, 0.00925], [0.3817, 0.1603, 15.81]),
+            (1, 0, -1.00, [0.14952, 0.07061, 0.01130], [0.3817, 0.1603, 15.81]),
+            (1, 0, -1.00, [0.30022, 0.21548, 0.13266], [0.5819, 0.0819, 21.59]),
+            (1, 0, -1.00, [0.36294, 0.19210, 0.04868], [0.5390, 0.1835, 17.67]),
+            (1, 0, -1.00, [0.39170, 0.18339, 0.03087], [0.5287, 0.2177, 15.83]),
+            (0, 0, 0.50, [0.13438, 0.07038, 0.07182], [0.4585, 0.0501, 28.27]),
+            (0, 0, 0.50, [0.17724, 0.04808, 0.05168], [0.4724, 0.0940, 32.60]),
+            (0, 0, 0.50, [0.21494, 0.02863, 0.03794], [0.4800, 0.1381, 32.38]),
+            (0, 0, 0.50, [0.31659, 0.19950, 0.19902], [0.6314, 0.0500, 30.73]),
+            (0, 0, 0.50, [0.39634, 0.15937, 0.15996], [0.6422, 0.0984, 30.57]),
+            (0, 0, 0.50, [0.46809, 0.12232, 0.13660], [0.6515, 0.1395, 31.70]),
+            (2, 1, -0.50, [0.10981, 0.08999, 0.03370], [0.4254, 0.0299, 84.56]),
+            (2, 1, -0.50, [0.11301, 0.08761, 0.01165], [0.4168, 0.0525, 80.96]),
+            (2, 1, -0.50, [0.11947, 0.08728, 0.00955], [0.4168, 0.0525, 80.96]),
+            (2, 1, -0.50, [0.27291, 0.23852, 0.11997], [0.5967, 0.0321, 91.93]),
+            (2, 1, -0.50, [0.29927, 0.23459, 0.03210], [0.5747, 0.0677, 85.29]),
+            (2, 1, -0.50, [0.30016, 0.22667, 0.02902], [0.5767, 0.0704, 88.20]),
+            (2, 2, -0.50, [0.10981, 0.08999, 0.03370], [0.4077, 0.0530, 92.05]),
+            (2, 2, -0.50, [0.11301, 0.08761, 0.01165], [0.3972, 0.0796, 91.83]),
+            (2, 2, -0.50, [0.11947, 0.08728, 0.00955], [0.3972, 0.0796, 91.83]),
+            (2, 2, -0.50, [0.27291, 0.23852, 0.11997], [0.5414, 0.0563, 87.07]),
+            (2, 2, -0.50, [0.29927, 0.23459, 0.03210], [0.5007, 0.1016, 90.22]),
+            (2, 2, -0.50, [0.30016, 0.22667, 0.02902], [0.5006, 0.1047, 90.74]),
+        ];
+        let err = |process: lcc_develop::Process| {
+            let (mut sum, mut worst) = ([0.0f32; 3], [0.0f32; 3]);
+            for (band, kind, v, rgb, want) in LRC {
+                let out = lab_to_lch(oklab_from_2020(ColorOps::new(&one_slider(process, band, kind, v)).apply(rgb, 0.0, 0.0)));
+                let dh = ((out[2].to_degrees() - want[2] + 540.0).rem_euclid(360.0) - 180.0).abs();
+                let e = [dh, (out[1] / want[1] - 1.0).abs(), (out[0] - want[0]).abs()];
+                for i in 0..3 {
+                    sum[i] += e[i] / LRC.len() as f32;
+                    worst[i] = worst[i].max(e[i]);
+                }
+            }
+            (sum, worst)
+        };
+        let (v9, v9_worst) = err(lcc_develop::Process::V9);
+        let (v8, _) = err(lcc_develop::Process::V8);
+        let msg = format!("V9 mean hue {:.2}° chroma {:.3} L {:.4}, worst {v9_worst:?}; V8 mean {v8:?}", v9[0], v9[1], v9[2]);
+        assert!(v9_worst[0] < 7.0 && v9_worst[1] < 0.15 && v9_worst[2] < 0.012, "{msg}");
+        assert!(v9[0] < 3.0 && v9[1] < 0.04 && v9[2] < 0.004, "{msg}");
+        assert!(v9[0] < 0.5 * v8[0] && v9[1] < v8[1] && v9[2] < v8[2], "{msg}");
+    }
+
+    #[test]
+    fn older_processes_keep_the_band_mixer_and_v9_neutrals_stay() {
+        let mut m = lcc_develop::Mixer::default();
+        m.yellow.hue = -60.0;
+        m.green.sat = 30.0;
+        m.blue.lum = -40.0;
+        for p in [lcc_develop::Process::V8, lcc_develop::Process::V1] {
+            assert_eq!(Mixer::new(&m, p), Some(Mixer::Bands(MixerK::new(&m))), "{p:?}");
+        }
+        assert!(matches!(Mixer::new(&m, lcc_develop::Process::V9), Some(Mixer::Measured(_))));
+        assert_eq!(Mixer::new(&lcc_develop::Mixer::default(), lcc_develop::Process::V9), None);
+        let s = one_slider(lcc_develop::Process::V9, 2, 0, -1.0);
         let ops = ColorOps::new(&s);
-        let blue = [0.02, 0.05, 0.4];
-        let red = [0.4, 0.03, 0.02];
-        let cb = lab_to_lch(oklab_from_2020(ops.apply(blue, 0.0, 0.0)))[1];
-        let cr0 = lab_to_lch(oklab_from_2020(red))[1];
-        let cr = lab_to_lch(oklab_from_2020(ops.apply(red, 0.0, 0.0)))[1];
-        assert!(cb < 0.02, "{cb}");
-        assert!((cr - cr0).abs() < 0.01);
+        assert!(!ops.mixer && ops.measured.is_some() && !ops.is_identity());
+        for g in [0.0, 0.18, 1.0] {
+            let o = ops.apply([g; 3], 0.0, 0.0);
+            assert!(o.iter().all(|v| (v - g).abs() < 1e-5), "grey {g} → {o:?}");
+        }
+        let v8 = ColorOps::new(&one_slider(lcc_develop::Process::V8, 2, 0, -1.0));
+        assert!(v8.mixer && v8.measured.is_none());
     }
 
     #[test]
     fn calibration_keeps_white_and_moves_primaries() {
-        assert!(calibration_matrix(&Calibration::default(), false).is_none());
+        assert!(calibration_matrix(&Calibration::default(), lcc_develop::Process::V8).is_none());
         let cal = Calibration { red_hue: 60.0, blue_sat: -50.0, ..Default::default() };
-        let m = calibration_matrix(&cal, false).unwrap();
+        let m = calibration_matrix(&cal, lcc_develop::Process::V8).unwrap();
         let grey = calibrate([0.3, 0.3, 0.3], Some(&m), 0.0);
         assert!(grey.iter().all(|v| (v - 0.3).abs() < 1e-4), "{grey:?}");
         // red rotates in hue, blue loses chroma
@@ -787,6 +971,443 @@ mod tests {
         let c0 = lab_to_lch(oklab_from_2020(blue))[1];
         let c1 = lab_to_lch(oklab_from_2020(calibrate(blue, Some(&m), 0.0)))[1];
         assert!(c1 < c0 * 0.97, "{c0} -> {c1}");
+    }
+
+    #[rustfmt::skip]
+    // Generated by r17calconst.py from Lightroom Classic's round-17 chart exports (16-bit ProPhoto, read to OkLab).
+    const R17_BASE: [[f32; 3]; 24] = [[0.24970, 0.03479, -0.02004], [0.24961, -0.00013, -0.11015], [0.24983, 0.05505, -0.09526], [0.34985, 0.10999, 0.00001], [0.34979, 0.09531, 0.05505], [0.34980, -0.00001, -0.11004], [0.34984, 0.09528, -0.05501], [0.44986, 0.05502, -0.09526], [0.54988, 0.09522, 0.05502], [0.64992, 0.05494, 0.09528], [0.64988, 0.00001, -0.11004], [0.74994, 0.10998, 0.00001], [0.74994, 0.05494, 0.09527], [0.74992, -0.11006, -0.00001], [0.74990, -0.05504, -0.09531], [0.74992, 0.00000, -0.11004], [0.84997, -0.00008, 0.11001], [0.84996, -0.05509, 0.09527], [0.84995, -0.09535, 0.05499], [0.84994, -0.09531, -0.05503], [0.89999, -0.00008, 0.11001], [0.89999, -0.05509, 0.09527], [0.89999, -0.09536, 0.05501], [0.89997, -0.11009, -0.00001]];
+    /// (primary 0 red / 1 green / 2 blue, hue slider, sat slider, LrC OkLab of every patch)
+    const R17_CAL: [(usize, f64, f64, [[f32; 3]; 24]); 12] = [
+        (
+            0,
+            -100.0,
+            0.0,
+            [
+                [0.24212, 0.04636, -0.02351],
+                [0.24153, 0.02637, -0.08750],
+                [0.23857, 0.08162, -0.08192],
+                [0.32631, 0.15469, -0.03723],
+                [0.31982, 0.16407, -0.01150],
+                [0.34312, 0.01722, -0.08434],
+                [0.32937, 0.12997, -0.06490],
+                [0.43524, 0.07843, -0.08306],
+                [0.52179, 0.15351, -0.00458],
+                [0.63070, 0.09883, 0.03222],
+                [0.64612, 0.00662, -0.08701],
+                [0.71191, 0.17853, -0.04210],
+                [0.73732, 0.08585, 0.02982],
+                [0.76926, -0.13164, 0.02955],
+                [0.76354, -0.07925, -0.06178],
+                [0.74684, 0.00471, -0.09089],
+                [0.84897, 0.01445, 0.05306],
+                [0.85750, -0.05516, 0.06403],
+                [0.86458, -0.11136, 0.05813],
+                [0.87669, -0.13788, -0.01294],
+                [0.89977, 0.01327, 0.05004],
+                [0.90686, -0.05254, 0.06083],
+                [0.91267, -0.10825, 0.05642],
+                [0.91447, -0.12158, 0.02743],
+            ],
+        ),
+        (
+            0,
+            100.0,
+            0.0,
+            [
+                [0.25741, 0.02323, -0.01657],
+                [0.25739, -0.03129, -0.12902],
+                [0.26266, 0.02381, -0.10475],
+                [0.37667, 0.05884, 0.03866],
+                [0.38156, 0.02987, 0.09449],
+                [0.35634, -0.02056, -0.13244],
+                [0.37099, 0.06130, -0.04488],
+                [0.46388, 0.03089, -0.10526],
+                [0.57662, 0.03800, 0.11014],
+                [0.66844, 0.00838, 0.15567],
+                [0.65318, -0.00627, -0.12734],
+                [0.77697, 0.06435, 0.03576],
+                [0.76678, 0.00917, 0.16899],
+                [0.72455, -0.07842, -0.03260],
+                [0.73651, -0.03883, -0.12106],
+                [0.75243, -0.00382, -0.12275],
+                [0.85141, -0.02625, 0.18467],
+                [0.84202, -0.05575, 0.13796],
+                [0.83234, -0.07444, 0.05085],
+                [0.82828, -0.05545, -0.08175],
+                [0.90036, -0.03032, 0.20265],
+                [0.89272, -0.05988, 0.14803],
+                [0.88389, -0.07698, 0.05271],
+                [0.87507, -0.07763, -0.03306],
+            ],
+        ),
+        (
+            0,
+            0.0,
+            -100.0,
+            [
+                [0.25879, 0.02041, -0.01193],
+                [0.25252, 0.00761, -0.07231],
+                [0.26107, 0.03446, -0.05994],
+                [0.38239, 0.06058, 0.00006],
+                [0.38118, 0.05824, 0.02613],
+                [0.35131, 0.00575, -0.07137],
+                [0.37448, 0.05381, -0.03202],
+                [0.46293, 0.03368, -0.05848],
+                [0.58234, 0.05658, 0.02813],
+                [0.67410, 0.03540, 0.04789],
+                [0.64961, 0.00299, -0.07816],
+                [0.78795, 0.05579, 0.00002],
+                [0.77576, 0.03149, 0.04314],
+                [0.71942, -0.07566, 0.00000],
+                [0.73108, -0.04023, -0.07573],
+                [0.74966, 0.00233, -0.08327],
+                [0.85754, 0.00315, 0.04932],
+                [0.84348, -0.02916, 0.05027],
+                [0.82938, -0.06473, 0.03697],
+                [0.82605, -0.07350, -0.04398],
+                [0.90750, 0.00292, 0.04600],
+                [0.89486, -0.02798, 0.04826],
+                [0.88165, -0.06605, 0.03776],
+                [0.87400, -0.08129, -0.00000],
+            ],
+        ),
+        (
+            0,
+            0.0,
+            100.0,
+            [
+                [0.24107, 0.04930, -0.02798],
+                [0.24672, -0.01700, -0.14252],
+                [0.24105, 0.07338, -0.12635],
+                [0.31742, 0.16343, -0.00018],
+                [0.32865, 0.12079, 0.07388],
+                [0.34837, -0.01219, -0.14396],
+                [0.32704, 0.13808, -0.07738],
+                [0.43663, 0.07509, -0.12959],
+                [0.51752, 0.12942, 0.09398],
+                [0.62835, 0.06184, 0.15467],
+                [0.64970, -0.00396, -0.13330],
+                [0.69954, 0.18658, -0.00012],
+                [0.72460, 0.06575, 0.16836],
+                [0.77461, -0.13646, -0.00004],
+                [0.76512, -0.06342, -0.10572],
+                [0.74956, -0.00239, -0.12706],
+                [0.84209, -0.01603, 0.19601],
+                [0.85517, -0.08880, 0.15403],
+                [0.86561, -0.12013, 0.06985],
+                [0.86624, -0.10697, -0.06073],
+                [0.89128, -0.02058, 0.21737],
+                [0.90313, -0.09493, 0.16474],
+                [0.91255, -0.11828, 0.06871],
+                [0.91810, -0.12881, -0.00003],
+            ],
+        ),
+        (
+            1,
+            -100.0,
+            0.0,
+            [
+                [0.24498, 0.02524, -0.03088],
+                [0.24862, -0.04440, -0.13722],
+                [0.24225, 0.01052, -0.12554],
+                [0.33123, 0.08175, -0.01460],
+                [0.32941, 0.06327, 0.05713],
+                [0.35011, -0.02579, -0.13844],
+                [0.33582, 0.06863, -0.08344],
+                [0.44327, 0.02636, -0.12591],
+                [0.53153, 0.06285, 0.05969],
+                [0.63939, 0.02381, 0.12289],
+                [0.65032, -0.00693, -0.12955],
+                [0.73473, 0.08568, -0.01506],
+                [0.74226, 0.02494, 0.13223],
+                [0.76670, -0.06529, 0.01121],
+                [0.76572, -0.03130, -0.10030],
+                [0.75002, -0.00419, -0.12442],
+                [0.84654, -0.02276, 0.17421],
+                [0.85379, -0.06155, 0.16354],
+                [0.86164, -0.08092, 0.10212],
+                [0.87505, -0.04573, -0.04847],
+                [0.89626, -0.02624, 0.19054],
+                [0.90327, -0.06797, 0.17974],
+                [0.91094, -0.08767, 0.11089],
+                [0.91901, -0.05794, 0.00997],
+            ],
+        ),
+        (
+            1,
+            100.0,
+            0.0,
+            [
+                [0.25418, 0.04390, -0.01003],
+                [0.25050, 0.02895, -0.07790],
+                [0.25714, 0.07645, -0.05991],
+                [0.36790, 0.13193, 0.01478],
+                [0.36862, 0.12321, 0.05217],
+                [0.34947, 0.01855, -0.07769],
+                [0.36184, 0.11714, -0.02846],
+                [0.45595, 0.07396, -0.06030],
+                [0.56583, 0.12343, 0.04972],
+                [0.65931, 0.08167, 0.06871],
+                [0.64900, 0.00690, -0.08448],
+                [0.76196, 0.12921, 0.01278],
+                [0.75929, 0.07526, 0.06237],
+                [0.72959, -0.16800, -0.01322],
+                [0.73274, -0.09017, -0.08611],
+                [0.74926, 0.00490, -0.08899],
+                [0.85372, 0.01296, 0.06094],
+                [0.84638, -0.05316, 0.04665],
+                [0.83623, -0.13412, 0.02649],
+                [0.81782, -0.18281, -0.06219],
+                [0.90379, 0.01204, 0.05740],
+                [0.89697, -0.05015, 0.04387],
+                [0.88554, -0.13728, 0.02721],
+                [0.86939, -0.19812, -0.01562],
+            ],
+        ),
+        (
+            1,
+            0.0,
+            -100.0,
+            [
+                [0.24222, 0.02150, -0.01258],
+                [0.24082, 0.00670, -0.07498],
+                [0.23365, 0.03750, -0.06521],
+                [0.32595, 0.07374, 0.00004],
+                [0.32257, 0.06820, 0.03407],
+                [0.34307, 0.00539, -0.07315],
+                [0.32774, 0.06348, -0.03729],
+                [0.43587, 0.03610, -0.06267],
+                [0.52749, 0.06385, 0.03314],
+                [0.63782, 0.03924, 0.05599],
+                [0.64598, 0.00288, -0.07928],
+                [0.72999, 0.07708, 0.00002],
+                [0.74414, 0.03665, 0.05271],
+                [0.77057, -0.05673, 0.00001],
+                [0.76716, -0.03148, -0.06380],
+                [0.74664, 0.00225, -0.08444],
+                [0.85113, 0.00315, 0.05224],
+                [0.85883, -0.02551, 0.04398],
+                [0.87012, -0.04674, 0.02651],
+                [0.88092, -0.04703, -0.02986],
+                [0.90197, 0.00293, 0.04903],
+                [0.90889, -0.02397, 0.04129],
+                [0.92137, -0.04412, 0.02502],
+                [0.92275, -0.04988, 0.00001],
+            ],
+        ),
+        (
+            1,
+            0.0,
+            100.0,
+            [
+                [0.25720, 0.04711, -0.02687],
+                [0.25800, -0.01128, -0.13862],
+                [0.26525, 0.06890, -0.11891],
+                [0.37197, 0.13990, -0.00006],
+                [0.37543, 0.11481, 0.07401],
+                [0.35639, -0.00978, -0.14133],
+                [0.37060, 0.12181, -0.06951],
+                [0.46311, 0.07028, -0.12147],
+                [0.56971, 0.11921, 0.07551],
+                [0.66145, 0.06355, 0.13575],
+                [0.65325, -0.00349, -0.13166],
+                [0.76632, 0.13405, -0.00001],
+                [0.75503, 0.06582, 0.14167],
+                [0.72517, -0.18154, -0.00013],
+                [0.72825, -0.08222, -0.12326],
+                [0.75253, -0.00207, -0.12549],
+                [0.84856, -0.01375, 0.18765],
+                [0.83990, -0.10093, 0.17532],
+                [0.82235, -0.16990, 0.10094],
+                [0.80043, -0.17862, -0.08887],
+                [0.89695, -0.01767, 0.20696],
+                [0.88871, -0.11227, 0.19515],
+                [0.86639, -0.18658, 0.11141],
+                [0.86344, -0.22097, -0.00019],
+            ],
+        ),
+        (
+            2,
+            -100.0,
+            0.0,
+            [
+                [0.25796, 0.01789, -0.01427],
+                [0.28568, -0.15791, -0.07491],
+                [0.27527, -0.07819, -0.06984],
+                [0.37006, 0.11540, 0.01043],
+                [0.36778, 0.13641, 0.05856],
+                [0.37844, -0.15346, -0.08071],
+                [0.37246, 0.04511, -0.03834],
+                [0.47493, -0.05789, -0.07226],
+                [0.56185, 0.14397, 0.05677],
+                [0.64548, 0.13189, 0.08797],
+                [0.65593, -0.16538, -0.09796],
+                [0.76823, 0.11082, 0.00903],
+                [0.73885, 0.12938, 0.08245],
+                [0.72894, -0.14375, -0.00969],
+                [0.71296, -0.28997, -0.10810],
+                [0.72916, -0.20170, -0.11454],
+                [0.82567, 0.08658, 0.08716],
+                [0.83226, 0.02537, 0.08200],
+                [0.83239, -0.06140, 0.04452],
+                [0.79965, -0.28963, -0.07547],
+                [0.87298, 0.08477, 0.08341],
+                [0.88286, 0.02611, 0.08225],
+                [0.88454, -0.06311, 0.04592],
+                [0.87401, -0.16326, -0.01108],
+            ],
+        ),
+        (
+            2,
+            100.0,
+            0.0,
+            [
+                [0.24203, 0.05142, -0.02560],
+                [0.26142, 0.14181, -0.10988],
+                [0.25491, 0.14513, -0.09622],
+                [0.32838, 0.10268, -0.01111],
+                [0.33067, 0.04682, 0.04964],
+                [0.33966, 0.15409, -0.12589],
+                [0.32978, 0.14451, -0.07057],
+                [0.43070, 0.16527, -0.11397],
+                [0.53498, 0.03900, 0.05142],
+                [0.64967, -0.02960, 0.09999],
+                [0.60873, 0.16520, -0.14971],
+                [0.72880, 0.10841, -0.01123],
+                [0.75624, -0.03406, 0.10508],
+                [0.76827, -0.08322, 0.00804],
+                [0.74091, 0.07490, -0.11020],
+                [0.67057, 0.19632, -0.17828],
+                [0.85306, -0.08970, 0.11383],
+                [0.85396, -0.11805, 0.09702],
+                [0.86356, -0.12247, 0.06354],
+                [0.87739, -0.01001, -0.04229],
+                [0.90126, -0.08855, 0.11131],
+                [0.90054, -0.11454, 0.09364],
+                [0.91081, -0.11987, 0.06210],
+                [0.91907, -0.07500, 0.00730],
+            ],
+        ),
+        (
+            2,
+            0.0,
+            -100.0,
+            [
+                [0.26266, 0.02014, -0.01177],
+                [0.33571, 0.00960, -0.05520],
+                [0.31934, 0.02834, -0.04947],
+                [0.34241, 0.06962, 0.00003],
+                [0.30510, 0.07079, 0.03694],
+                [0.43631, 0.00715, -0.05622],
+                [0.38615, 0.05174, -0.03086],
+                [0.52034, 0.02930, -0.05094],
+                [0.50536, 0.06699, 0.03553],
+                [0.58362, 0.04318, 0.06749],
+                [0.75193, 0.00382, -0.04961],
+                [0.74780, 0.07018, 0.00002],
+                [0.69137, 0.04446, 0.07104],
+                [0.75783, -0.06118, 0.00001],
+                [0.84841, -0.01710, -0.03974],
+                [0.86393, 0.00313, -0.04335],
+                [0.79172, 0.00161, 0.08418],
+                [0.79883, -0.04136, 0.07144],
+                [0.82067, -0.06899, 0.03947],
+                [0.90969, -0.03556, -0.02317],
+                [0.84681, 0.00146, 0.08621],
+                [0.85264, -0.04252, 0.07346],
+                [0.87263, -0.07162, 0.04103],
+                [0.91151, -0.05652, 0.00001],
+            ],
+        ),
+        (
+            2,
+            0.0,
+            100.0,
+            [
+                [0.23726, 0.04960, -0.02813],
+                [0.14419, -0.27288, -0.16702],
+                [0.19947, 0.05620, -0.12950],
+                [0.35768, 0.14601, -0.00006],
+                [0.38814, 0.11342, 0.06964],
+                [0.22414, -0.14160, -0.18736],
+                [0.31471, 0.14234, -0.07935],
+                [0.36260, 0.08973, -0.15402],
+                [0.58683, 0.11508, 0.07033],
+                [0.69880, 0.06210, 0.11407],
+                [0.47773, -0.06529, -0.21749],
+                [0.75028, 0.14596, -0.00002],
+                [0.79144, 0.06111, 0.11083],
+                [0.74004, -0.16755, -0.00010],
+                [0.53781, -0.31416, -0.21552],
+                [0.44835, -0.21476, -0.29486],
+                [0.88927, -0.00147, 0.12660],
+                [0.88583, -0.06407, 0.11087],
+                [0.87199, -0.11357, 0.06586],
+                [0.72709, -0.29269, -0.12035],
+                [0.93393, -0.00126, 0.12452],
+                [0.93137, -0.06277, 0.10860],
+                [0.91893, -0.10995, 0.06368],
+                [0.88156, -0.18795, -0.00012],
+            ],
+        ),
+    ];
+
+    /// Mean and worst OkLab error against Lightroom Classic's round-17 calibration exports, the matrix applied to its
+    /// baseline patches (each export moves one primary's hue or saturation to ±100).
+    fn r17_calibration_error(process: lcc_develop::Process) -> (f32, f32) {
+        let (mut sum, mut worst, mut n) = (0.0f32, 0.0f32, 0.0f32);
+        for (prim, hue, sat, lrc) in R17_CAL.iter() {
+            let mut cal = Calibration::default();
+            match prim {
+                0 => (cal.red_hue, cal.red_sat) = (*hue, *sat),
+                1 => (cal.green_hue, cal.green_sat) = (*hue, *sat),
+                _ => (cal.blue_hue, cal.blue_sat) = (*hue, *sat),
+            }
+            let m = calibration_matrix(&cal, process).unwrap();
+            let mut e = 0.0f32;
+            for (b, l) in R17_BASE.iter().zip(lrc.iter()) {
+                let o = oklab_from_2020(calibrate(oklab_to_2020(*b), Some(&m), 0.0));
+                e += ((o[0] - l[0]).powi(2) + (o[1] - l[1]).powi(2) + (o[2] - l[2]).powi(2)).sqrt();
+            }
+            e /= R17_BASE.len() as f32;
+            sum += e;
+            worst = worst.max(e);
+            n += 1.0;
+        }
+        (sum / n, worst)
+    }
+
+    #[test]
+    fn v9_calibration_follows_lightroom_classic_on_our_charts() {
+        let (v8, v8_worst) = r17_calibration_error(lcc_develop::Process::V8);
+        let (v9, v9_worst) = r17_calibration_error(lcc_develop::Process::V9);
+        eprintln!("round 17 calibration, mean / worst OkLab error: V8 {v8:.4} / {v8_worst:.4}, V9 {v9:.4} / {v9_worst:.4}");
+        // measured: V8 0.042 / 0.104, V9 0.020 / 0.058 (24 strongly coloured patches, every primary at ±100)
+        assert!(v9 < 0.025 && v9_worst < 0.07, "V9 {v9} / {v9_worst}");
+        assert!(v9 < 0.6 * v8 && v9_worst < 0.7 * v8_worst, "V9 {v9} / {v9_worst} vs V8 {v8} / {v8_worst}");
+    }
+
+    #[test]
+    fn v9_calibration_keeps_white_and_v8_keeps_its_matrix() {
+        let cal = Calibration { red_hue: 60.0, green_sat: 100.0, blue_hue: -100.0, blue_sat: -100.0, ..Default::default() };
+        let m9 = calibration_matrix(&cal, lcc_develop::Process::V9).unwrap();
+        for g in [0.01, 0.3, 4.0] {
+            let o = calibrate([g; 3], Some(&m9), 0.0);
+            assert!(o.iter().all(|v| (v - g).abs() < 1e-4 * g.max(1.0)), "{g} -> {o:?}");
+        }
+        assert!(calibration_matrix(&Calibration::default(), lcc_develop::Process::V9).is_none());
+        // V1–V8 keep the OkLCh construction
+        for p in [lcc_develop::Process::V1, lcc_develop::Process::V8] {
+            assert_eq!(calibration_matrix(&cal, p), calibration_matrix(&cal, lcc_develop::Process::V7));
+            assert_ne!(calibration_matrix(&cal, p), Some(m9));
+        }
+        // the full slider range, odd values included, stays finite
+        for v in [-100.0, -99.9, 0.5, 100.0, 1e9, -1e9, f64::NAN] {
+            let c = Calibration { red_hue: v, red_sat: v, green_hue: v, green_sat: v, blue_hue: v, blue_sat: v, ..Default::default() };
+            if let Some(m) = calibration_matrix(&c, lcc_develop::Process::V9) {
+                assert!(m.iter().flatten().all(|x| x.is_finite()), "{v}: {m:?}");
+            }
+        }
     }
 
     /// #1031: from V9 a primary's Saturation changes the chroma of its colours and leaves their hue,
@@ -805,7 +1426,7 @@ mod tests {
                     1 => (c.green_hue, c.green_sat) = (hue, sat),
                     _ => (c.blue_hue, c.blue_sat) = (hue, sat),
                 }
-                calibration_matrix(&c, true).unwrap()
+                calibration_matrix(&c, lcc_develop::Process::V9).unwrap()
             };
             let more = cal(0.0, 100.0);
             let less = cal(0.0, -100.0);
@@ -877,8 +1498,17 @@ mod tests {
         let mut s = DevelopSettings::default();
         s.grading.shadows = lcc_develop::Wheel { hue: 220.0, sat: 60.0, lum: 0.0 };
         let ops = ColorOps::new(&s);
-        let dark = ops.apply([0.01, 0.01, 0.01], 0.0, 0.0);
-        let bright = ops.apply([0.8, 0.8, 0.8], 0.0, 0.0);
+        // process V9's split goes on in the finish, after the curves: add it as there (no curves here)
+        let apply = |c: [f32; 3]| {
+            let mut lab = oklab_from_2020(ops.apply(c, 0.0, 0.0));
+            if let Some(k) = &ops.split {
+                let o = k.offset(lab[0]);
+                lab = std::array::from_fn(|i| lab[i] + o[i]);
+            }
+            oklab_to_2020(lab)
+        };
+        let dark = apply([0.01, 0.01, 0.01]);
+        let bright = apply([0.8, 0.8, 0.8]);
         assert!(dark[2] > dark[0]);
         assert!((bright[2] - bright[0]).abs() < 0.02);
     }

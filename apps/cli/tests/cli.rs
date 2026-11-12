@@ -1637,3 +1637,23 @@ fn shared_settings_gathers_presets_without_a_library() {
     assert_eq!(std::fs::read(backup.join("prefs.json")).unwrap(), prefs);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A render whose input the import refuses says why (a missing file, a broken raw), not only that it is
+/// "not a readable photo": a public Panasonic sample once failed that way with nothing to go on.
+#[test]
+fn render_of_a_refused_file_says_why() {
+    let missing = tmp("no-such-photo.rw2");
+    let _ = std::fs::remove_file(&missing);
+    let broken = tmp("broken.rw2");
+    let mut bytes = b"IIU    ".to_vec();
+    bytes.resize(4096, 0);
+    std::fs::write(&broken, bytes).unwrap();
+    let out = tmp("refused-out.jpg");
+    for input in [&missing, &broken] {
+        let o = Command::new(BIN).args(["render", input.to_str().unwrap(), "-o", out.to_str().unwrap()]).output().unwrap();
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        let last = err.lines().last().unwrap_or_default();
+        assert!(last.contains("not imported: ") && last.len() > input.to_str().unwrap().len() + 16, "{}: {err}", input.display());
+    }
+}

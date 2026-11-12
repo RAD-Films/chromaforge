@@ -21,6 +21,8 @@
 //!    on them for [`LOOP_ROUNDS`] rounds (a round that makes the real training error worse is undone).
 //! 7. Gates: held-out ΔE00 median and p95, from real renders (the app's own colour `lc` before, the candidate after),
 //!    must beat the app's current colour. When a raw can't be rendered, the analytic numbers stand in, with a note.
+//!
+//! [`fit_on_base`] runs stages 5 to 7 only, on the camera model of an existing calibration (`fit --base`).
 use crate::dataset::{DngMatrices, PhotoSamples};
 use crate::deltae;
 use crate::{Error, Result};
@@ -45,6 +47,9 @@ pub struct FitOptions {
     pub editor: Editor,
     /// Refinement rounds of the tables on their residuals (default 3 when 0).
     pub rounds: usize,
+    /// [`fit_on_base`] only: add the fitted looks as entries for this process number and newer
+    /// ([`Look::since_process`]), so photos on older processes keep the base file's looks.
+    pub since_process: Option<u32>,
 }
 
 const T_A: f64 = 2856.0;
@@ -633,7 +638,14 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
                 )));
             }
         }
-        look_evidence.push(LookEvidence { name: l.name.clone(), photos: count_photos(&trained), held_out: count_photos(&held), before: b, after: a });
+        look_evidence.push(LookEvidence {
+            name: l.name.clone(),
+            photos: count_photos(&trained),
+            held_out: count_photos(&held),
+            before: b,
+            after: a,
+            since_process: None,
+        });
     }
     looks.retain(|l| !dropped.contains(&l.name));
     if gated == 0 {
@@ -649,6 +661,175 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
         looks: look_evidence,
     };
     let cal = assemble(&who, &model, &looks, prior_fm, evidence);
+    cal.validate().map_err(|e| Error(format!("the fitted calibration is not valid: {e}")))?;
+    Ok(cal)
+}
+
+/// Fit only looks on top of an existing calibration (`calibrate-lightroom fit --base`): the camera model (colour and
+/// forward matrices, hue/saturation map) and every look of `base` stay exactly as they are, so photos developed
+/// with them render as before; each look the exports name that `base` doesn't have gets its own tone curve and look
+/// table on that fixed camera model (stage 5), the closed loop through the real decode (stage 6) and the held-out
+/// gate (stage 7). The new looks are added after `base`'s, so its default (first) look stays the default. Exports
+/// of a look `base` already has are an error unless `replace` is set; then that look is refitted in its place
+/// (camera model still fixed) and its evidence replaced. "Before" in the evidence is the base file's own colour for
+/// the look (the replaced look, else its default look), not the app's estimated colour.
+///
+/// With [`FitOptions::since_process`] each fitted look is added as an entry for that process and newer
+/// ([`Look::since_process`]) next to the base's own, which keeps rendering every older process: a refit of a look the
+/// file has needs no `replace` then, unless the file already has an entry for that process.
+pub fn fit_on_base(photos: &[PhotoSamples], base: &Calibration, replace: bool, opts: &FitOptions) -> Result<Calibration> {
+    use lcc_camdb::calibration::{LOOK_PREFIX, look_id};
+    if photos.is_empty() {
+        return Err(Error("no photos to fit: collect pairs of raws and exports first".into()));
+    }
+    if photos.iter().any(|p| !base.matches(Some(&p.make), &p.model)) {
+        return Err(Error(format!("the photos are not all of the base calibration's camera ({} {})", base.make, base.model)));
+    }
+    if base.editor != opts.editor {
+        return Err(Error(format!("the base calibration is for {}, the exports for {}", base.editor.name(), opts.editor.name())));
+    }
+    let rounds = if opts.rounds == 0 { 3 } else { opts.rounds.min(8) };
+    let renamed: Vec<PhotoSamples> = photos
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            if opts.editor != Editor::Lightroom {
+                p.white.lightroom_temp_tint = None;
+            }
+            p.look = look_name_for(opts.editor, &p.look);
+            p
+        })
+        .collect();
+    let mut names: Vec<String> = renamed.iter().map(|p| p.look.clone()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.iter().any(|n| look_id(n) == LOOK_PREFIX) {
+        return Err(Error("an export has no usable profile name (crs:CameraProfile)".into()));
+    }
+    // the entry a fitted look takes the place of: same name and same first process
+    let since = opts.since_process;
+    let existing = |n: &str| base.looks.iter().position(|l| look_id(&l.name) == look_id(n) && l.since_process == since);
+    if !replace && let Some(n) = names.iter().find(|n| existing(n).is_some()) {
+        return Err(Error(format!(
+            "the base calibration already has the look {n:?}: export another profile, or pass --replace-looks to refit it on the base's camera model"
+        )));
+    }
+    let train: Vec<&PhotoSamples> = renamed.iter().filter(|p| !p.held_out).collect();
+    let cam = &base.camera;
+    let mut model = Model { cm: cam.color_matrix, fm: Some(cam.forward_matrix), hsm: cam.hue_sat_map.clone() };
+    let no_look = LookModel::default();
+    let mut looks = Vec::new();
+    for name in &names {
+        let set: Vec<&PhotoSamples> = train.iter().copied().filter(|p| p.look.trim() == name).collect();
+        let lp = pairs(&set, TABLE_SAMPLES);
+        if lp.len() < 50 {
+            eprintln!("note: look {name:?} left out: only {} usable colour samples in its training photos", lp.len());
+            continue;
+        }
+        let tone = fit_tone(&tone_pairs(&model, &no_look, &set, &lp))?;
+        let lut = lut_for(&tone)?;
+        let mut look = LookModel::default();
+        for _ in 0..rounds {
+            table_round(&mut model.clone(), &mut look, Which::Look, &set, &lp, &lut);
+        }
+        if look.table.as_ref().is_some_and(table::is_identity) {
+            look.table = None;
+        }
+        looks.push(FittedLook { name: name.clone(), look, tone, lut });
+    }
+    if looks.is_empty() {
+        return Err(Error("no look had enough training samples: add photos or hold out fewer".into()));
+    }
+    let who = Who { make: &base.make, model: &base.model, contributor: opts.contributor.as_deref(), editor: opts.editor };
+    // no look is named as the base, so the closed loop refits look tables and tone curves only, never the camera
+    // model; the model is restored afterwards all the same, as the file's camera model is what must not change
+    closed_loop(&mut model, &mut looks, &train, "", &who, cam.forward_matrix);
+    let model = Model { cm: cam.color_matrix, fm: Some(cam.forward_matrix), hsm: cam.hue_sat_map.clone() };
+
+    // gate each fitted look on its held-out photos against the base file's colour for it
+    let candidate = assemble(&who, &model, &looks, cam.forward_matrix, Evidence::default());
+    let mut kept: Vec<(FittedLook, LookEvidence)> = Vec::new();
+    for l in looks {
+        let of_look = |held: bool| -> Vec<&PhotoSamples> { renamed.iter().filter(|p| p.held_out == held && p.look.trim() == l.name).collect() };
+        let (held, trained) = (of_look(true), of_look(false));
+        if held.is_empty() {
+            return Err(Error(format!("look {:?}: no held-out photos to check it on: hold out at least one of its photos", l.name)));
+        }
+        let ps = pairs(&held, usize::MAX);
+        // what the base file renders the look with today, at the process the new entry is for
+        let before_look = base.look_at(&look_id(&l.name), since.unwrap_or(0)).or_else(|| base.default_look());
+        let real = candidate.looks.iter().find(|c| c.name == l.name).ok_or_else(|| Error("look missing from the candidate".into())).and_then(|cl| {
+            Ok((real_outputs(&held, &ps, before_look.map(|b| base.look_dcp(b)))?, real_outputs(&held, &ps, Some(candidate.look_dcp(cl)))?))
+        });
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        match real {
+            Ok((rb, ra)) => {
+                for ((s, b), a) in ps.iter().zip(&rb).zip(&ra) {
+                    if let (Some(b), Some(a)) = (b, a) {
+                        before.push(deltae::de2000(deltae::lab(*b), s.lab));
+                        after.push(deltae::de2000(deltae::lab(*a), s.lab));
+                    }
+                }
+            }
+            Err(e) => eprintln!("note: {}: ΔE00 from the analytic model, a raw could not be rendered ({e})", l.name),
+        }
+        if before.is_empty() {
+            let (bl, btone) = match before_look {
+                Some(b) => (LookModel { offset: b.baseline_exposure_offset, table: b.look_table.clone() }, b.tone_curve.clone()),
+                None => (LookModel::default(), Vec::new()),
+            };
+            let blut = if btone.is_empty() { pipe::Lut::build(None)? } else { lut_for(&btone)? };
+            before = errors(&model, &bl, &blut, &held, &ps);
+            after = errors(&model, &l.look, &l.lut, &held, &ps);
+        }
+        let (b, a) = (deltae::summary(&before), deltae::summary(&after));
+        if !(a.median < b.median && a.p95 < b.p95) {
+            eprintln!(
+                "note: look {:?} left out: on the held-out photos it does not beat the base file's colour (ΔE00 median {:.2} vs {:.2}, p95 {:.2} vs {:.2})",
+                l.name, a.median, b.median, a.p95, b.p95
+            );
+            continue;
+        }
+        let ev = LookEvidence {
+            name: l.name.clone(),
+            photos: count_photos(&trained),
+            held_out: count_photos(&held),
+            before: b,
+            after: a,
+            since_process: opts.since_process,
+        };
+        kept.push((l, ev));
+    }
+    if kept.is_empty() {
+        return Err(Error("no fitted look beats the base file's colour on its held-out photos; nothing to add".into()));
+    }
+
+    if since.is_some_and(|p| p < 2) {
+        return Err(Error("--since-process: a look entry for newer processes starts at process 2 or later".into()));
+    }
+    let mut cal = base.clone();
+    cal.tool_version = env!("CARGO_PKG_VERSION").into();
+    if let Some(c) = opts.contributor.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        cal.contributor = Some(c.to_string());
+    }
+    for (l, ev) in kept {
+        let look = Look {
+            name: l.name.clone(),
+            baseline_exposure_offset: l.look.offset,
+            look_table: l.look.table.clone(),
+            tone_curve: l.tone.clone(),
+            since_process: opts.since_process,
+        };
+        match existing(&l.name).and_then(|i| cal.looks.get_mut(i)) {
+            Some(slot) => *slot = look,
+            None => cal.looks.push(look),
+        }
+        let id = look_id(&ev.name);
+        match cal.evidence.looks.iter_mut().find(|e| look_id(&e.name) == id && e.since_process == since) {
+            Some(slot) => *slot = ev,
+            None => cal.evidence.looks.push(ev),
+        }
+    }
     cal.validate().map_err(|e| Error(format!("the fitted calibration is not valid: {e}")))?;
     Ok(cal)
 }
@@ -687,6 +868,7 @@ fn assemble(who: &Who, model: &Model, looks: &[FittedLook], prior_fm: [Mat3; 2],
                 baseline_exposure_offset: l.look.offset,
                 look_table: l.look.table.clone(),
                 tone_curve: l.tone.clone(),
+                since_process: None,
             })
             .collect(),
         evidence,

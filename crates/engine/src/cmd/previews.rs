@@ -764,7 +764,21 @@ pub fn build_after_import(s: &mut Session, ids: &[lcc_catalog::PhotoId]) {
 /// vendor raws and DNGs (whose tone can come from their preview); only those proxies go stale when
 /// the fit changes; an older encoding makes any proxy stale).
 #[cfg(not(target_arch = "wasm32"))]
-type SmartJob = (lcc_catalog::PhotoId, std::path::PathBuf, Option<crate::media::SourceRef>, bool);
+type SmartJob = (lcc_catalog::PhotoId, std::path::PathBuf, Option<crate::media::SourceRef>, Option<u32>, Option<f32>);
+
+/// The camera-look fit a photo's proxy must have been made with (`smart::is_stale_for`), `None` when it takes no
+/// per-file look: that of its process (V1 to V8 keep an older fit than V9's, `camera_preview::FitGen`).
+#[cfg(not(target_arch = "wasm32"))]
+fn proxy_look(p: &lcc_catalog::Photo) -> Option<u32> {
+    preview_fitted_look(p).then(|| crate::camera_preview::FitGen::of_process(crate::media::LoadOptions::of(&p.develop).process).look_version())
+}
+
+/// The highlight headroom (stops) photo `p`'s proxy must be made with: `None` when it doesn't develop a raw (its
+/// decode has none).
+#[cfg(not(target_arch = "wasm32"))]
+fn proxy_headroom(p: &lcc_catalog::Photo) -> Option<f32> {
+    p.develops_raw().then(|| crate::files::headroom_of(&crate::media::LoadOptions::of(&p.develop)))
+}
 
 /// DNG tone fits also go stale, although DNGs keep their own matrix and Kelvin white-balance scale.
 /// So do preview-only raws: their proxy is the embedded JPEG, read in the colour space the raw
@@ -837,7 +851,7 @@ fn smart_run(
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
     }
-    for (id, path, source, look) in jobs {
+    for (id, path, source, look, headroom) in jobs {
         if state.is_some_and(|(st, _)| st.cancel.load(Ordering::Relaxed)) {
             break;
         }
@@ -855,7 +869,7 @@ fn smart_run(
             // fit (see `smart::ENCODE_VERSION` and `camera_preview::LOOK_VERSION`) when its
             // original can be read
             let damaged = path.exists();
-            let stale = damaged && crate::smart::is_stale_for(&path, look);
+            let stale = damaged && crate::smart::is_stale_for(&path, look, headroom);
             if damaged && !stale && crate::smart::is_valid(&path) {
                 n.built += 1;
             } else {
@@ -870,7 +884,9 @@ fn smart_run(
                     .and_then(|s| s.load_source())
                     .and_then(|src| {
                         let info = src.info_or(Default::default());
-                        crate::smart::encode(&src.image, Some(&info))
+                        let headroom = if info.raw { crate::files::headroom_of(&src.options) } else { 0.0 };
+                        let look = crate::camera_preview::FitGen::of_process(src.options.process).look_version();
+                        crate::smart::encode_for(&src.image, Some(&info), headroom, look)
                     })
                     .and_then(|b| {
                         let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
@@ -941,7 +957,7 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let path = crate::smart::sharded_file_path(&dir, &ph);
         let source = (!discard).then(|| s.media.source_ref(&ph, crate::media::SourceLevel::Preview));
-        jobs.push((id, path, source, preview_fitted_look(&ph)));
+        jobs.push((id, path, source, proxy_look(&ph), proxy_headroom(&ph)));
     }
     let custom = s.smart_previews_dir.is_some();
     if background {
@@ -986,7 +1002,17 @@ pub(crate) fn refresh_stale_smart_previews(s: &mut Session) -> Option<std::threa
     let photos: Vec<_> = s.catalog.photos().filter(|p| matches!(p.source, lcc_catalog::Source::File { .. })).collect();
     let jobs: Vec<SmartJob> = photos
         .iter()
-        .map(|p| (p.id, crate::smart::sharded_file_path(&dir, p), Some(s.media.origin_ref(&p.source, max_edge)), preview_fitted_look(p)))
+        .map(|p| {
+            // (rebuilt with the highlight headroom the photo's decode takes, or it would stay stale)
+            let mut source = s.media.origin_ref(&p.source, max_edge);
+            // (and the camera-look fit of its process)
+            if let crate::media::SourceRef::File { options, .. } = &mut source {
+                let wanted = crate::media::LoadOptions::of(&p.develop);
+                options.highlight_headroom = wanted.highlight_headroom;
+                options.process = wanted.process;
+            }
+            (p.id, crate::smart::sharded_file_path(&dir, p), Some(source), proxy_look(p), proxy_headroom(p))
+        })
         .collect();
     std::thread::Builder::new()
         .name("lc-smart-look".into())
@@ -1000,8 +1026,8 @@ pub(crate) fn refresh_stale_smart_previews(s: &mut Session) -> Option<std::threa
 fn refresh_stale(dir: &std::path::Path, jobs: Vec<SmartJob>) {
     let stale: Vec<SmartJob> = jobs
         .into_iter()
-        .map(|(id, path, source, look)| (id, crate::smart::existing_file_path(dir, path), source, look))
-        .filter(|(_, path, _, look)| crate::smart::is_stale_for(path, *look))
+        .map(|(id, path, source, look, headroom)| (id, crate::smart::existing_file_path(dir, path), source, look, headroom))
+        .filter(|(_, path, _, look, headroom)| crate::smart::is_stale_for(path, *look, *headroom))
         .collect();
     if !stale.is_empty() {
         // `custom`: the folder is there already, and must not be recreated if it went away since

@@ -3,7 +3,7 @@
 
 use lcc_color::spline::Lut1;
 use lcc_develop::VignetteStyle;
-use lcc_pipeline::colorops::{HSL_WORDS, MIXER_WORDS, POINT_WORDS};
+use lcc_pipeline::colorops::{HSL_WORDS, MIXER_WORDS, Mixer, POINT_WORDS};
 use lcc_pipeline::finish::{CURVE_LUT_N, FinishParams, MASK_TERMS, srgb_lut};
 
 use crate::ctx::{FailKind, fail};
@@ -26,6 +26,12 @@ const FIELDS: &[(&str, usize)] = &[
     ("SRGB_OFF", 1),
     ("CURVE_OFF", 1),
     ("CURVES", 1),
+    // process V9's Tone Curve before the output transform (`FinishParams::curves_pp`): four tables at PPCURVE_OFF
+    // (parametric ∘ master, red, green, blue) and the working ↔ ProPhoto matrices
+    ("PPCURVES", 1),
+    ("PPCURVE_OFF", 1),
+    ("PP_M", 9),
+    ("PP_INV", 9),
     // the masks' local Curves: a slot per mask (its table set, or −1), then the table sets
     ("LCURVE_OFF", 1),
     // the masks' local Point Color: one record of `LOCAL_POINT_WORDS` per mask in `aux`
@@ -38,6 +44,48 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR_PRE", 1),
     ("HL", 1),
     ("SH", 1),
+    // process V9's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
+    ("LIFT", 1),
+    ("LIFT_OFF", 1),
+    ("LIFT_N", 1),
+    ("LIFT_LO", 1),
+    ("LIFT_STEP", 1),
+    // process V9's extra Highlights pull next to clipped areas (`FinishParams::edge_pull`): its plane in `aux` at
+    // EDGE_OFF, EDGE_W × EDGE_H, read at (origin + pixel + 0.5) · scale − 0.5 and scaled by EDGE_GAIN
+    ("EDGE_PULL", 1),
+    ("EDGE_OFF", 1),
+    ("EDGE_W", 1),
+    ("EDGE_H", 1),
+    ("EDGE_GAIN", 1),
+    ("EDGE_SX", 1),
+    ("EDGE_SY", 1),
+    ("EDGE_OX", 1),
+    ("EDGE_OY", 1),
+    // …the surroundings' base on the same grid at EDGE_WIDE_OFF (0 = none), where the picture's pull table (on the
+    // LIFT grid, at EDGE_TABLE_OFF) is read
+    ("EDGE_WIDE_OFF", 1),
+    ("EDGE_TABLE_OFF", 1),
+    // …whose cells count by how close their tone is to the pixel's own, by a Gaussian of this sigma (EV)
+    ("EDGE_READ_TONE", 1),
+    // …plus this much of plain nearness, so a pixel with no cell near its tone doesn't take the least-far cell's
+    ("EDGE_READ_FLOOR", 1),
+    // across a step in the surroundings: the span planes (0 = none) and the grading by own tone
+    ("EDGE_SPAN_OFF", 1),
+    ("EDGE_STEP_GAP", 1),
+    // a grid cell reads the cells beside it at this share per row and column
+    ("EDGE_CELL_SIDE", 1),
+    ("EDGE_STEP_RAMP", 1),
+    ("EDGE_STEP_TOP", 1),
+    // process V9's highlight lift under a negative Exposure (`FinishParams::negev_lift`): its table (NEGEV_N rows, by
+    // headroom under NEGEV_WHITE in steps of NEGEV_STEP, of NEGEV_GAPS columns, by the brightest channel's gap over
+    // luminance in steps of NEGEV_GAP_STEP) in `aux` at NEGEV_OFF
+    ("NEGEV", 1),
+    ("NEGEV_OFF", 1),
+    ("NEGEV_N", 1),
+    ("NEGEV_STEP", 1),
+    ("NEGEV_WHITE", 1),
+    ("NEGEV_GAPS", 1),
+    ("NEGEV_GAP_STEP", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -47,6 +95,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("HUE_CLIP", 1),
     // process V8: 8-bit output is ordered-dithered (`lcc_pipeline::finish::bayer_dither_offset`)
     ("DITHER", 1),
+    // process V9: bright colours take the tone curve per channel (`lcc_pipeline::finish::top_shoulder`)
+    ("TOP_SHOULDER", 1),
     ("SHARPEN", 1),
     ("SHARPEN_MASK", 1),
     ("SHARPEN_LIMIT", 1),
@@ -64,6 +114,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("MIX_HUE", 8),
     ("MIX_SAT", 8),
     ("MIX_LUM", 8),
+    // process V9's measured Color Mixer (`ColorOps::measured`): its block in `aux` at MIXT_OFF
+    ("MIXT", 1),
+    ("MIXT_OFF", 1),
     ("NPC", 1),
     ("PC", 8 * POINT_WORDS),
     ("BW", 1),
@@ -72,6 +125,11 @@ const FIELDS: &[(&str, usize)] = &[
     ("WHEELS", 12),
     ("BLENDING", 1),
     ("BALANCE", 1),
+    ("SPLIT", 1),
+    ("SPLIT_K", lcc_pipeline::split_v9::SPLIT_WORDS),
+    ("SPLIT_ZSH", 61),
+    ("SPLIT_ZHL", 61),
+    ("SPLIT_ZMIX", 61),
     ("SKIN", 1),
     ("BANDH", 8),
     // the colourist primaries (`PrimariesK`): the Color wheels then the Log wheels (rgb + master
@@ -143,8 +201,14 @@ const FIELDS: &[(&str, usize)] = &[
     ("REFINE_SAT", 1),
     ("CALIB", 1),
     ("CALIB_M", 9),
+    // process V9: the base tone on each linear ProPhoto channel (`FinishParams::tone_per_channel`), these matrices
+    // working space → ProPhoto and back
+    ("TONE_PC", 1),
+    ("TONE_PC_TO", 9),
+    ("TONE_PC_FROM", 9),
     ("SHADOW_TINT", 1),
     ("OUT_M", 9),
+    ("OUT_INV", 9),
     ("OUT_Y", 3),
     ("OUT_TRC", 1),
     ("OUT_GAMMA", 1),
@@ -261,6 +325,17 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
             aux.extend_from_slice(&l.v);
         }
     }
+    let ppcurve_off = aux.len();
+    if let Some(c) = &fp.curves_pp {
+        for l in c {
+            if l.v.len() != CURVE_N as usize {
+                // as for `curves` above: a wrong length would shift every later offset
+                fail(FailKind::Fatal, format!("curve table has {} entries, expected {}", l.v.len(), CURVE_N));
+                return (Vec::new(), aux);
+            }
+            aux.extend_from_slice(&l.v);
+        }
+    }
     let mask_off = aux.len();
     for m in masks {
         aux.extend_from_slice(m);
@@ -286,10 +361,60 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some((l, _)) = lut {
         aux.extend(l.data.iter().flatten());
     }
+    // process V9's Highlights / Shadows table
+    let lift_off = aux.len();
+    let lift = fp.lift.as_ref().filter(|l| l.0.len() == lcc_pipeline::tone_lift::LIFT_N);
+    if let Some(l) = lift {
+        aux.extend_from_slice(&l.0);
+    }
+    // process V9's raw Highlights pull (only with the table it adds to, as on the CPU)
+    let edge_off = aux.len();
+    let edge = fp
+        .edge_pull
+        .as_ref()
+        .filter(|e| lift.is_some() && e.plane.width > 0 && e.plane.height > 0 && e.plane.data.len() == e.plane.width * e.plane.height);
+    if let Some(e) = edge {
+        aux.extend_from_slice(&e.plane.data);
+    }
+    let lean = edge.filter(|e| e.wide.data.len() == e.plane.data.len() && e.pull.0.len() == lcc_pipeline::tone_lift::LIFT_N);
+    let (wide_off, table_off) = (aux.len(), aux.len() + lean.map_or(0, |e| e.wide.data.len()));
+    if let Some(e) = lean {
+        aux.extend_from_slice(&e.wide.data);
+        aux.extend_from_slice(&e.pull.0);
+    }
+    // the surroundings' darkest and brightest near each cell, one plane after the other
+    let span = lean.filter(|e| e.span.0.data.len() == e.wide.data.len() && e.span.1.data.len() == e.wide.data.len());
+    let span_off = if span.is_some() { aux.len() } else { 0 };
+    if let Some(e) = span {
+        aux.extend_from_slice(&e.span.0.data);
+        aux.extend_from_slice(&e.span.1.data);
+    }
+    // process V9's highlight lift under a negative Exposure
+    let negev_off = aux.len();
+    let negev =
+        fp.negev_lift.as_ref().filter(|l| l.table.len() == lcc_pipeline::negev_lift::N * lcc_pipeline::negev_lift::GAPS && l.white.is_finite());
+    if let Some(l) = negev {
+        aux.extend_from_slice(&l.table);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
     let mixers_ok = fp.local_mixers.len() == masks.len();
+    // process V9's measured Color Mixers: the colour-space matrices, then the tables; the global one,
+    // then each mask's (its record holds the offset)
+    let measured_block = |m: &lcc_pipeline::mixer_measured::Measured, aux: &mut Vec<f32>| {
+        let o = aux.len();
+        aux.extend_from_slice(&m.matrices());
+        aux.extend(m.words());
+        o
+    };
+    let mixt_off = fp.ops.measured.as_deref().map(|m| measured_block(m, &mut aux));
+    let local_mixt: Vec<Option<usize>> = (0..masks.len())
+        .map(|m| match fp.local_mixers.get(m).and_then(Option::as_ref).filter(|_| mixers_ok) {
+            Some(Mixer::Measured(t)) => Some(measured_block(t, &mut aux)),
+            _ => None,
+        })
+        .collect();
     let lpoints = !masks.is_empty() && ((points_ok && !fp.local_points.is_empty()) || (mixers_ok && !fp.local_mixers.is_empty()));
     let lpoint_off = aux.len();
     if lpoints {
@@ -297,11 +422,21 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
             let mut rec = [0.0f32; LOCAL_POINT_WORDS];
             let points: &[lcc_pipeline::colorops::PointK] = if points_ok { fp.local_points.get(m).map_or(&[], Vec::as_slice) } else { &[] };
             rec[0] = points.len().min(8) as f32;
-            if let Some(mk) = fp.local_mixers.get(m).copied().flatten().filter(|_| mixers_ok) {
-                rec[1] = 1.0;
-                for (slot, v) in rec.iter_mut().skip(2).zip(mk.words()) {
-                    *slot = v;
+            match fp.local_mixers.get(m).and_then(Option::as_ref).filter(|_| mixers_ok) {
+                Some(Mixer::Bands(mk)) => {
+                    rec[1] = 1.0;
+                    for (slot, v) in rec.iter_mut().skip(2).zip(mk.words()) {
+                        *slot = v;
+                    }
                 }
+                // the block's offset, bit for bit (an f32 holds integers exactly only up to 2^24)
+                Some(Mixer::Measured(_)) => {
+                    if let Some(o) = local_mixt.get(m).copied().flatten().and_then(|o| u32::try_from(o).ok()) {
+                        rec[1] = 2.0;
+                        rec[2] = f32::from_bits(o);
+                    }
+                }
+                None => {}
             }
             for (slot, v) in rec.iter_mut().skip(LOCAL_POINT_SAMPLES).zip(points.iter().take(8).flat_map(|k| k.words())) {
                 *slot = v;
@@ -318,6 +453,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.u("SRGB_OFF", srgb_off as u32);
     p.u("CURVE_OFF", curve_off as u32);
     p.b("CURVES", fp.curves.is_some());
+    if fp.curves_pp.is_some() {
+        let (to_pp, from_pp) = lcc_pipeline::finish::prophoto_matrices();
+        p.b("PPCURVES", true);
+        p.u("PPCURVE_OFF", ppcurve_off as u32);
+        p.fs("PP_M", to_pp.as_flattened());
+        p.fs("PP_INV", from_pp.as_flattened());
+    }
     p.u("LCURVE_OFF", lcurve_off as u32);
     p.b("LCURVES", next > 0.0);
     p.b("LPOINTS", lpoints);
@@ -336,6 +478,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.b("SHARPEN_V4", fp.sharpen_v4);
     p.b("HUE_CLIP", fp.hue_clip);
     p.b("DITHER", fp.dither);
+    p.b("TOP_SHOULDER", fp.top_shoulder);
     p.f("SHARPEN", fp.sharpen);
     p.f("SHARPEN_MASK", fp.sharpen_mask);
     p.f("SHARPEN_LIMIT", fp.sharpen_limit);
@@ -355,6 +498,8 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.fs("MIX_HUE", &ops.hue);
     p.fs("MIX_SAT", &ops.sat);
     p.fs("MIX_LUM", &ops.lum);
+    p.b("MIXT", mixt_off.is_some());
+    p.u("MIXT_OFF", mixt_off.and_then(|o| u32::try_from(o).ok()).unwrap_or(0));
     p.u("NPC", ops.points.len().min(8) as u32);
     let pc: Vec<f32> = ops.points.iter().take(8).flat_map(|k| k.words()).collect();
     p.fs("PC", &pc);
@@ -388,6 +533,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.b("HSL", true);
         p.fs("HSL_LUT", &hsl.words());
     }
+    if let Some(k) = &ops.split {
+        p.b("SPLIT", true);
+        p.fs("SPLIT_K", &k.words());
+        p.fs("SPLIT_ZSH", &lcc_pipeline::split_v9::SPLIT_ZONE_SH);
+        p.fs("SPLIT_ZHL", &lcc_pipeline::split_v9::SPLIT_ZONE_HL);
+        p.fs("SPLIT_ZMIX", &lcc_pipeline::split_v9::SPLIT_MIX);
+    }
     p.f("SKIN", ops.skin);
     p.fs("BANDH", lcc_pipeline::colorops::band_hues());
 
@@ -414,8 +566,18 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.b("CALIB", true);
         p.fs("CALIB_M", m.as_flattened());
     }
+    if let Some([to, from]) = &fp.tone_per_channel {
+        p.b("TONE_PC", true);
+        p.fs("TONE_PC_TO", to.as_flattened());
+        p.fs("TONE_PC_FROM", from.as_flattened());
+    }
     p.f("SHADOW_TINT", fp.shadow_tint);
     p.fs("OUT_M", fp.to_out.as_flattened());
+    match lcc_pipeline::finish::inv3(&fp.to_out) {
+        Some(m) => p.fs("OUT_INV", m.as_flattened()),
+        // singular output matrix (never in practice): no split, as the CPU
+        None => p.b("SPLIT", false),
+    }
     p.fs("OUT_Y", &fp.out_luma);
     let (trc, gamma) = fp.out_trc.code();
     p.u("OUT_TRC", trc);
@@ -436,6 +598,44 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.f("LUT_AMT", *amount);
         p.fs("LUT_MIN", &l.domain_min);
         p.fs("LUT_MAX", &l.domain_max);
+    }
+    if lift.is_some() {
+        p.b("LIFT", true);
+        p.u("LIFT_OFF", lift_off as u32);
+        p.u("LIFT_N", lcc_pipeline::tone_lift::LIFT_N as u32);
+        p.f("LIFT_LO", lcc_pipeline::tone_lift::LIFT_LO);
+        p.f("LIFT_STEP", lcc_pipeline::tone_lift::LIFT_STEP);
+    }
+    if let Some(e) = edge {
+        p.b("EDGE_PULL", true);
+        p.u("EDGE_OFF", edge_off as u32);
+        p.u("EDGE_W", e.plane.width as u32);
+        p.u("EDGE_H", e.plane.height as u32);
+        p.f("EDGE_GAIN", e.gain);
+        p.f("EDGE_SX", e.scale.0);
+        p.f("EDGE_SY", e.scale.1);
+        p.u("EDGE_OX", u32::try_from(e.origin.0).unwrap_or(u32::MAX));
+        p.u("EDGE_OY", u32::try_from(e.origin.1).unwrap_or(u32::MAX));
+    }
+    if lean.is_some() {
+        p.u("EDGE_WIDE_OFF", wide_off as u32);
+        p.u("EDGE_TABLE_OFF", table_off as u32);
+        p.f("EDGE_READ_TONE", lcc_pipeline::hl_edge::READ_TONE);
+        p.f("EDGE_READ_FLOOR", lcc_pipeline::hl_edge::READ_FLOOR);
+        p.u("EDGE_SPAN_OFF", span_off as u32);
+        p.f("EDGE_STEP_GAP", lcc_pipeline::hl_edge::STEP_GAP);
+        p.f("EDGE_CELL_SIDE", lcc_pipeline::hl_edge::CELL_SIDE);
+        p.f("EDGE_STEP_RAMP", lcc_pipeline::hl_edge::STEP_RAMP);
+        p.f("EDGE_STEP_TOP", lcc_pipeline::hl_edge::STEP_TOP);
+    }
+    if let Some(l) = negev {
+        p.b("NEGEV", true);
+        p.u("NEGEV_OFF", negev_off as u32);
+        p.u("NEGEV_N", lcc_pipeline::negev_lift::N as u32);
+        p.f("NEGEV_STEP", lcc_pipeline::negev_lift::STEP);
+        p.f("NEGEV_WHITE", l.white);
+        p.u("NEGEV_GAPS", lcc_pipeline::negev_lift::GAPS as u32);
+        p.f("NEGEV_GAP_STEP", lcc_pipeline::negev_lift::GAP_STEP);
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

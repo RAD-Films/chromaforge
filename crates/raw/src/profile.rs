@@ -477,6 +477,12 @@ impl ProfileTables {
         Some(ProfileTables { hue_sat, look: look.look_table.clone(), to_prophoto: to.to_f32(), from_prophoto: from.to_f32() })
     }
 
+    /// The hue/saturation map, the look table and the matrices into and out of linear ProPhoto RGB (from and to linear
+    /// Rec.2020 D65), for a renderer that applies them itself (the GPU's twin of [`Self::apply`]).
+    pub fn parts(&self) -> (Option<&HsvTable>, Option<&HsvTable>, &[[f32; 3]; 3], &[[f32; 3]; 3]) {
+        (self.hue_sat.as_ref(), self.look.as_ref(), &self.to_prophoto, &self.from_prophoto)
+    }
+
     /// Hue/saturation map, then `gain` (exposure compensation), then the look table:
     /// linear Rec.2020 D65 in, linear Rec.2020 D65 out.
     #[inline]

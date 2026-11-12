@@ -107,6 +107,8 @@ pub const LOOK_PREFIX: &str = "cal:";
 const MAX_TABLE: usize = 1 << 16;
 /// Largest number of looks per camera.
 const MAX_LOOKS: usize = 16;
+/// The highest process number a look entry may name ([`Look::since_process`]).
+const MAX_PROCESS: u32 = 999;
 /// Largest number of tone-curve points.
 const MAX_TONE_POINTS: usize = 1024;
 
@@ -175,6 +177,13 @@ pub struct Look {
     /// `ProfileToneCurve`: linear (input, output) pairs from (0, 0) to (1, 1); empty: none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tone_curve: Vec<[f32; 2]>,
+    /// The first process version (number) this entry renders under; `None`: every process. A file can hold a look
+    /// twice under one name, once without and once with this, so a refit reaches only photos on a newer process
+    /// while older edits keep rendering as they were: a photo gets the entry with the highest `since_process` its
+    /// process allows ([`Calibration::look_at`]). Only entries without it are the look as V1–V7 and older files
+    /// know it ([`Calibration::default_look`], [`Calibration::look`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_process: Option<u32>,
 }
 
 /// What the calibration was fitted on and how well it does.
@@ -217,6 +226,9 @@ pub struct LookEvidence {
     /// The app's colour before (its estimated colour) and with this calibration.
     pub before: DeltaE,
     pub after: DeltaE,
+    /// The look entry's [`Look::since_process`], when the evidence is for a process-gated entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_process: Option<u32>,
 }
 
 /// Median and 95th percentile of ΔE00.
@@ -394,14 +406,17 @@ impl Calibration {
         if self.looks.is_empty() || self.looks.len() > MAX_LOOKS {
             return Err(Error(format!("{name}: needs 1 to {MAX_LOOKS} looks")));
         }
-        let mut ids: Vec<String> = Vec::new();
+        let mut ids: Vec<(String, Option<u32>)> = Vec::new();
         for look in &self.looks {
             check_identifier("look name", &look.name, 64).map_err(err)?;
             let id = look_id(&look.name);
-            if id == LOOK_PREFIX || ids.contains(&id) {
+            if id == LOOK_PREFIX || ids.contains(&(id.clone(), look.since_process)) {
                 return Err(Error(format!("{name}: look {:?} has no usable or a duplicate id", look.name)));
             }
-            ids.push(id);
+            if look.since_process.is_some_and(|p| !(2..=MAX_PROCESS).contains(&p)) {
+                return Err(Error(format!("{name}: look {:?} names a process out of range", look.name)));
+            }
+            ids.push((id, look.since_process));
             if !look.baseline_exposure_offset.is_finite() || look.baseline_exposure_offset.abs() > 4.0 {
                 return Err(Error(format!("{name}: look {:?} has an exposure offset out of range", look.name)));
             }
@@ -429,14 +444,23 @@ impl Calibration {
         Ok(())
     }
 
-    /// The camera's default look (the first).
+    /// The camera's default look (the first one for every process).
     pub fn default_look(&self) -> Option<&Look> {
-        self.looks.first()
+        self.looks.iter().find(|l| l.since_process.is_none())
     }
 
-    /// The look with id `id` (`cal:<slug>`, [`look_id`]).
+    /// The look with id `id` (`cal:<slug>`, [`look_id`]), as every process has it.
     pub fn look(&self, id: &str) -> Option<&Look> {
-        self.looks.iter().find(|l| look_id(&l.name) == id)
+        self.looks.iter().find(|l| l.since_process.is_none() && look_id(&l.name) == id)
+    }
+
+    /// The look with id `id` a photo on process `process` (its number) renders with: the entry with the highest
+    /// [`Look::since_process`] up to `process`, else the one for every process.
+    pub fn look_at(&self, id: &str, process: u32) -> Option<&Look> {
+        self.looks
+            .iter()
+            .filter(|l| look_id(&l.name) == id && l.since_process.is_none_or(|p| p <= process))
+            .max_by_key(|l| l.since_process.unwrap_or(0))
     }
 
     /// Whether the calibration is for a camera (Exif make and model): its model or an alias, compared without case
@@ -505,10 +529,19 @@ impl Calibration {
     pub fn calibrated(&self) -> lcc_raw::dcp::Calibrated {
         let names: Vec<String> =
             std::iter::once(&self.model).chain(&self.aliases).map(|m| format!("{} {}", super::brand(&self.make), m.trim())).collect();
-        let looks = self.looks.iter().map(|l| (look_id(&l.name), std::sync::Arc::new(self.look_dcp(l)))).collect();
+        let looks =
+            self.looks.iter().filter(|l| l.since_process.is_none()).map(|l| (look_id(&l.name), std::sync::Arc::new(self.look_dcp(l)))).collect();
+        let gated = self.looks.iter().filter_map(|l| Some((look_id(&l.name), l.since_process?, std::sync::Arc::new(self.look_dcp(l))))).collect();
         // only a Lightroom calibration gives the camera a default look; other editors' looks are chosen per photo
         let default = (self.editor == Editor::Lightroom).then(|| self.default_look().map(|l| look_id(&l.name))).flatten();
-        lcc_raw::dcp::Calibrated { make: super::brand(&self.make), names, lens: self.lens.as_ref().map(|l| l.trim().to_string()), looks, default }
+        lcc_raw::dcp::Calibrated {
+            make: super::brand(&self.make),
+            names,
+            lens: self.lens.as_ref().map(|l| l.trim().to_string()),
+            looks,
+            gated,
+            default,
+        }
     }
 
     /// The file name a calibration is kept under: `<Make>_<Model>.json` for Lightroom, `<Make>_<Model>_<editor>.json`
@@ -591,8 +624,9 @@ mod tests {
                     baseline_exposure_offset: 0.25,
                     look_table: Some(table),
                     tone_curve: vec![[0.0, 0.0], [0.18, 0.3], [1.0, 1.0]],
+                    since_process: None,
                 },
-                Look { name: "Adobe Standard".into(), baseline_exposure_offset: 0.0, look_table: None, tone_curve: vec![] },
+                Look { name: "Adobe Standard".into(), baseline_exposure_offset: 0.0, look_table: None, tone_curve: vec![], since_process: None },
             ],
             evidence: Evidence {
                 photos: 30,
@@ -606,9 +640,43 @@ mod tests {
                     held_out: 6,
                     before: DeltaE { median: 5.0, p95: 12.0 },
                     after: DeltaE { median: 1.2, p95: 3.4 },
+                    since_process: None,
                 }],
             },
         }
+    }
+
+    #[test]
+    fn a_look_entry_for_newer_processes_leaves_the_file_as_older_processes_read_it() {
+        let old = sample();
+        let json = old.to_json().unwrap();
+        assert!(!json.contains("since_process"), "a file without gated entries is written as before");
+        assert_eq!(Calibration::parse(&json).unwrap(), old, "and reads back the same");
+        let mut cal = old.clone();
+        let mut refit = cal.looks[1].clone();
+        refit.tone_curve = vec![[0.0, 0.0], [0.18, 0.25], [1.0, 1.0]];
+        refit.since_process = Some(8);
+        cal.looks.push(refit.clone());
+        cal.validate().unwrap();
+        let back = Calibration::parse(&cal.to_json().unwrap()).unwrap();
+        assert_eq!(back, cal);
+        let id = look_id("Adobe Standard");
+        assert_eq!(back.look(&id), Some(&old.looks[1]), "the look as every process has it");
+        assert_eq!(back.look_at(&id, 7), Some(&old.looks[1]));
+        assert_eq!(back.look_at(&id, 8), Some(&refit));
+        assert_eq!(back.look_at(&id, 30), Some(&refit));
+        assert_eq!(back.default_look(), old.default_look());
+        let reg = back.calibrated();
+        assert_eq!(reg.looks.len(), old.looks.len());
+        assert_eq!(reg.gated.len(), 1);
+        assert_eq!((reg.gated[0].0.as_str(), reg.gated[0].1), (id.as_str(), 8));
+        // two entries for the same process, or a process out of range, are invalid
+        let mut twice = cal.clone();
+        twice.looks.push(refit.clone());
+        assert!(twice.validate().is_err());
+        let mut far = old.clone();
+        far.looks.push(Look { since_process: Some(1), ..refit });
+        assert!(far.validate().is_err());
     }
 
     #[test]

@@ -57,6 +57,7 @@ const MODULES: &[Module] = &[
             "guided_ab",
             "guided_apply",
             "wb_k",
+            "wb_tables_k",
             "nr_lum",
             "chroma_k",
             "clamp0_k",
@@ -497,6 +498,13 @@ fn constants() -> String {
     s += &format!("const POINT_WORDS: u32 = {}u;\n", lcc_pipeline::colorops::POINT_WORDS);
     s += &format!("const LOCAL_POINT_WORDS: u32 = {}u;\n", crate::params::LOCAL_POINT_WORDS);
     s += &format!("const LOCAL_POINT_SAMPLES: u32 = {}u;\n", crate::params::LOCAL_POINT_SAMPLES);
+    {
+        use lcc_pipeline::mixer_measured::{HUES, NODES, SATS, VALS};
+        s += &format!(
+            "const MT_HUES: u32 = {HUES}u;\nconst MT_SATS: u32 = {SATS}u;\nconst MT_VALS: u32 = {VALS}u;\nconst MT_STEP: u32 = {}u;\n",
+            1 + NODES * 3
+        );
+    }
     s += &format!("const EYE_WORDS: u32 = {}u;\n", lcc_pipeline::redeye::EYE_WORDS);
     use lcc_pipeline::masks::{AUTO_LRC_CHROMA, AUTO_LRC_EV, AUTO_TOL_CHROMA, AUTO_TOL_EV};
     s += &format!("const AUTO_TOL_EV: f32 = {AUTO_TOL_EV:?};\nconst AUTO_TOL_CHROMA: f32 = {AUTO_TOL_CHROMA:?};\n");
@@ -506,6 +514,17 @@ fn constants() -> String {
         AUTO_LRC_EV.0, AUTO_LRC_EV.1, AUTO_LRC_CHROMA.0, AUTO_LRC_CHROMA.1
     );
     s += &format!("const SHADOW_TINT_K: f32 = {:?};\n", lcc_pipeline::colorops::SHADOW_TINT);
+    {
+        use lcc_pipeline::split_v9::{SPLIT_CENTRE, SPLIT_ZONE_DL, SPLIT_ZONE_L0, SPLIT_ZONE_SH};
+        s += &format!(
+            "const SPLIT_L0: f32 = {SPLIT_ZONE_L0:?};
+const SPLIT_DL: f32 = {SPLIT_ZONE_DL:?};
+const SPLIT_CENTRE: f32 = {SPLIT_CENTRE:?};
+const SPLIT_N: u32 = {}u;
+",
+            SPLIT_ZONE_SH.len()
+        );
+    }
     // value noise of processes V1–V6
     for (i, h) in GRAIN_HASH.iter().enumerate() {
         s += &format!("const GRAIN_VH{i}: u32 = {h}u;\n");
