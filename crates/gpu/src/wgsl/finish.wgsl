@@ -63,6 +63,42 @@ fn lift_at(ev: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// Process V9's highlight lift under a negative Exposure (`negev_lift::NegEvLift::at`) for the white-balanced colour
+// `raw` before the Exposure: the table at its brightest channel's headroom under white and that channel's gap over
+// its luminance.
+fn negev_at(raw: vec3<f32>) -> f32 {
+    let m = max(raw.x, max(raw.y, raw.z));
+    if (!(m > 0.0) || !is_finite(m)) {
+        return 0.0;
+    }
+    let n = pu(F_NEGEV_N);
+    let gs = pu(F_NEGEV_GAPS);
+    let last_gap = f32(gs - 1u);
+    let y = lum2020(raw);
+    var g = last_gap;
+    if (y > 0.0) {
+        g = min(max(log2(m / y), 0.0) / pf(F_NEGEV_GAP_STEP), last_gap);
+    }
+    if (!(g == g) || !is_finite(g)) {
+        g = last_gap;
+    }
+    let h = pf(F_NEGEV_WHITE) - log2(m / GREY);
+    var f = min(max(h, 0.0) / pf(F_NEGEV_STEP), f32(n - 1u));
+    if (!(f == f)) {
+        f = f32(n - 1u);
+    }
+    let i = min(u32(f), n - 2u);
+    let j = min(u32(g), gs - 2u);
+    let t = f - f32(i);
+    let u = g - f32(j);
+    let o = pu(F_NEGEV_OFF);
+    let r0 = o + i * gs + j;
+    let r1 = r0 + gs;
+    let a = aux[r0] + (aux[r0 + 1u] - aux[r0]) * u;
+    let b = aux[r1] + (aux[r1 + 1u] - aux[r1]) * u;
+    return a + (b - a) * t;
+}
+
 // Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
 // `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V9 Highlights grid (EDGE_W × EDGE_H in aux), each by
 // its bilinear weight and how close its surroundings' tone is to `own`.
@@ -1223,6 +1259,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let det = l_pre - tex[i];
         delta -= clamp(l_noise, -1.0, 1.0) * 0.9 * det * (1.0 - sstep(0.1, 0.5, abs(det)));
     }
+    // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+    var lift = 0.0;
+    if (pu(F_NEGEV) != 0u) {
+        lift = negev_at(vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]));
+    }
     if (delta != 0.0) {
         c = c * exp2(delta);
     }
@@ -1232,33 +1273,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = calibrate(c);
     }
 
-    // --- tone map on luminance (or per ProPhoto channel, `FinishParams::tone_per_channel`), highlight desaturation
-    var o = 0.0;
-    var d = vec3<f32>(0.0);
-    if (pu(F_TONE_PC) != 0u) {
-        let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
-        d = mul3(mat_at(F_TONE_PC_FROM), near_white(tone_keeping_hue(q), pf(F_PEAK)));
-        o = lum2020(d);
-    } else {
-        let yl = lum2020(c);
-        o = tone_apply(yl);
-        if (yl > 1e-9) {
-            d = c * o / yl;
-        }
-        let k = chroma_scale(o);
-        if (k != 1.0) {
-            d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
-        }
-    }
+    // --- tone map on luminance (or per ProPhoto channel), highlight desaturation (`tone_map`)
     let peak = pf(F_PEAK);
     let hdr = peak > 1.0;
     let deep = pu(F_DEEP) != 0u;
-    if (pu(F_TOP_SHOULDER) != 0u) {
-        let moved = top_shoulder(d, c, o, peak);
-        d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
-    } else if (pu(F_TONE_PC) == 0u) {
-        // (toned per channel: clipped per channel at the output instead)
-        d = over_range(d, o, peak);
+    var d = tone_map(c);
+    if (lift > 0.0) {
+        // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+        d = negev_keep_colour(d, tone_map(c * exp2(lift)));
     }
 
     // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
@@ -1539,6 +1561,50 @@ const TOP_SHOULDER: vec4<f32> = vec4<f32>(0.7, 1.5, 0.6, 1.0);
 const TOP_SHOULDER_SCENE: vec2<f32> = vec2<f32>(0.9, 1.4);
 
 // `finish::tone_keeping_hue`: the brightest and darkest channel take the tone curve, the middle one keeps its place
+// The tone map of scene colour `c` on luminance (or per ProPhoto channel, `FinishParams::tone_per_channel`), with the
+// highlight desaturation (`finish`'s `tone_map` on the CPU).
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    var o = 0.0;
+    var d = vec3<f32>(0.0);
+    if (pu(F_TONE_PC) != 0u) {
+        let q = max(mul3(mat_at(F_TONE_PC_TO), c), vec3<f32>(0.0));
+        d = mul3(mat_at(F_TONE_PC_FROM), near_white(tone_keeping_hue(q), pf(F_PEAK)));
+        o = lum2020(d);
+    } else {
+        let yl = lum2020(c);
+        o = tone_apply(yl);
+        if (yl > 1e-9) {
+            d = c * o / yl;
+        }
+        let k = chroma_scale(o);
+        if (k != 1.0) {
+            d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+        }
+    }
+    let peak = pf(F_PEAK);
+    if (pu(F_TOP_SHOULDER) != 0u) {
+        let moved = top_shoulder(d, c, o, peak);
+        d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));
+    } else if (pu(F_TONE_PC) == 0u) {
+        // (toned per channel: clipped per channel at the output instead)
+        d = over_range(d, o, peak);
+    }
+    return d;
+}
+
+// `negev_lift::keep_colour`: `plain` brightened to the luminance of `lifted`, moving over to `lifted` past white.
+fn negev_keep_colour(plain: vec3<f32>, lifted: vec3<f32>) -> vec3<f32> {
+    let y0 = lum2020(plain);
+    let y1 = lum2020(lifted);
+    let top = max(plain.x, max(plain.y, plain.z));
+    if (!is_finite(y0) || !is_finite(y1) || !is_finite(top) || y0 <= 1e-9 || y1 <= y0) {
+        return lifted;
+    }
+    let k = y1 / y0;
+    let w = clamp((top * k - 0.95) / 0.1, 0.0, 1.0);
+    return plain * k + (lifted - plain * k) * w;
+}
+
 fn tone_keeping_hue(p: vec3<f32>) -> vec3<f32> {
     var t = vec3<f32>(tone_apply(p.x), tone_apply(p.y), tone_apply(p.z));
     var hi = 2u;

@@ -1109,6 +1109,48 @@ fn v9_highlights_pull_next_to_clipped_areas_matches() {
     }
 }
 
+/// Process V9's highlight lift under a negative Exposure (`lcc_pipeline::negev_lift`): the GPU lifts the same pixels
+/// by the same table as the CPU, at −0.5, −1 and −3 EV, on the whole frame, a window and under a mask's Exposure.
+#[test]
+fn v9_negative_exposure_highlight_lift_matches() {
+    if !gpu() {
+        return;
+    }
+    // a dark ground under a bright warm sky whose middle clips: every headroom from deep to past the clip
+    let (w, h) = (640usize, 480usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        if y > 380 {
+            return [0.02, 0.025, 0.018];
+        }
+        let d = ((x as f32 - 320.0) / 220.0).powi(2) + ((y as f32 - 160.0) / 130.0).powi(2);
+        let v = (6.0 * (1.0 - d)).exp2().max(0.05) * 0.2;
+        [1.1 * v, 0.95 * v, 0.8 * v]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = lcc_pipeline::PixelWindow { x: 200, y: 60, w: 240, h: 180 };
+    for ev in [-0.5, -1.0, -3.0] {
+        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        s.light.exposure = ev;
+        let tone = lcc_pipeline::finish::base_tone(&s, &info, 1.0);
+        assert!(lcc_pipeline::negev_lift::NegEvLift::new(&tone, ev as f32).is_some(), "Exposure {ev}: the lift is on");
+        let req = RenderRequest::fit(w, h);
+        check(&format!("V9 negative-Exposure lift {ev}"), &src, &info, &s, &req);
+        check(&format!("V9 negative-Exposure lift {ev} window"), &src, &info, &s, &RenderRequest { window: Some(win), ..req });
+        s.masks = vec![Mask {
+            components: vec![MaskComponent {
+                anchor: None,
+                name: None,
+                op: MaskOp::Add,
+                invert: false,
+                shape: MaskShape::Linear { start: Point::new(0.5, 0.0), end: Point::new(0.5, 0.9) },
+            }],
+            adjust: lcc_develop::LocalAdjustments { exposure: 0.5, ..Default::default() },
+            ..Default::default()
+        }];
+        check(&format!("V9 negative-Exposure lift {ev} with a mask"), &src, &info, &s, &req);
+    }
+}
+
 /// Black pixels have no hue. The GPU's `atan2(0, 0)` is undefined (NaN on some GPUs), which made
 /// every exactly black pixel NaN once a colour tool ran, and a lightening vignette then showed it:
 /// the CPU lifted the black corners, the GPU left them black.

@@ -69,6 +69,16 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_READ_TONE", 1),
     // …plus this much of plain nearness, so a pixel with no cell near its tone doesn't take the least-far cell's
     ("EDGE_READ_FLOOR", 1),
+    // process V9's highlight lift under a negative Exposure (`FinishParams::negev_lift`): its table (NEGEV_N rows, by
+    // headroom under NEGEV_WHITE in steps of NEGEV_STEP, of NEGEV_GAPS columns, by the brightest channel's gap over
+    // luminance in steps of NEGEV_GAP_STEP) in `aux` at NEGEV_OFF
+    ("NEGEV", 1),
+    ("NEGEV_OFF", 1),
+    ("NEGEV_N", 1),
+    ("NEGEV_STEP", 1),
+    ("NEGEV_WHITE", 1),
+    ("NEGEV_GAPS", 1),
+    ("NEGEV_GAP_STEP", 1),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -361,6 +371,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         aux.extend_from_slice(&e.wide.data);
         aux.extend_from_slice(&e.pull.0);
     }
+    // process V9's highlight lift under a negative Exposure
+    let negev_off = aux.len();
+    let negev =
+        fp.negev_lift.as_ref().filter(|l| l.table.len() == lcc_pipeline::negev_lift::N * lcc_pipeline::negev_lift::GAPS && l.white.is_finite());
+    if let Some(l) = negev {
+        aux.extend_from_slice(&l.table);
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -587,6 +604,15 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("EDGE_TABLE_OFF", table_off as u32);
         p.f("EDGE_READ_TONE", lcc_pipeline::hl_edge::READ_TONE);
         p.f("EDGE_READ_FLOOR", lcc_pipeline::hl_edge::READ_FLOOR);
+    }
+    if let Some(l) = negev {
+        p.b("NEGEV", true);
+        p.u("NEGEV_OFF", negev_off as u32);
+        p.u("NEGEV_N", lcc_pipeline::negev_lift::N as u32);
+        p.f("NEGEV_STEP", lcc_pipeline::negev_lift::STEP);
+        p.f("NEGEV_WHITE", l.white);
+        p.u("NEGEV_GAPS", lcc_pipeline::negev_lift::GAPS as u32);
+        p.f("NEGEV_GAP_STEP", lcc_pipeline::negev_lift::GAP_STEP);
     }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {

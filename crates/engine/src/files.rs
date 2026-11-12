@@ -3457,7 +3457,9 @@ pub(crate) mod tests {
         let (_, plain_info) = load_bytes(&plain, 64).unwrap();
         assert!(info.local_tone.is_some() && plain_info.local_tone.is_none());
         let req = RenderRequest::fit(64, 64);
-        let mut s = lcc_develop::DevelopSettings::default();
+        // (process V8: V9 lifts bright tones under a negative Exposure, `negev_lift`, which would bend the plain
+        // render's columns this test compares)
+        let mut s = lcc_develop::DevelopSettings { process: lcc_develop::Process::V8.version(), ..Default::default() };
         // (darker, so that ×4 never reaches white)
         s.light.exposure = -3.0;
         let off = render(&img, &info, &s, &req).image;
