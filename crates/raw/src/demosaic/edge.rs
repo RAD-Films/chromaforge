@@ -29,6 +29,7 @@
 //! | [`NOISE_CV`] | the noise weight: the relative noise of the sites' green at which the ratio is trusted fully / not |
 //! | [`SUPPORT_OUTER`] | the support: weight of the next sites out, beside the nearest ones |
 //! | [`GUIDE_BRIGHT`] | the near-clip fade (full size): back to the difference as the pixel's green nears the clip |
+//! | [`NEAR_CLIP`], [`NEAR_CLIP_DARK`] | the near-clip zone (full size): a dark guard there besides the edge rule |
 //! | [`WHITE_ELECTRONS_ISO100`], [`READ_NOISE_ELECTRONS`], [`READ_NOISE_DN`], [`DEFAULT_ISO`] | the noise model |
 //!
 //! Sources: own design. Interpolating a colour as a ratio to green (constant hue) goes back to D. R. Cok's
@@ -75,6 +76,23 @@ pub(crate) const SUPPORT_OUTER: f32 = 0.5;
 /// surface's colour just below its clip (with the ratio there a frame's partly clipped foliage came out 0.4 dE further
 /// from Lightroom Classic). The fit-size binning keeps each colour within the neighbouring blocks' means instead.
 pub(crate) const GUIDE_BRIGHT: (f32, f32) = (0.7, 0.95);
+
+/// The near-clip zone (full size), in px: within this distance of a clipped sample the ratio runs on every pixel, as far
+/// as the larger of the edge rule's own weight (edge gate times noise weight) and the dark guard [`NEAR_CLIP_DARK`]
+/// allow (times the near-clip fade, [`GUIDE_BRIGHT`]). Beside clipped samples the colour difference itself draws colour
+/// that isn't there: the difference to green at a site next to the clipping reads against clipped or nearly clipped
+/// greens, and on a textured or mid-toned edge 0-5 px from a clipped sky it left red short (cyan) and the texture's
+/// colour off. At higher ISO the edge gate's noise allowance and the noise weight switched the ratio off there and left
+/// that difference in place: on a synthetic ISO 2000 frame (`ahd.rs` tests), cyan in the 0-2 px ring next to a dark bar
+/// went 249 -> 90 of 993 pixels with this zone, the texture's colour error 2-5 px out 0.057 -> 0.044. The same 6 px the
+/// rule reached next to clipped samples before it ran on every edge.
+pub(crate) const NEAR_CLIP: usize = 6;
+
+/// The near-clip zone's dark guard ([`NEAR_CLIP`]): the ratio blends in from the colour difference as the mean green at
+/// the pixel's sites rises from `.0` to `.1` of the white, edge or not and whatever the noise. Below it only the edge
+/// rule's own weight counts: a ratio to a green that noise dominates comes out too high on average (red about 2 %
+/// around glints on a dark noisy surface, a magenta cast), and there the edge gate and the noise weight keep it out.
+pub(crate) const NEAR_CLIP_DARK: (f32, f32) = (0.03, 0.12);
 
 /// Added to both sides of the ratio, and to both greens of the edge gate (of the white), so that they stay finite at
 /// black.

@@ -145,6 +145,8 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
     let near = if clip_aware { near_clipped(&mos, bw, bh) } else { None };
     // and the sites the ratio leaves out: a clipped sample or one beside it, whose green the clip understates
     let touched = if rule.is_some() && near.is_some() { Some(clip_touched(&mos, bw)) } else { None };
+    // and the pixels within [`edge::NEAR_CLIP`] of one, where the ratio runs on every pixel (with the dark guard)
+    let zone = if rule.is_some() { near_clipped_wide(m, &mos, (ox, oy), bw, bh) } else { None };
     let sites = Sites::new(bw);
     // 1. directional greens (down to 2 px from the buffer's edge: the ratio's outer sites read them 3 px around)
     let mut gh = vec![0f32; n];
@@ -182,7 +184,14 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
                 set(p, 2 - own, gvv + (d(i - bw - 1) + d(i - bw + 1) + d(i + bw - 1) + d(i + bw + 1)) * 0.25)
             };
             let p = match rule {
-                Some(rule) if on_edge(rule, own, gvv, g, i, bw) => by_ratio(p, own, gvv, &mos, &col, g, i, &sites, rule, touched.as_deref()),
+                Some(rule) => {
+                    let near_clip = zone.as_ref().is_some_and(|z| z.get(i).copied().unwrap_or(false));
+                    if near_clip || on_edge(rule, own, gvv, g, i, bw) {
+                        by_ratio(p, own, gvv, &mos, &col, g, i, &sites, rule, touched.as_deref(), near_clip)
+                    } else {
+                        p
+                    }
+                }
                 _ => p,
             };
             let p = match &near {
@@ -273,6 +282,41 @@ fn near_clipped(mos: &[f32], bw: usize, bh: usize) -> Option<Vec<bool>> {
     Some(near)
 }
 
+/// Which pixels of the `bw × bh` tile buffer `mos` (whose top-left lies at `at` of the mosaic `m`) have a clipped sample
+/// ([`CLIP`]) within [`edge::NEAR_CLIP`] (a square), or `None` when none has. The candidates are completed down to
+/// `MARGIN - 2` px from the buffer's edge, and their square reaches past it: the mosaic is read that much beyond the
+/// buffer, so that a tile's edge changes nothing.
+fn near_clipped_wide(m: &Mosaic, mos: &[f32], at: (isize, isize), bw: usize, bh: usize) -> Option<Vec<bool>> {
+    let reach = edge::NEAR_CLIP;
+    let extra = reach.saturating_sub(MARGIN - 2);
+    let (ew, eh) = (bw + 2 * extra, bh + 2 * extra);
+    let (ex, ey) = (at.0 - extra as isize, at.1 - extra as isize);
+    let clipped_at = |x: usize, y: usize| m.get(ex + x as isize, ey + y as isize) >= CLIP;
+    // (the ring outside the buffer first: a tile with no clipped sample in or around it is the rule)
+    let ring = (0..eh).any(|y| {
+        if y < extra || y + extra >= eh { (0..ew).any(|x| clipped_at(x, y)) } else { (0..extra).chain(ew - extra..ew).any(|x| clipped_at(x, y)) }
+    });
+    if !ring && !mos.iter().any(|&v| v >= CLIP) {
+        return None;
+    }
+    let clipped: Vec<bool> = (0..eh).flat_map(|y| (0..ew).map(move |x| (x, y))).map(|(x, y)| clipped_at(x, y)).collect();
+    let mut rows = vec![false; ew * eh];
+    for (src, dst) in clipped.chunks_exact(ew).zip(rows.chunks_exact_mut(ew)) {
+        for (x, d) in dst.iter_mut().enumerate() {
+            *d = src.get(x.saturating_sub(reach)..(x + reach + 1).min(ew)).is_some_and(|s| s.contains(&true));
+        }
+    }
+    let mut near = vec![false; bw * bh];
+    for (y, row) in near.chunks_exact_mut(bw).enumerate() {
+        let yy = y + extra;
+        for (x, n) in row.iter_mut().enumerate() {
+            let xx = x + extra;
+            *n = (yy.saturating_sub(reach)..(yy + reach + 1).min(eh)).any(|r| rows.get(r * ew + xx).copied().unwrap_or(false));
+        }
+    }
+    Some(near)
+}
+
 /// Which samples of the tile buffer `mos` (`bw` wide) are clipped ([`CLIP`]) or have a clipped sample beside them
 /// (left, right, above, below: the greens a site's directional green is interpolated from).
 fn clip_touched(mos: &[f32], bw: usize) -> Vec<bool> {
@@ -333,6 +377,10 @@ fn on_edge(rule: &Follow, own: u8, green: f32, g: &[f32], i: usize, bw: usize) -
 /// and so does a green interpolated from one, so a ratio to it overstates the colour. Next to a clipped sky that made
 /// red and blue too high on the bright side of dark bars, a magenta line a -3 EV render showed; the outer sites, 3 px
 /// out, reach into the clipping first. When every nearest site is touched the colour difference stays.
+///
+/// Within [`edge::NEAR_CLIP`] of a clipped sample (`near_clip`) the ratio runs on every pixel, as far as the larger of
+/// the edge rule's weight and the dark guard ([`edge::NEAR_CLIP_DARK`]) allow: there the colour difference itself reads
+/// against the clipping and leaves red short (cyan), and at higher ISO the noise allowance switched the ratio off.
 #[allow(clippy::too_many_arguments)]
 fn by_ratio(
     mut p: [f32; 3],
@@ -345,6 +393,7 @@ fn by_ratio(
     sites: &Sites,
     rule: &Follow,
     touched: Option<&[bool]>,
+    near_clip: bool,
 ) -> [f32; 3] {
     let fade = if green <= edge::GUIDE_BRIGHT.0 { 1.0 } else { edge::fade(green) };
     if fade.is_nan() || fade <= 0.0 {
@@ -370,11 +419,8 @@ fn by_ratio(
     };
     let mut follow = |c: Option<&u8>, near: &[isize], outer: &[isize]| {
         let Some((lo, hi)) = range(near) else { return };
-        if !rule.may_step(green, lo, hi) {
-            return;
-        }
-        let gate = rule.edge(green, lo, hi, SITE_SAMPLES) * fade;
-        if gate.is_nan() || gate <= 0.0 {
+        let gate = if rule.may_step(green, lo, hi) { rule.edge(green, lo, hi, SITE_SAMPLES) * fade } else { 0.0 };
+        if !near_clip && (gate.is_nan() || gate <= 0.0) {
             return;
         }
         // (every nearest site next to a clipped sample: the colour difference stays)
@@ -386,6 +432,8 @@ fn by_ratio(
         let total = n + w * m;
         let (own_mean, guide) = ((own_near + w * own_outer) / total, (green_near + w * green_outer) / total);
         let t = gate * rule.trust(guide, edge::samples(total, n + w * w * m, SITE_SAMPLES));
+        // (near clipped samples, at least as far as the sites' green allows, edge or not)
+        let t = if near_clip { t.max(fade * edge::smoothstep(edge::NEAR_CLIP_DARK.0, edge::NEAR_CLIP_DARK.1, guide)) } else { t };
         let v = edge::ratio(green, own_mean, guide);
         if t > 0.0
             && v.is_finite()
@@ -702,6 +750,111 @@ mod tests {
             }
         }
         (bad, magenta, count)
+    }
+
+    /// A sky whose green and blue clip and whose red doesn't, and below it a mid-toned, textured surface (foliage, a wall)
+    /// with, if `bar`, a dark bar 2.5-4.5 px out: the 0-2 and 2-5 px rings next to clipped samples that a -3 EV render
+    /// shows. `level`: the surface's green; `amp`, `freq`: its texture (red varies most, blue least, so its colour moves
+    /// with it). Soft, slanted edges, every pattern phase. Camera RGB: sky red / green 0.5, blue / green 1.45, at 2.5 x
+    /// the white in green; surface red / green 0.62, blue / green 0.8.
+    fn textured_ring_scene(w: usize, h: usize, level: f32, amp: f32, freq: f32, bar: bool) -> Rgb32f {
+        let sky = [0.5f32, 1.0, 1.45].map(|v| v * 2.5);
+        Rgb32f::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            // distance below the sky's edge
+            let d = fy - (0.3 * h as f32 + fx / 5.0);
+            let t = (fx * freq).sin() * (fy * freq * 0.85).cos();
+            let surface = [level * 0.62 * (1.0 + amp * 1.2 * t), level * (1.0 + amp * t), level * 0.8 * (1.0 + amp * 0.7 * t)];
+            let in_bar = if bar { 0.5 + 0.5 * ((1.0 - (d - 3.5).abs()) / 0.6).tanh() } else { 0.0 };
+            let below = 0.5 + 0.5 * (d / 0.7).tanh();
+            std::array::from_fn(|c| {
+                let ground = surface[c] + ([0.03, 0.05, 0.04][c] - surface[c]) * in_bar;
+                sky[c] + (ground - sky[c]) * below
+            })
+        })
+    }
+
+    /// Over the pixels of `out` between `ring.0` (exclusive) and `ring.1` px (a square) from a clipped sample of `n`
+    /// whose true colour (`truth`) clips in no channel: how many have red or blue against green more than 10 % off the
+    /// truth's, how many of those are cyan (red short, the larger error) and magenta (red and blue both over), the mean
+    /// error (of red and blue against green, log) and the count.
+    fn ring_against_truth(out: &Rgb32f, truth: &Rgb32f, n: &[f32], ring: (usize, usize)) -> [f64; 5] {
+        let (w, h) = (out.width, out.height);
+        let mut r = [0f64; 5];
+        for y in 3..h - 3 {
+            for x in 3..w - 3 {
+                let t = truth.get(x, y);
+                if t.iter().any(|&v| v >= 0.95) || near_clip(n, w, h, x, y, ring.0) || !near_clip(n, w, h, x, y, ring.1) {
+                    continue;
+                }
+                let p = out.get(x, y);
+                let er = ((p[0] / p[1]) / (t[0] / t[1])).ln();
+                let eb = ((p[2] / p[1]) / (t[2] / t[1])).ln();
+                if !(er.is_finite() && eb.is_finite()) {
+                    continue;
+                }
+                r[4] += 1.0;
+                r[3] += f64::from(er.abs() + eb.abs()) / 2.0;
+                if er.abs() > 0.1 || eb.abs() > 0.1 {
+                    r[0] += 1.0;
+                    if er < -0.1 && er.abs() >= eb.abs() {
+                        r[1] += 1.0;
+                    }
+                    if er > 0.05 && eb > 0.05 && er + eb > 0.1 {
+                        r[2] += 1.0;
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// The textured ring scene at ISO `iso` (noise of that model, deterministic), developed by `develop` for each
+    /// pattern: [`ring_against_truth`] summed over the patterns, for the 0-2 and 2-5 px rings.
+    fn textured_ring(level: f32, amp: f32, freq: f32, bar: bool, iso: u32, develop: &dyn Fn(&Mosaic, SensorNoise) -> Rgb32f) -> [[f64; 5]; 2] {
+        let truth = textured_ring_scene(128, 96, level, amp, freq, bar);
+        let clipped = Rgb32f { data: truth.data.iter().map(|p| p.map(|v| v.min(1.0))).collect(), ..truth.clone() };
+        let noise = SensorNoise::new(16_383.0 - 512.0, Some(iso));
+        let mut sums = [[0f64; 5]; 2];
+        for pattern in PATTERNS {
+            let cfa = Cfa::bayer(pattern).unwrap();
+            let mut n = mosaic_from_rgb(&clipped, &cfa);
+            add_noise(&mut n.data, noise, 0x9e37_79b9_7f4a_7c15 ^ u64::from(iso));
+            for v in n.data.iter_mut() {
+                *v = v.clamp(0.0, 1.0);
+            }
+            let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+            let out = develop(&m, noise);
+            for (sum, ring) in sums.iter_mut().zip([(0, 2), (2, 5)]) {
+                for (s, v) in sum.iter_mut().zip(ring_against_truth(&out, &truth, &n.data, ring)) {
+                    *s += v;
+                }
+            }
+        }
+        sums
+    }
+
+    /// Process V9 within 0-5 px of clipped samples at a higher ISO (2000): a dark bar 2.5-4.5 px below a sky whose green
+    /// and blue clip, and a textured mid-toned surface right against it. The colour difference, where the edge gate's
+    /// noise allowance or the noise weight left it in place, read against the clipping: red came out short (cyan) in
+    /// the 0-2 px ring and the texture's colour off in the 2-5 px ring. Measured against the rule switched off, which
+    /// draws that colour everywhere there.
+    #[test]
+    fn next_to_clipped_samples_texture_keeps_its_colour() {
+        let develop = |m: &Mosaic, n: SensorNoise| v9(m, n);
+        let without = |m: &Mosaic, _: SensorNoise| without_rule(m);
+        // the bar: cyan in the 0-2 px ring
+        let (was, now) = (textured_ring(0.15, 0.1, 0.6, true, 2000, &without), textured_ring(0.15, 0.1, 0.6, true, 2000, &develop));
+        eprintln!("bar, 0-2 px: cyan {} -> {}, off colour {} -> {} of {}", was[0][1], now[0][1], was[0][0], now[0][0], now[0][4]);
+        assert!(now[0][4] >= 800.0, "{} pixels in the ring", now[0][4]);
+        assert!(now[0][1] * 3.0 <= was[0][1], "cyan in the 0-2 px ring: {} (without the rule {})", now[0][1], was[0][1]);
+        // the texture: its colour in the 2-5 px ring
+        let (was, now) = (textured_ring(0.45, 0.3, 1.3, false, 2000, &without), textured_ring(0.45, 0.3, 1.3, false, 2000, &develop));
+        let (err_was, err_now) = (was[1][3] / was[1][4], now[1][3] / now[1][4]);
+        eprintln!("texture, 2-5 px: error {err_was:.4} -> {err_now:.4}, cyan {} -> {} of {}", was[1][1], now[1][1], now[1][4]);
+        assert!(now[1][4] >= 1500.0, "{} pixels in the ring", now[1][4]);
+        assert!(err_now <= 0.8 * err_was, "the texture's colour error in the 2-5 px ring: {err_now} (without the rule {err_was})");
+        assert!(now[1][1] * 2.0 <= was[1][1], "cyan in the 2-5 px ring: {} (without the rule {})", now[1][1], was[1][1]);
     }
 
     /// Process V9 next to clipped samples, at full size: on the bright side of a dark bar against a clipped sky (the
