@@ -141,6 +141,89 @@ const MAGENTA_SIDE: f32 = 0.3;
 /// patch's light fell off (frame 4941 at +1.33 EV), and the patch came out white with magenta speckle (dE00 14), or
 /// deep magenta without the colour fade (31).
 const MAGENTA_OWN: f32 = 0.9;
+/// [`BlueExtent`]: the size of its cells as a share of the image's long edge (4 pixels on an R5 C frame), so it
+/// measures the same at every scale…
+const BLUE_EXTENT_CELL: f32 = 0.0005;
+/// …and how many cells either side it reaches out from an area of clipped blue, so that the unclipped pixels around an
+/// area take the near-clip move as its edge does and nothing steps there.
+const BLUE_EXTENT_REACH: usize = 4;
+
+/// Whether blue is clipped over an area or only on a thin feature, around each pixel: the share of pixels with blue
+/// clipped per cell of [`BLUE_EXTENT_CELL`] of the long edge, opened over 3 × 3 cells (the largest of the smallest
+/// shares around), which keeps an area's share up to its edge but takes a feature under three cells across (a
+/// specular line) to nothing, then averaged over [`BLUE_EXTENT_REACH`] cells either side and read bilinearly, so it
+/// changes smoothly. Under magenta light Lightroom Classic turns the chart patches with only blue clipped pale but
+/// keeps a thin line of clipped blue in its light's colour (frame 4939 at 0 EV: C* 140 where under 35 % of the pixels
+/// around have blue clipped). For the engine's near-clip move for magenta light ([`Self::weight`]).
+pub struct BlueExtent {
+    cell: usize,
+    cw: usize,
+    ch: usize,
+    field: Vec<f32>,
+}
+
+impl BlueExtent {
+    /// For a `w × h` image whose pixel `i` has blue clipped when `blue(i)`; `None` for an empty image.
+    pub fn new(w: usize, h: usize, blue: impl Fn(usize) -> bool + Sync) -> Option<BlueExtent> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let cell = ((BLUE_EXTENT_CELL * w.max(h) as f32).round() as usize).max(1);
+        let (cw, ch) = (w.div_ceil(cell), h.div_ceil(cell));
+        let mut share = vec![0f32; cw * ch];
+        share.par_chunks_mut(cw).enumerate().for_each(|(cy, row)| {
+            for (cx, c) in row.iter_mut().enumerate() {
+                let (mut n, mut k) = (0u32, 0u32);
+                for y in cy * cell..((cy + 1) * cell).min(h) {
+                    for x in cx * cell..((cx + 1) * cell).min(w) {
+                        n += 1;
+                        k += u32::from(blue(y * w + x));
+                    }
+                }
+                *c = if n > 0 { k as f32 / n as f32 } else { 0.0 };
+            }
+        });
+        // over the (2r + 1)² cells around (those inside the image): the smallest, the largest or the mean
+        let around = |v: &[f32], r: usize, how: fn(&mut dyn Iterator<Item = f32>) -> f32| -> Vec<f32> {
+            (0..ch)
+                .into_par_iter()
+                .flat_map_iter(|y| {
+                    (0..cw).map(move |x| {
+                        let (ys, xs) = (y.saturating_sub(r)..(y + r + 1).min(ch), x.saturating_sub(r)..(x + r + 1).min(cw));
+                        how(&mut ys.flat_map(|yy| xs.clone().map(move |xx| v.get(yy * cw + xx).copied().unwrap_or(0.0))))
+                    })
+                })
+                .collect()
+        };
+        let eroded = around(&share, 1, |it| it.fold(1.0, f32::min));
+        let opened = around(&eroded, 1, |it| it.fold(0.0, f32::max));
+        let field = around(&opened, BLUE_EXTENT_REACH, |it| {
+            let (sum, n) = it.fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+            if n > 0 { sum / n as f32 } else { 0.0 }
+        });
+        Some(BlueExtent { cell, cw, ch, field })
+    }
+
+    /// The averaged, opened share of clipped blue at pixel (`x`, `y`), read bilinearly between cell centres.
+    pub fn at(&self, x: usize, y: usize) -> f32 {
+        let cell = self.cell as f32;
+        let (fx, fy) = ((x as f32 + 0.5) / cell - 0.5, (y as f32 + 0.5) / cell - 0.5);
+        let (x0, y0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (x0, y0) = (x0.min(self.cw.saturating_sub(1)), y0.min(self.ch.saturating_sub(1)));
+        let (x1, y1) = ((x0 + 1).min(self.cw.saturating_sub(1)), (y0 + 1).min(self.ch.saturating_sub(1)));
+        let (tx, ty) = ((fx - x0 as f32).clamp(0.0, 1.0), (fy - y0 as f32).clamp(0.0, 1.0));
+        let s = |x: usize, y: usize| self.field.get(y * self.cw + x).copied().unwrap_or(0.0);
+        let top = s(x0, y0) + (s(x1, y0) - s(x0, y0)) * tx;
+        let bottom = s(x0, y1) + (s(x1, y1) - s(x0, y1)) * tx;
+        top + (bottom - top) * ty
+    }
+
+    /// How far pixel (`x`, `y`) lies in or beside an area of clipped blue, rather than on a thin clipped feature or away
+    /// from clipping: 0 to 1, all of it from half the cells around in the area (inside it and at its edge, both sides).
+    pub fn weight(&self, x: usize, y: usize) -> f32 {
+        smoothstep(0.0, 0.5, self.at(x, y))
+    }
+}
 
 /// With [`Rebuild::rim_hue`], a partly clipped pixel whose own unclipped channels contradict its rim's colour by
 /// `OWN_HUE.0` to `OWN_HUE.1` stops (a small coloured object inside a pale clipped area, such as orange roof caps
@@ -744,7 +827,7 @@ fn rebuild_clipped(
                     }
                 }
                 // magenta light with only blue clipped: its own colour, blue at the clip ([`MAGENTA_OWN`])
-                let own = if cl == [false, false, true] { magenta * (1.0 - smoothstep(MAGENTA_OWN, 1.0, p[0] / clip)) } else { 0.0 };
+                let own = if cl == [false, false, true] && magenta > 0.0 { magenta * (1.0 - smoothstep(MAGENTA_OWN, 1.0, p[0] / clip)) } else { 0.0 };
                 if own >= 1.0 {
                     continue;
                 }
@@ -1152,6 +1235,25 @@ mod tests {
             let same = got.iter().zip(&p).all(|(a, b)| a.to_bits() == b.to_bits());
             assert_eq!(same, own, "{core:?}: {p:?} -> {got:?}");
         }
+    }
+
+    /// [`BlueExtent`]: an area of clipped blue weighs 1 inside, at its edge and just outside, fading to nothing a few cells
+    /// out without a jump; a line of clipped blue two pixels wide weighs nothing, and so does everything away from both.
+    #[test]
+    fn blue_extent_tells_an_area_from_a_thin_line() {
+        let (w, h) = (160, 64);
+        let blue = |i: usize| (8..56).contains(&(i / w)) && ((10..60).contains(&(i % w)) || (110..112).contains(&(i % w)));
+        let Some(e) = BlueExtent::new(w, h, blue) else { panic!("an image") };
+        assert_eq!(e.weight(35, 32), 1.0, "inside the area");
+        assert_eq!(e.weight(59, 32), 1.0, "at its edge");
+        assert!(e.weight(60, 32) > 0.9, "just outside: {}", e.weight(60, 32));
+        assert_eq!(e.weight(70, 32), 0.0, "a few cells out");
+        assert_eq!(e.weight(90, 32), 0.0, "away from it");
+        assert_eq!(e.weight(110, 32), 0.0, "on the thin line");
+        for x in 0..w - 1 {
+            assert!((e.weight(x + 1, 32) - e.weight(x, 32)).abs() < 0.4, "a jump at x {x}: {} -> {}", e.weight(x, 32), e.weight(x + 1, 32));
+        }
+        assert!(BlueExtent::new(0, 10, |_| true).is_none());
     }
 
     /// A sky with green and blue clipped and red 0.7 stops under its clip is not magenta light, though its clipped green
