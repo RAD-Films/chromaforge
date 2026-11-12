@@ -20,12 +20,14 @@
 mod ahd;
 mod bilinear;
 mod detail;
+pub(crate) mod edge;
 mod ppg;
 mod xtrans;
 mod xtrans_ri;
 mod xtrans_taps;
 
 use crate::{Cfa, Normalized, Rgb32f};
+pub use edge::SensorNoise;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,6 +104,10 @@ pub struct Options {
     /// and interpolation turns that into colour fringes. Bayer methods ignore it, as they do gains that are not
     /// finite and positive.
     pub balance: Option<[f32; 3]>,
+    /// The noise of the file's samples, for process V9's edge rule ([`Method::AhdBlend`]: red and blue follow green's
+    /// shape across edges where their ratio to green can be trusted, `edge.rs`); `None`: [`SensorNoise::default`].
+    /// [`crate::RawImage::develop`] passes [`crate::RawImage::sensor_noise`].
+    pub noise: Option<SensorNoise>,
 }
 
 /// [`demosaic`] with [`Options`].
@@ -144,8 +150,8 @@ pub fn demosaic_with(n: &Normalized, method: Method, opts: Options) -> Rgb32f {
             match method {
                 Method::Bilinear => bilinear::bilinear(&m),
                 Method::Ppg => ppg::ppg(&m),
-                Method::Ahd => ahd::ahd(&m, false),
-                Method::AhdBlend => ahd::ahd(&m, true),
+                Method::Ahd => ahd::ahd(&m, false, SensorNoise::default()),
+                Method::AhdBlend => ahd::ahd(&m, true, opts.noise.unwrap_or_default()),
                 Method::Detail => detail::detail(&m),
             }
         }
@@ -229,7 +235,7 @@ mod tests {
         // Bayer methods ignore it
         let bayer = mosaic_from_rgb(&img, &Cfa::bayer("RGGB").unwrap());
         for m in [Method::Bilinear, Method::Ppg, Method::Ahd] {
-            let with = demosaic_with(&bayer, m, Options { balance: Some([1.9, 1.0, 1.6]) });
+            let with = demosaic_with(&bayer, m, Options { balance: Some([1.9, 1.0, 1.6]), ..Default::default() });
             assert_eq!(with.data, demosaic(&bayer, m).data, "{m:?}");
         }
         // a balanced scene seen under a coloured illuminant, demosaiced with that illuminant's gains and balanced
@@ -238,11 +244,11 @@ mod tests {
         let neutral = demosaic(&mosaic_from_rgb(&img, &cfa), Method::Ahd);
         let g = [1.15f32, 1.0, 2.8];
         let cam = Rgb32f { width: img.width, height: img.height, data: img.data.iter().map(|p| [p[0] / g[0], p[1], p[2] / g[2]]).collect() };
-        let out = demosaic_with(&mosaic_from_rgb(&cam, &cfa), Method::Ahd, Options { balance: Some(g) });
+        let out = demosaic_with(&mosaic_from_rgb(&cam, &cfa), Method::Ahd, Options { balance: Some(g), ..Default::default() });
         let back = Rgb32f { width: out.width, height: out.height, data: out.data.iter().map(|p| [p[0] * g[0], p[1], p[2] * g[2]]).collect() };
         assert!(psnr(&back, &neutral, 0) > 80.0);
         // invalid gains are ignored rather than poisoning the image
-        let bad = Options { balance: Some([f32::NAN, 1.0, 0.0]) };
+        let bad = Options { balance: Some([f32::NAN, 1.0, 0.0]), ..Default::default() };
         assert!(demosaic_with(&mosaic_from_rgb(&img, &cfa), Method::Ahd, bad).data.iter().all(|p| p.iter().all(|v| v.is_finite())));
     }
 

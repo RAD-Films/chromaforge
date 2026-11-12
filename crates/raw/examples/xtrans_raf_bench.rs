@@ -109,7 +109,7 @@ fn main() {
         file_count += 1;
 
         for (vi, v) in VARIANTS.iter().enumerate() {
-            let opts = Options { balance: Some(wb) };
+            let opts = Options { balance: Some(wb), ..Default::default() };
             let t0 = Instant::now();
             let out = demosaic_with(&normalized, v.method, opts);
             let ms = t0.elapsed().as_secs_f64() * 1e3;

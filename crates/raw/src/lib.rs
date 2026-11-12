@@ -915,6 +915,17 @@ impl RawImage {
         Ok(Normalized { width: a.width, height: a.height, cpp, data: out, cfa })
     }
 
+    /// The noise of this file's samples ([`demosaic::SensorNoise`]), from its raw range (white - black level) and ISO,
+    /// for process V9's edge rule (red and blue follow green across edges where their ratio to green can be trusted). A
+    /// float raw takes the default range (its rounding is negligible).
+    pub fn sensor_noise(&self) -> demosaic::SensorNoise {
+        let range = match self.data {
+            RawData::U16(_) => self.white_at(0) - self.black.mean(),
+            RawData::F32(_) => f32::NAN,
+        };
+        demosaic::SensorNoise::new(range, self.metadata.iso)
+    }
+
     /// Full "raw → camera RGB" path: normalise, demosaic with `method`, apply `OpcodeList3`, then the default crop.
     /// The result is camera RGB (not white balanced), white level = 1.0, not oriented.
     pub fn develop(&self, method: Method) -> Result<Rgb32f> {
@@ -922,7 +933,7 @@ impl RawImage {
         // the demosaiced picture is the biggest buffer: refuse it with an error rather than abort on allocation
         drop(lcc_raster::Rgb32f::try_new(n.width, n.height).map_err(|_| RawError::Limit("not enough memory to develop this raw"))?);
         // (X-Trans interpolates the white-balanced mosaic; Bayer methods ignore the gains)
-        let rgb = demosaic::demosaic_with(&n, method, demosaic::Options { balance: self.wb_multipliers });
+        let rgb = demosaic::demosaic_with(&n, method, demosaic::Options { balance: self.wb_multipliers, noise: Some(self.sensor_noise()) });
         drop(n);
         Ok(self.finish_demosaiced(rgb))
     }

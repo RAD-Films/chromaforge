@@ -122,7 +122,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn lib(&self, method: Method, wb: bool) -> Rgb32f {
-        demosaic_with(self.n, method, Options { balance: wb.then_some(self.gains) })
+        demosaic_with(self.n, method, Options { balance: wb.then_some(self.gains), ..Default::default() })
     }
     fn m(&self) -> proto::M {
         proto::M::new(self.n, self.cfa, self.gains)

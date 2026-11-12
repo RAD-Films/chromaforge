@@ -14,23 +14,27 @@
 //! within the range of its colour's samples around the pixel ([`CLIP`]). A clipped sample reads lower than the
 //! light was, so a colour difference taken against it (red minus a green interpolated from clipped greens) is far
 //! too negative or too positive, and the next pixel's colour went past anything its samples allow: black specks on
-//! a lamp's bright rim (a channel below zero) and neon green-cyan pixels where branches cross a white sky. Within
-//! [`RATIO_REACH`] of one, red and blue also follow green's shape across an edge: green times their ratio to green at
-//! the samples they are interpolated from, not green plus their difference to it ([`by_ratio`]). From dark branches to
-//! a sky near its clip that difference grows with the brightness, so a pixel between them took too little red or blue
-//! from the bright side's difference: the rest of the neon rim.
+//! a lamp's bright rim (a channel below zero) and neon green-cyan pixels where branches cross a white sky.
+//!
+//! On every edge, clipped or not, [`super::Method::AhdBlend`]'s red and blue also follow green's shape: green times
+//! their ratio to green at the samples they are interpolated from, not green plus their difference to it
+//! ([`by_ratio`], the rule and its tunables in `edge.rs`). From a dark bridge to a bright sky that difference grows with
+//! the brightness, so a pixel on the edge took too much or too little red or blue from the bright side's difference: a
+//! neon fringe. Where the pixel's green and its sites' green agree (flat and smoothly shaded areas) the rule doesn't
+//! run and the candidates are bit for bit as before.
 //!
 //! Work is done in overlapping tiles (bounded memory, rayon-parallel), one band of tiles at a time written
 //! straight into the output. Each step runs only where the tile's output depends on it: the choice reads the
-//! homogeneity 1 pixel around the tile, which reads Lab 2 pixels around, the candidates read the greens 3
-//! pixels around, and those read the mosaic 5 pixels around, inside the `MARGIN`.
+//! homogeneity 1 pixel around the tile, which reads Lab 2 pixels around, the candidates read the greens 3 pixels around
+//! (the ratio's outer sites 3 more), and those read the mosaic 2 pixels around, inside the `MARGIN`.
 
 use super::Mosaic;
+use super::edge::{self, Follow, SensorNoise};
 use crate::Rgb32f;
 use rayon::prelude::*;
 
 const TILE: usize = 128;
-const MARGIN: usize = 6;
+const MARGIN: usize = 7;
 /// Difference of the two candidates' 3×3 homogeneity sums (each 0–36) from which the more homogeneous one is taken
 /// alone; closer sums blend the two linearly, equal sums half and half. In a flat, noisy area noise alone decides
 /// which sum is larger, and picking outright turned the noise into short horizontal and vertical strokes (a maze,
@@ -43,31 +47,22 @@ const CLIP: f32 = 0.99;
 /// How far (px) a clipped sample reaches into the two candidates: the directional greens read the mosaic 2 px away,
 /// and the colour differences read the greens 1 px away.
 const REACH: usize = 3;
-/// How far (px) from a clipped sample red and blue follow green's shape ([`by_ratio`]): an edge in front of a clipped
-/// sky is often a few pixels short of the clipping (the sky dims toward it), and the neon rim with it. The same 6 px
-/// the fit-size binning reaches (`binned.rs`); with the homogeneity's 3 px, pixels up to 9 px away can change.
-const RATIO_REACH: usize = 6;
-/// [`by_ratio`] blends from the colour difference (green at the sites below `.0` of the white) to the ratio (above
-/// `.1`): a ratio to a green that noise dominates comes out too high on average (red about 2 % around glints on a dark
-/// noisy surface, a magenta cast).
-const GUIDE_DARK: (f32, f32) = (0.03, 0.12);
-/// [`by_ratio`] fades back to the colour difference as the pixel's own green nears the clip (from `.0` to `.1` of the
-/// white): the greens around it are clipped or about to clip there, and a ratio to an understated green overstates the
-/// colour. These pixels are also what the highlight rebuild takes as a clipped surface's colour just below its clip:
-/// with the ratio there, a frame's partly clipped foliage in a window came out 0.4 dE further from Lightroom Classic.
-/// The neon rim lies lower, between a dark edge and the sky (green 0.17 to 0.57 of the white on an R5 C frame).
-const GUIDE_BRIGHT: (f32, f32) = (0.7, 0.95);
-/// Added to both sides of [`by_ratio`]'s ratio (of the white), so that it stays finite at black.
-const RATIO_FLOOR: f32 = 1e-3;
+/// Samples' worth of one directional green at a site, for the ratio's noise ([`Follow::trust`]): the mean of two greens
+/// plus a quarter of the site colour's second difference has about one sample's variance.
+const SITE_SAMPLES: f32 = 1.0;
 
 /// `blend`: blend the two candidates where their homogeneity sums are close ([`BLEND`], process V9's
-/// [`super::Method::AhdBlend`]); false: the more homogeneous one outright, the average on ties (V1-V8).
-pub(crate) fn ahd(m: &Mosaic, blend: bool) -> Rgb32f {
-    ahd_with(m, blend, blend)
+/// [`super::Method::AhdBlend`]), keep them within their samples' range near clipped ones, and let red and blue follow
+/// green across edges for a file with this `noise` ([`by_ratio`]); false: the more homogeneous one outright, the
+/// average on ties (V1-V8), and neither rule.
+pub(crate) fn ahd(m: &Mosaic, blend: bool, noise: SensorNoise) -> Rgb32f {
+    ahd_with(m, blend, blend, blend.then_some(noise))
 }
 
-/// [`ahd`], with the candidates kept within their samples' range near clipped ones (`clip_aware`) or not.
-fn ahd_with(m: &Mosaic, blend: bool, clip_aware: bool) -> Rgb32f {
+/// [`ahd`], with the candidates kept within their samples' range near clipped ones (`clip_aware`) or not, and red and
+/// blue following green across edges for a file with this noise ([`by_ratio`]) or not.
+fn ahd_with(m: &Mosaic, blend: bool, clip_aware: bool, follow: Option<SensorNoise>) -> Rgb32f {
+    let rule = follow.map(Follow::new);
     let (w, h) = (m.w, m.h);
     let mut out = Rgb32f::new(w, h);
     if w == 0 || h == 0 {
@@ -80,7 +75,7 @@ fn ahd_with(m: &Mosaic, blend: bool, clip_aware: bool) -> Rgb32f {
             .into_par_iter()
             .map(|tx| {
                 let (x0, tw) = (tx * TILE, TILE.min(w - tx * TILE));
-                (x0, tw, tile(m, x0, y0, tw, th, blend, clip_aware))
+                (x0, tw, tile(m, x0, y0, tw, th, blend, clip_aware, rule.as_ref()))
             })
             .collect();
         for (x0, tw, px) in tiles {
@@ -120,7 +115,8 @@ fn cube_root(t: f32) -> f32 {
     y
 }
 
-fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, clip_aware: bool) -> Vec<[f32; 3]> {
+#[allow(clippy::too_many_arguments)]
+fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, clip_aware: bool, rule: Option<&Follow>) -> Vec<[f32; 3]> {
     let (bw, bh) = (tw + 2 * MARGIN, th + 2 * MARGIN);
     let n = bw * bh;
     let (ox, oy) = (x0 as isize - MARGIN as isize, y0 as isize - MARGIN as isize);
@@ -147,12 +143,11 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
     let inner = |d: usize| (d..bh - d).flat_map(move |y| y * bw + d..y * bw + bw - d);
     // process V9: the pixels whose candidates read a clipped sample (none in a tile without one)
     let near = if clip_aware { near_clipped(&mos, bw, bh) } else { None };
-    // and those within [`RATIO_REACH`] of one, whose red and blue follow green ([`by_ratio`])
-    let near_ratio = if clip_aware { near_clipped_wide(m, &mos, (ox, oy), bw, bh) } else { None };
-    // 1. directional greens
+    let sites = Sites::new(bw);
+    // 1. directional greens (down to 2 px from the buffer's edge: the ratio's outer sites read them 3 px around)
     let mut gh = vec![0f32; n];
     let mut gv = vec![0f32; n];
-    for i in inner(MARGIN - 3) {
+    for i in inner(2) {
         let c = mos[i];
         if col[i] == 1 {
             gh[i] = c;
@@ -184,8 +179,8 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
                 let p = set([0.0, gvv, 0.0], own, mos[i]);
                 set(p, 2 - own, gvv + (d(i - bw - 1) + d(i - bw + 1) + d(i + bw - 1) + d(i + bw + 1)) * 0.25)
             };
-            let p = match &near_ratio {
-                Some(nr) if nr[i] => by_ratio(p, own, gvv, &mos, &col, g, i, bw),
+            let p = match rule {
+                Some(rule) if on_edge(rule, own, gvv, g, i, bw) => by_ratio(p, own, gvv, &mos, &col, g, i, &sites, rule),
                 _ => p,
             };
             let p = match &near {
@@ -276,74 +271,98 @@ fn near_clipped(mos: &[f32], bw: usize, bh: usize) -> Option<Vec<bool>> {
     Some(near)
 }
 
-/// Which pixels of the `bw × bh` tile buffer `mos` (whose top-left lies at `at` of the mosaic `m`) have a clipped sample
-/// ([`CLIP`]) within [`RATIO_REACH`] (a square), or `None` when none has. The candidates are completed down to `MARGIN -
-/// 2` px from the buffer's edge, and their square reaches past it: the mosaic is read that much beyond the buffer.
-fn near_clipped_wide(m: &Mosaic, mos: &[f32], at: (isize, isize), bw: usize, bh: usize) -> Option<Vec<bool>> {
-    let extra = RATIO_REACH.saturating_sub(MARGIN - 2);
-    let (ew, eh) = (bw + 2 * extra, bh + 2 * extra);
-    let (ex, ey) = (at.0 - extra as isize, at.1 - extra as isize);
-    let clipped_at = |x: usize, y: usize| m.get(ex + x as isize, ey + y as isize) >= CLIP;
-    // (the ring outside the buffer first: a tile with no clipped sample in or around it is the rule)
-    let ring = (0..eh).any(|y| {
-        if y < extra || y >= eh - extra { (0..ew).any(|x| clipped_at(x, y)) } else { (0..extra).chain(ew - extra..ew).any(|x| clipped_at(x, y)) }
-    });
-    if !ring && !mos.iter().any(|&v| v >= CLIP) {
-        return None;
-    }
-    let clipped: Vec<bool> = (0..eh).flat_map(|y| (0..ew).map(move |x| (x, y))).map(|(x, y)| clipped_at(x, y)).collect();
-    let mut rows = vec![false; ew * eh];
-    for (src, dst) in clipped.chunks_exact(ew).zip(rows.chunks_exact_mut(ew)) {
-        for (x, d) in dst.iter_mut().enumerate() {
-            *d = src.get(x.saturating_sub(RATIO_REACH)..(x + RATIO_REACH + 1).min(ew)).is_some_and(|s| s.contains(&true));
-        }
-    }
-    let mut near = vec![false; bw * bh];
-    for (y, row) in near.chunks_exact_mut(bw).enumerate() {
-        let yy = y + extra;
-        for (x, n) in row.iter_mut().enumerate() {
-            let xx = x + extra;
-            *n = (yy.saturating_sub(RATIO_REACH)..(yy + RATIO_REACH + 1).min(eh)).any(|r| rows.get(r * ew + xx).copied().unwrap_or(false));
-        }
-    }
-    Some(near)
+/// Offsets in a tile buffer `bw` wide of the sites a pixel's missing colour is interpolated from, `(nearest, outer)`
+/// ([`edge::SUPPORT_OUTER`]): at a green pixel, the colour of its row neighbours (`row`) and of its column neighbours
+/// (`column`); at a red or blue pixel, the other one, on the diagonals (`diagonal`). Each set lies symmetrically
+/// around the pixel, so on a linear ramp its mean green is the pixel's.
+struct Sites {
+    row: ([isize; 2], [isize; 4]),
+    column: ([isize; 2], [isize; 4]),
+    diagonal: ([isize; 4], [isize; 8]),
 }
 
-#[inline]
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+impl Sites {
+    fn new(bw: usize) -> Sites {
+        let w = bw as isize;
+        Sites {
+            row: ([-1, 1], [-1 - 2 * w, 1 - 2 * w, -1 + 2 * w, 1 + 2 * w]),
+            column: ([-w, w], [-w - 2, -w + 2, w - 2, w + 2]),
+            diagonal: ([-w - 1, -w + 1, w - 1, w + 1], [-3 * w - 1, -3 * w + 1, 3 * w - 1, 3 * w + 1, -w - 3, -w + 3, w - 3, w + 3]),
+        }
+    }
+}
+
+/// Whether the pixel at flat index `i` of the tile buffer (own colour `own`, green `green` from the candidate's green
+/// plane `g`) may lie on an edge for [`by_ratio`] ([`Follow::may_step`] to the nearest sites of a colour it lacks): a
+/// cheap first test, false for nearly every pixel of a flat or smoothly shaded area. `i` lies at least `MARGIN - 2`
+/// from the buffer's edge.
+#[inline(always)]
+fn on_edge(rule: &Follow, own: u8, green: f32, g: &[f32], i: usize, bw: usize) -> bool {
+    let step = |a: f32, b: f32| rule.may_step(green, a.min(b), a.max(b));
+    if own == 1 {
+        step(g[i - 1], g[i + 1]) || step(g[i - bw], g[i + bw])
+    } else {
+        let (a, b, c, d) = (g[i - bw - 1], g[i - bw + 1], g[i + bw - 1], g[i + bw + 1]);
+        rule.may_step(green, a.min(b).min(c.min(d)), a.max(b).max(c.max(d)))
+    }
 }
 
 /// `p` (the candidate at flat index `i` of the tile buffer, own colour `own`, green `green` from the candidate's green
-/// plane `g`) with each interpolated red and blue taken as green times its ratio to green at the sites it is
-/// interpolated from, instead of green plus its difference to it. Across an edge from dark to a near-clipped sky the
-/// difference grows with the brightness (red 0.42 against green 0.78 on the bright side, 0.09 against 0.17 on the dark
-/// one, on an R5 C frame), so a pixel between them took far too little red from the bright side's difference: a neon
-/// green-cyan rim. The ratio stays put (0.54 and 0.53 there). Blended in by [`GUIDE_DARK`] and [`GUIDE_BRIGHT`].
+/// plane `g`) with each interpolated red and blue moved toward green times its ratio to green at the sites it is
+/// interpolated from (and the next ones out), instead of green plus its difference to it. Across an edge from a dark
+/// bridge to a bright sky the difference grows with the brightness (red 0.42 against green 0.78 on the bright side,
+/// 0.09 against 0.17 on the dark one, on an R5 C frame), so a pixel between them took far too little red from the
+/// bright side's difference: a neon green-cyan fringe. The ratio stays put (0.54 and 0.53 there). How far: the edge
+/// gate between `green` and the nearest sites' greens ([`Follow::edge`]; 0 leaves `p` exactly as it is), the
+/// trust in the ratio given the sites' green noise ([`Follow::trust`]) and the near-clip fade ([`edge::fade`]).
 #[allow(clippy::too_many_arguments)]
-fn by_ratio(mut p: [f32; 3], own: u8, green: f32, mos: &[f32], col: &[u8], g: &[f32], i: usize, bw: usize) -> [f32; 3] {
-    let mut follow = |c: Option<&u8>, sites: &[usize]| {
-        let (mut own_sum, mut green_sum) = (0f32, 0f32);
-        for &j in sites {
-            let (Some(&v), Some(&gj)) = (mos.get(j), g.get(j)) else { return };
-            own_sum += v;
-            green_sum += gj;
+fn by_ratio(mut p: [f32; 3], own: u8, green: f32, mos: &[f32], col: &[u8], g: &[f32], i: usize, sites: &Sites, rule: &Follow) -> [f32; 3] {
+    let fade = if green <= edge::GUIDE_BRIGHT.0 { 1.0 } else { edge::fade(green) };
+    if fade.is_nan() || fade <= 0.0 {
+        return p;
+    }
+    // green's range over some sites (cheap: most pixels stop here)
+    let range = |offsets: &[isize]| {
+        offsets.iter().try_fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &o| {
+            let gj = *g.get(i.wrapping_add_signed(o))?;
+            Some((lo.min(gj), hi.max(gj)))
+        })
+    };
+    // the colour's and green's sums over some sites (`None` past the buffer, which the margin rules out)
+    let sum = |offsets: &[isize]| {
+        offsets.iter().try_fold((0f32, 0f32), |(own, green), &o| {
+            let j = i.wrapping_add_signed(o);
+            Some((own + *mos.get(j)?, green + *g.get(j)?))
+        })
+    };
+    let mut follow = |c: Option<&u8>, near: &[isize], outer: &[isize]| {
+        let Some((lo, hi)) = range(near) else { return };
+        if !rule.may_step(green, lo, hi) {
+            return;
         }
-        let v = green * (own_sum + RATIO_FLOOR) / (green_sum.max(0.0) + RATIO_FLOOR);
-        let t =
-            smoothstep(GUIDE_DARK.0, GUIDE_DARK.1, green_sum / sites.len().max(1) as f32) * (1.0 - smoothstep(GUIDE_BRIGHT.0, GUIDE_BRIGHT.1, green));
-        if let Some(slot) = c.and_then(|&c| p.get_mut(c as usize))
+        let gate = rule.edge(green, lo, hi, SITE_SAMPLES) * fade;
+        if gate.is_nan() || gate <= 0.0 {
+            return;
+        }
+        let n = near.len() as f32;
+        let (Some((own_near, green_near)), Some((own_outer, green_outer))) = (sum(near), sum(outer)) else { return };
+        let (w, m) = (edge::SUPPORT_OUTER, outer.len() as f32);
+        let total = n + w * m;
+        let (own_mean, guide) = ((own_near + w * own_outer) / total, (green_near + w * green_outer) / total);
+        let t = gate * rule.trust(guide, edge::samples(total, n + w * w * m, SITE_SAMPLES));
+        let v = edge::ratio(green, own_mean, guide);
+        if t > 0.0
             && v.is_finite()
+            && let Some(slot) = c.and_then(|&c| p.get_mut(c as usize))
         {
             *slot += (v - *slot) * t;
         }
     };
     if own == 1 {
-        follow(col.get(i + 1), &[i - 1, i + 1]);
-        follow(col.get(i + bw), &[i - bw, i + bw]);
+        follow(col.get(i + 1), &sites.row.0, &sites.row.1);
+        follow(col.get(i.wrapping_add_signed(sites.column.0[1])), &sites.column.0, &sites.column.1);
     } else {
-        follow(Some(&(2 - own)), &[i - bw - 1, i - bw + 1, i + bw - 1, i + bw + 1]);
+        follow(Some(&(2 - own)), &sites.diagonal.0, &sites.diagonal.1);
     }
     p
 }
@@ -393,9 +412,27 @@ mod tests {
         assert_eq!(cube_root(8.0), 2.0);
     }
 
-    use super::super::{Mosaic, mosaic_from_rgb};
-    use super::{CLIP, RATIO_REACH, REACH, ahd_with};
+    use super::super::{Mosaic, SensorNoise, mosaic_from_rgb};
+    use super::{CLIP, REACH, ahd_with};
     use crate::{Cfa, Rgb32f};
+
+    const PATTERNS: [&str; 4] = ["RGGB", "BGGR", "GRBG", "GBRG"];
+
+    /// A 14-bit file at ISO 100: the noise these noise-free scenes are developed for.
+    fn clean() -> SensorNoise {
+        SensorNoise::new(16_383.0 - 512.0, Some(100))
+    }
+
+    /// Process V9 as it develops now.
+    fn v9(m: &Mosaic, noise: SensorNoise) -> Rgb32f {
+        ahd_with(m, true, true, Some(noise))
+    }
+
+    /// Process V9 without the edge rule: as it developed before red and blue followed green across every edge (the same
+    /// as before for a frame without a clipped sample).
+    fn without_rule(m: &Mosaic) -> Rgb32f {
+        ahd_with(m, true, true, None)
+    }
 
     /// Branches and a lamp's rim against a light 4 stops over white: a dark textured scene with a bright disc and
     /// thin dark bars crossing it, its colour varying, at `peak` × white for the bright parts (clipped to 1.0 in the
@@ -446,50 +483,53 @@ mod tests {
         (worst, n)
     }
 
+    /// Whether `(x, y)` lies within `r` px (a square) of a clipped sample.
+    fn near_clip(n: &[f32], w: usize, h: usize, x: usize, y: usize, r: usize) -> bool {
+        (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| n[yy * w + xx] >= CLIP))
+    }
+
     /// Process V9: next to clipped samples no interpolated channel goes past its colour's samples around it (plain AHD
-    /// does here: a black speck or a neon pixel), and every pixel out of their reach is exactly plain AHD's.
+    /// does here: a black speck or a neon pixel), and out of the clamp's reach (its 3 px and the homogeneity's 3 more)
+    /// the clamp changes nothing.
     #[test]
     fn near_clipped_samples_the_colours_stay_within_their_samples() {
         let (img, cfa) = branches(16.0);
         let n = mosaic_from_rgb(&img, &cfa);
         let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
-        let (plain, aware) = (ahd_with(&m, true, false), ahd_with(&m, true, true));
+        let (plain, aware) = (ahd_with(&m, true, false, None), v9(&m, clean()));
         let (before, count) = overshoot(&plain, &n.data, &cfa, n.width, n.height);
         let (after, _) = overshoot(&aware, &n.data, &cfa, n.width, n.height);
         assert!(count > 500, "{count} pixels near clip");
         assert!(before > 0.05, "plain AHD overshoots its samples here: {before}");
         assert!(after <= 1e-6, "clip-aware: {after}");
         assert!(aware.data.iter().all(|p| p.iter().all(|v| v.is_finite() && *v >= 0.0)));
-        // out of reach (red and blue follow green 6 px around, and the homogeneity reads 3 more): plain AHD, bit for bit
+        let unclamped = ahd_with(&m, true, false, Some(clean()));
         let (w, h) = (n.width, n.height);
-        let r = RATIO_REACH + 3;
         let mut far = 0;
         for y in 0..h {
             for x in 0..w {
-                let reach = (y.saturating_sub(r)..(y + r + 1).min(h))
-                    .any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| n.data[yy * w + xx] >= CLIP));
-                if !reach {
+                if !near_clip(&n.data, w, h, x, y, 2 * REACH) {
                     far += 1;
-                    assert_eq!(aware.get(x, y), plain.get(x, y), "({x}, {y})");
+                    assert_eq!(aware.get(x, y), unclamped.get(x, y), "({x}, {y})");
                 }
             }
         }
         assert!(far > 300, "{far} pixels out of reach");
     }
 
-    /// A frame without a clipped sample develops exactly as plain AHD.
+    /// A frame without a clipped sample is never clamped.
     #[test]
-    fn an_unclipped_frame_is_unchanged() {
+    fn an_unclipped_frame_is_not_clamped() {
         let (img, cfa) = branches(0.95);
         let n = mosaic_from_rgb(&img, &cfa);
         assert!(n.data.iter().all(|&v| v < CLIP));
         let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
-        assert_eq!(ahd_with(&m, true, true).data, ahd_with(&m, true, false).data);
+        assert_eq!(v9(&m, clean()).data, ahd_with(&m, true, false, Some(clean())).data);
     }
 
     /// A dark beam across a pale blue sky that brightens away from it until green, then blue clip a pixel or two from
     /// its edges (red never does), as at the edge of a clipped sky. The edges are soft, as a lens draws them, and
-    /// slanted, so they cross the pattern at every phase, sky above one and below the other. `peak` 0.65: nothing clips.
+    /// slanted, so they cross the pattern at every phase, sky above one and below the other.
     fn beam(peak: f32) -> Rgb32f {
         let (sky, dark) = ([0.38f32, 1.0, 0.82], [0.02f32, 0.045, 0.03]);
         Rgb32f::from_fn(96, 64, |x, y| {
@@ -501,22 +541,25 @@ mod tests {
         })
     }
 
-    /// Pixels on an edge (green between 15 % and 85 % of the sky's nearby) whose red or blue ratio to green lies more
-    /// than 10 % outside the range the two sides' samples span (colour neither side has: the neon rim), and the count
-    /// of edge pixels.
-    fn false_colour(img: &Rgb32f) -> (usize, usize) {
+    /// Pixels on an edge (green between 15 % and 85 % of the brightest green within `reach` rows and columns) whose red
+    /// or blue ratio to green lies more than 10 % outside the range the two sides span (`rg`, `bg`: colour neither side
+    /// has, a fringe), and the count of edge pixels.
+    fn false_colour(img: &Rgb32f, reach: usize, rg: (f32, f32), bg: (f32, f32)) -> (usize, usize) {
         let (mut bad, mut n) = (0, 0);
-        for y in 2..img.height - 2 {
-            for x in 2..img.width - 2 {
+        let (w, h) = (img.width, img.height);
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
                 let p = img.get(x, y);
-                let sky = (y.saturating_sub(8)..(y + 9).min(img.height)).map(|yy| img.get(x, yy)[1]).fold(1e-3, f32::max);
-                if !(0.15..0.85).contains(&(p[1] / sky)) {
+                let bright = (y.saturating_sub(reach)..(y + reach + 1).min(h))
+                    .flat_map(|yy| (x.saturating_sub(reach)..(x + reach + 1).min(w)).map(move |xx| (xx, yy)))
+                    .map(|(xx, yy)| img.get(xx, yy)[1])
+                    .fold(1e-3, f32::max);
+                if !(0.15..0.85).contains(&(p[1] / bright)) {
                     continue;
                 }
                 n += 1;
-                // red / green: sky 0.38 (unclipped) to 0.53 (green clipped), beam 0.44; blue / green: 0.67 to 1.0
-                let (rg, bg) = (p[0] / p[1], p[2] / p[1]);
-                if !(0.38 / 1.1..=0.53 * 1.1).contains(&rg) || !(0.67 / 1.1..=1.1).contains(&bg) {
+                let (r, b) = (p[0] / p[1], p[2] / p[1]);
+                if !(rg.0 / 1.1..=rg.1 * 1.1).contains(&r) || !(bg.0 / 1.1..=bg.1 * 1.1).contains(&b) {
                     bad += 1;
                 }
             }
@@ -530,13 +573,15 @@ mod tests {
     #[test]
     fn next_to_a_clipped_sky_an_edge_keeps_its_colours() {
         let (mut before, mut total) = (0, 0);
-        for pattern in ["RGGB", "BGGR", "GRBG", "GBRG"] {
+        for pattern in PATTERNS {
             let cfa = Cfa::bayer(pattern).unwrap();
             let n = mosaic_from_rgb(&beam(1.0), &cfa);
             assert!(n.data.iter().filter(|&&v| v >= CLIP).count() > 500, "{pattern}: the sky clips");
             let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
-            let (was, count) = false_colour(&ahd_with(&m, true, false));
-            let (after, _) = false_colour(&ahd_with(&m, true, true));
+            // red / green: sky 0.38 (unclipped) to 0.53 (green clipped), beam 0.44; blue / green: 0.67 to 1.0
+            let measure = |img: &Rgb32f| false_colour(img, 8, (0.38, 0.53), (0.67, 1.0));
+            let (was, count) = measure(&ahd_with(&m, true, false, None));
+            let (after, _) = measure(&v9(&m, clean()));
             eprintln!("{pattern}: false colour on the edges {was} -> {after} of {count}");
             assert!(count >= 200, "{pattern}: {count} edge pixels");
             assert!(after * 40 <= count, "{pattern}: {after} of {count}");
@@ -545,16 +590,146 @@ mod tests {
         assert!(before * 10 >= total, "plain AHD draws the rim: {before} of {total}");
     }
 
+    /// A dark bridge's girders against a bright sky that is nowhere near its clip (the bridge of test frame 6719):
+    /// soft edges as a lens draws them, one slanted and one steep, so they cross the pattern at every phase. Camera RGB:
+    /// sky red / green 0.45 and blue / green 0.8, girders 0.5 and 0.75.
+    fn bridge(w: usize, h: usize) -> Rgb32f {
+        let (sky, dark) = ([0.27f32, 0.6, 0.48], [0.02f32, 0.04, 0.03]);
+        Rgb32f::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let girder = (fy - (0.3 * h as f32 + fx / 6.0)).abs() - 3.0;
+            let post = (fx - (0.6 * w as f32 + fy / 5.0)).abs() - 2.5;
+            let t = 0.5 + 0.5 * (girder.min(post) / 0.7).tanh();
+            std::array::from_fn(|c| dark[c] + (sky[c] - dark[c]) * t)
+        })
+    }
+
+    /// Process V9: on a bright edge that clips nowhere, red and blue as green plus their difference to green at their
+    /// sites gave the edge's pixels colour neither side has (a neon fringe at full size); as a ratio to green they keep
+    /// the sides' colours. Without the edge rule (process V9 before this change) the fringe is there.
+    #[test]
+    fn a_bright_unclipped_edge_keeps_its_colours() {
+        let (mut before, mut after, mut total) = (0, 0, 0);
+        for pattern in PATTERNS {
+            let cfa = Cfa::bayer(pattern).unwrap();
+            let n = mosaic_from_rgb(&bridge(96, 64), &cfa);
+            assert!(n.data.iter().all(|&v| v < 0.7), "{pattern}: nothing near the clip");
+            let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+            let measure = |img: &Rgb32f| false_colour(img, 6, (0.45, 0.5), (0.75, 0.8));
+            let (was, count) = measure(&without_rule(&m));
+            let (now, _) = measure(&v9(&m, clean()));
+            eprintln!("{pattern}: fringe on the edges {was} -> {now} of {count}");
+            assert!(count >= 150, "{pattern}: {count} edge pixels");
+            (before, after, total) = (before + was, after + now, total + count);
+        }
+        assert!(before * 5 >= total, "without the rule the edge has a fringe: {before} of {total}");
+        assert!(after * 30 <= total, "with it: {after} of {total}");
+    }
+
+    /// Flat and smoothly shaded areas (a flat colour, linear ramps, a slow colour wave, a bright gradient with mild noise)
+    /// develop bit for bit as without the edge rule: their greens never step far enough for the gate.
+    #[test]
+    fn flat_and_smooth_areas_develop_as_before() {
+        let (w, h) = (80, 64);
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut uniform = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let gradient = Rgb32f::from_fn(w, h, |x, y| [0.25 + 0.002 * x as f32, 0.5 + 0.002 * y as f32, 0.35]);
+        let noisy = Rgb32f { data: gradient.data.iter().map(|p| p.map(|v| v * (1.0 + 0.01 * uniform()))).collect(), ..gradient };
+        let scenes = [
+            ("flat", Rgb32f::filled(w, h, [0.21, 0.47, 0.33])),
+            // (green steps at most 0.04 stops a pixel)
+            ("ramps", Rgb32f::from_fn(w, h, |x, y| [0.05 + 0.004 * x as f32, 0.15 + 0.004 * y as f32, 0.1 + 0.002 * (x + y) as f32])),
+            (
+                "wave",
+                Rgb32f::from_fn(w, h, |x, y| {
+                    let t = (x as f32 * 0.08).sin() * (y as f32 * 0.06).cos();
+                    [0.2 + 0.05 * t, 0.4 + 0.08 * t, 0.3 - 0.04 * t]
+                }),
+            ),
+            ("noisy gradient", noisy),
+        ];
+        for (name, img) in &scenes {
+            for pattern in PATTERNS {
+                let cfa = Cfa::bayer(pattern).unwrap();
+                let n = mosaic_from_rgb(img, &cfa);
+                let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+                for noise in [clean(), SensorNoise::new(4095.0 - 256.0, Some(3200)), SensorNoise::default()] {
+                    let (now, was) = (v9(&m, noise), without_rule(&m));
+                    let moved: Vec<(usize, usize)> =
+                        (0..now.data.len()).filter(|&i| now.data[i] != was.data[i]).map(|i| (i % now.width, i / now.width)).collect();
+                    assert!(moved.is_empty(), "{name} {pattern} {noise:?}: {} pixels moved, {:?}", moved.len(), &moved[..moved.len().min(12)]);
+                }
+            }
+        }
+    }
+
+    /// Gaussian noise of the given model on a mosaic (deterministic; sum of four uniforms).
+    fn add_noise(data: &mut [f32], noise: SensorNoise, seed: u64) {
+        let mut s = seed | 1;
+        let mut uniform = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        for v in data.iter_mut() {
+            let g = (0..4).map(|_| uniform()).sum::<f32>() * 3f32.sqrt();
+            *v += g * noise.variance(*v).sqrt();
+        }
+    }
+
+    /// A dark, noisy scene shot at a high ISO (girders and textured shadows at 1-8 % of the white, sky-less): the edge
+    /// rule moves no channel's mean against green's. A ratio to a green that noise dominates comes out too high on
+    /// average (magenta shadows); the noise model keeps the rule out of them.
+    #[test]
+    fn a_dark_noisy_frame_keeps_its_colour() {
+        let (w, h) = (128, 96);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            let t = 0.5 + 0.5 * ((x as f32 * 0.3).sin() * (y as f32 * 0.2).cos());
+            let bar = (x / 9) % 4 == 0 || (y / 11) % 5 == 0;
+            let l = if bar { 0.012 } else { 0.03 + 0.05 * t };
+            [l * 0.5, l, l * 0.75]
+        });
+        let means = |img: &Rgb32f| {
+            let mut s = [0f64; 3];
+            for p in &img.data {
+                for c in 0..3 {
+                    s[c] += f64::from(p[c]);
+                }
+            }
+            [s[0] / s[1], s[2] / s[1]]
+        };
+        let high = SensorNoise::new(16_383.0 - 512.0, Some(6400));
+        for pattern in ["RGGB", "GBRG"] {
+            let cfa = Cfa::bayer(pattern).unwrap();
+            let mut n = mosaic_from_rgb(&img, &cfa);
+            add_noise(&mut n.data, high, 0x9e37_79b9_7f4a_7c15);
+            let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
+            let (was, now) = (means(&without_rule(&m)), means(&v9(&m, high)));
+            // the same mosaic told it came from ISO 100: the ratio runs in the noise
+            let wrong = means(&v9(&m, clean()));
+            for c in 0..2 {
+                let (shift, wrong) = (now[c] / was[c] - 1.0, wrong[c] / was[c] - 1.0);
+                eprintln!("{pattern}: {} / green {shift:+.5} (as if ISO 100: {wrong:+.5})", ["red", "blue"][c]);
+                assert!(shift.abs() < 0.002, "{pattern} channel {c}: {shift}");
+            }
+        }
+    }
+
     /// Small clipped glints on a dark, noisy surface (catchlights in an eye): the dark pixels around them keep their
     /// colour on average (red and blue as a ratio to a green that noise dominates would come out too high: magenta).
-    /// Measured where the ratio reaches and the clamp to the samples' range ([`REACH`]) doesn't.
     #[test]
     fn dark_noise_around_glints_keeps_its_colour() {
         let img = Rgb32f::from_fn(96, 64, |x, y| if x % 16 == 7 && y % 16 == 7 { [4.0; 3] } else { [0.012, 0.025, 0.018] });
         let img = Rgb32f { data: img.data.iter().map(|p| p.map(|v| v.min(1.0))).collect(), ..img };
         let cfa = Cfa::bayer("RGGB").unwrap();
         let mut n = mosaic_from_rgb(&img, &cfa);
-        // deterministic noise, about 0.004 of white per sample
+        // deterministic noise, about 0.004 of white per sample (an ISO 800 file's at this level)
         let mut s = 0x2545_f491_4f6c_dd1du64;
         for v in n.data.iter_mut().filter(|v| **v < 0.5) {
             s ^= s << 13;
@@ -563,16 +738,12 @@ mod tests {
             *v += ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.014;
         }
         let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
-        let (plain, aware) = (ahd_with(&m, true, false), ahd_with(&m, true, true));
+        let (plain, aware) = (without_rule(&m), v9(&m, SensorNoise::new(16_383.0 - 512.0, Some(800))));
         let (w, h) = (n.width, n.height);
         let (mut sum_plain, mut sum_aware, mut count) = ([0f64; 3], [0f64; 3], 0);
         for y in 0..h {
             for x in 0..w {
-                let near = |r: usize| {
-                    (y.saturating_sub(r)..(y + r + 1).min(h))
-                        .any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| n.data[yy * w + xx] >= CLIP))
-                };
-                if near(RATIO_REACH) && !near(REACH) {
+                if near_clip(&n.data, w, h, x, y, 6) && !near_clip(&n.data, w, h, x, y, REACH) {
                     count += 1;
                     for c in 0..3 {
                         sum_plain[c] += plain.get(x, y)[c] as f64;
@@ -584,14 +755,13 @@ mod tests {
         assert!(count > 200, "{count} dark pixels near the glints");
         for c in [0, 2] {
             let ratio = sum_aware[c] / sum_plain[c];
-            eprintln!("channel {c}: mean {ratio:.4} of plain AHD");
+            eprintln!("channel {c}: mean {ratio:.4} of V9 without the rule");
             assert!((ratio - 1.0).abs() < 0.005, "channel {c}: {ratio}");
         }
     }
 
     /// Glints in a textured field just below the clip (green above 0.95 of the white, the highlight rebuild's rim):
-    /// red and blue keep their colour differences there, so beyond the clamp's reach and its homogeneity's (6 px)
-    /// every pixel is plain AHD's, though a ratio would reach further.
+    /// red and blue keep their colour differences there (the near-clip fade), every pixel as without the rule.
     #[test]
     fn near_the_clip_red_and_blue_keep_their_differences() {
         let img = Rgb32f::from_fn(96, 64, |x, y| {
@@ -606,21 +776,6 @@ mod tests {
         let cfa = Cfa::bayer("RGGB").unwrap();
         let n = mosaic_from_rgb(&img, &cfa);
         let m = Mosaic { w: n.width, h: n.height, data: &n.data, cfa: &cfa };
-        let (plain, aware) = (ahd_with(&m, true, false), ahd_with(&m, true, true));
-        let (w, h) = (n.width, n.height);
-        let mut beyond = 0;
-        for y in 0..h {
-            for x in 0..w {
-                let near = |r: usize| {
-                    (y.saturating_sub(r)..(y + r + 1).min(h))
-                        .any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| n.data[yy * w + xx] >= CLIP))
-                };
-                if near(RATIO_REACH + 3) && !near(2 * REACH) {
-                    beyond += 1;
-                    assert_eq!(aware.get(x, y), plain.get(x, y), "({x}, {y})");
-                }
-            }
-        }
-        assert!(beyond > 100, "{beyond} pixels between the reaches");
+        assert!(v9(&m, clean()).data == without_rule(&m).data);
     }
 }
