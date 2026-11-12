@@ -382,6 +382,9 @@ pub struct FinishParams {
     pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
     /// Process V9's extra Highlights pull next to clipped areas ([`crate::hl_edge`]), added to the table's shift.
     pub edge_pull: Option<std::sync::Arc<crate::hl_edge::EdgePull>>,
+    /// Process V9's highlight lift under a negative Exposure for raws ([`crate::negev_lift`]): a lightness lift at the
+    /// tone map by each pixel's headroom under the clip, keeping its colour. `None` at Exposure 0 and above (renders bit-identical there).
+    pub negev_lift: Option<std::sync::Arc<crate::negev_lift::NegEvLift>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -482,6 +485,11 @@ impl FinishParams {
         let calibration = s.section_enabled("calibration");
         let peak = s.hdr.peak();
         let per_channel = tone_per_channel(s, info, peak);
+        let tone = base_tone(s, info, peak);
+        let negev_lift = (s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info) && peak <= 1.0)
+            .then(|| crate::negev_lift::NegEvLift::new(&tone, ev))
+            .flatten()
+            .map(std::sync::Arc::new);
         FinishParams {
             // a render toned per channel already has the shoulder this step adds
             top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info),
@@ -489,7 +497,7 @@ impl FinishParams {
             peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
-            tone: base_tone(s, info, peak),
+            tone,
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
             local_points: crate::colorops::mask_point_ks(s),
@@ -506,6 +514,7 @@ impl FinishParams {
             sh: (s.light.shadows / 100.0) as f32,
             lift: None,
             edge_pull: None,
+            negev_lift,
             clar,
             tex,
             dehaze,
@@ -1017,6 +1026,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let det = l_pre - b.data[i];
                 delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
             }
+            // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+            let lift = fp.negev_lift.as_deref().map_or(0.0, |nl| nl.at(raw));
             if delta != 0.0 {
                 let g = delta.exp2();
                 c = c.map(|v| v * g);
@@ -1028,32 +1039,39 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             }
 
             // --- tone map on luminance (or per ProPhoto channel), highlight desaturation
-            let (o, mut d) = match &fp.tone_per_channel {
-                Some([to, from]) => {
-                    let d = mul3(from, near_white(tone_keeping_hue(mul3(to, c), |v| tone.apply(v)), peak));
-                    (luminance_2020(d), d)
-                }
-                None => {
-                    let yl = luminance_2020(c);
-                    let o = tone.apply(yl);
-                    let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
-                    let k = tone.chroma_scale(o);
-                    if k != 1.0 {
-                        d = d.map(|v| o + (v - o) * k);
+            let tone_map = |c: [f32; 3]| {
+                let (o, d) = match &fp.tone_per_channel {
+                    Some([to, from]) => {
+                        let d = mul3(from, near_white(tone_keeping_hue(mul3(to, c), |v| tone.apply(v)), peak));
+                        (luminance_2020(d), d)
                     }
-                    (o, d)
+                    None => {
+                        let yl = luminance_2020(c);
+                        let o = tone.apply(yl);
+                        let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
+                        let k = tone.chroma_scale(o);
+                        if k != 1.0 {
+                            d = d.map(|v| o + (v - o) * k);
+                        }
+                        (o, d)
+                    }
+                };
+                if fp.top_shoulder {
+                    let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
+                    let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
+                    hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
+                } else if fp.tone_per_channel.is_some() {
+                    // clipped per channel at the output instead (see below)
+                    d
+                } else {
+                    over_range(d, o, peak, fp.hue_clip)
                 }
             };
-            d = if fp.top_shoulder {
-                let moved = top_shoulder(d, c, o, peak, |v| tone.apply(v));
-                let (before, after) = (over_range(d, o, peak, fp.hue_clip), over_range(moved, luminance_2020(moved), peak, fp.hue_clip));
-                hold_lightness(before, after, c[0].max(c[1]).max(c[2]))
-            } else if fp.tone_per_channel.is_some() {
-                // clipped per channel at the output instead (see below)
-                d
-            } else {
-                over_range(d, o, peak, fp.hue_clip)
-            };
+            let mut d = tone_map(c);
+            if lift > 0.0 {
+                // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+                d = crate::negev_lift::keep_colour(d, tone_map(c.map(|v| v * lift.exp2())));
+            }
 
             // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
             if let Some(p) = &ops.primaries {
