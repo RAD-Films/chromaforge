@@ -2748,6 +2748,8 @@ mod tests_denoise;
 #[cfg(feature = "denoise")]
 mod tests_denoise_own;
 #[cfg(test)]
+mod tests_dng_baseline;
+#[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_dng_update;
 #[cfg(test)]
