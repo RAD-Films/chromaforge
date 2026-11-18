@@ -4553,7 +4553,7 @@ mod tests {
     /// bounded and the smoothed curve is not held at the fitted level, both only for V10's fit; the fit is chosen per
     /// decode and put back after it.
     #[test]
-    fn processes_v1_to_v8_keep_the_fit_of_look_22() {
+    fn processes_v1_to_v9_keep_the_fit_of_look_22() {
         let mut pairs = Vec::new();
         for i in 0..620 {
             let x = 0.040 + 0.012 * f64::from(i) / 620.0;
@@ -4586,8 +4586,12 @@ mod tests {
         let old = with_fit_gen(FitGen::V8, || with_smooth_tone(fitted.clone()));
         let new = with_smooth_tone(fitted.clone());
         let d = |l: &CameraLook| (l.tone.apply(0.18) / fitted.tone.apply(0.18)).ln();
-        assert!(d(&old) < -0.02 && d(&new).abs() < 0.01, "V8 {:+.4}, V9 {:+.4} in log at grey", d(&old), d(&new));
-        assert_eq!((FitGen::of_process(8), FitGen::of_process(9), FitGen::of_process(1)), (FitGen::V8, FitGen::Current, FitGen::V8));
+        assert!(d(&old) < -0.02 && d(&new).abs() < 0.01, "V8 {:+.4}, V10 {:+.4} in log at grey", d(&old), d(&new));
+        // main's released V9 keeps main's camera look (LOOK 22) as V1-V8 do; the newer fit is V10's
+        assert_eq!(
+            (FitGen::of_process(8), FitGen::of_process(9), FitGen::of_process(10), FitGen::of_process(1)),
+            (FitGen::V8, FitGen::V8, FitGen::Current, FitGen::V8)
+        );
         assert_eq!((FitGen::V8.look_version(), FitGen::Current.look_version()), (LOOK_VERSION_V8, LOOK_VERSION));
     }
 
