@@ -1,4 +1,4 @@
-//! Process V9 Split Toning: the Color Grading panel's shadows and highlights wheels as Lightroom Classic applies them.
+//! Process V10 Split Toning: the Color Grading panel's shadows and highlights wheels as Lightroom Classic applies them.
 //! Measured on its own exports of our grey-ramp and colour charts (round 17: each wheel at six hues and two
 //! saturations, three balances, two blendings), all in OkLab on display values:
 //! - LrC applies it to the final display colour, after the tone curves: in a raw's full edit (round 12's g07, steep
@@ -270,11 +270,11 @@ mod tests {
     #[test]
     fn v9_split_toning_follows_lightroom_classic_on_our_charts() {
         let (v8, v8_worst, _) = r17_error(lcc_develop::Process::V8);
-        let (v9, v9_worst, model) = r17_error(lcc_develop::Process::V9);
+        let (v9, v9_worst, model) = r17_error(lcc_develop::Process::V10);
         eprintln!(
             "round 17 split toning, mean / worst OkLab error: V8 {v8:.4} / {v8_worst:.4}, V9 {v9:.4} / {v9_worst:.4}; V9 vs the fitted model {model:.4}"
         );
-        // measured: V8 0.0169 / 0.0349, V9 0.0040 / 0.0053, V9 within 0.0024 of the zone model up to Blending 50
+        // measured: V8 0.0169 / 0.0349, V10 0.0040 / 0.0053, V10 within 0.0024 of the zone model up to Blending 50
         // (its profiles on a finer grid)
         assert!(v9 < 0.005 && v9_worst < 0.007, "V9 {v9} / {v9_worst}");
         assert!(v9 < 0.35 * v8 && v9_worst < 0.25 * v8_worst, "V9 {v9} / {v9_worst} vs V8 {v8} / {v8_worst}");

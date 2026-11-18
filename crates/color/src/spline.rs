@@ -163,8 +163,8 @@ impl NaturalCurve {
     }
 }
 
-/// A point curve's spline: [`MonotoneCurve`] (masks' Curves, and the Tone Curve before process V9) or
-/// [`NaturalCurve`] (the Tone Curve from V9), so the curve editor draws what the render applies.
+/// A point curve's spline: [`MonotoneCurve`] (masks' Curves, and the Tone Curve before process V10) or
+/// [`NaturalCurve`] (the Tone Curve from V10), so the curve editor draws what the render applies.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PointSpline {
     Monotone(MonotoneCurve),

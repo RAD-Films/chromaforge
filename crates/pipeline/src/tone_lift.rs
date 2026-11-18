@@ -1,4 +1,4 @@
-//! The global Highlights and Shadows of process V9: Lightroom Classic's response, one tone curve per picture.
+//! The global Highlights and Shadows of process V10: Lightroom Classic's response, one tone curve per picture.
 //!
 //! Measured on Lightroom Classic exports of our own procedural pictures (240 photo-like scenes with skies, shapes,
 //! textures, night, high-key, fog, back-lit and portrait-like layouts; 16-bit sRGB TIFFs, OneSlips, Nov 2026):
@@ -386,10 +386,10 @@ fn finite(v: f32) -> f32 {
 
 /// Whether `s` renders its global Highlights / Shadows with this module's curve.
 pub fn active(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V9 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
+    s.process.process() >= Process::V10 && (s.light.shadows != 0.0 || s.light.highlights != 0.0 || s.light.whites > 0.0)
 }
 
-/// The share of Lightroom's −100 pull a negative Highlights in `s` gives under process V9 ([`active`]), `None` when
+/// The share of Lightroom's −100 pull a negative Highlights in `s` gives under process V10 ([`active`]), `None` when
 /// Highlights isn't below 0 there.
 pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
     let h = (s.light.highlights / 100.0) as f32;
@@ -397,7 +397,7 @@ pub(crate) fn highlights_down(s: &DevelopSettings) -> Option<f32> {
 }
 
 /// A raw's Highlights − pull of `s` ([`highlights`], at the slider's share) as a table on this module's grid, for the
-/// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V9 or there is nothing to measure.
+/// whole `frame` of `src`: `None` when Highlights isn't below 0 under process V10 or there is nothing to measure.
 /// [`crate::hl_edge`] reads it at each pixel's surroundings' tone ([`for_frame`]'s table leaves it out). Tones
 /// keep their order with room to spare ([`in_order`]).
 /// `white` is the scene tone where the raw's camera curve reaches white ([`highlights::Pull::of`]).
@@ -449,10 +449,10 @@ fn in_order(v: Vec<f32>) -> Lift {
     Lift(a.into_iter().map(|s| if s.is_finite() { s.clamp(-MAX_SHIFT, 0.0) } else { 0.0 }).collect())
 }
 
-/// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V9 and above, Whites up
+/// Whether a raw's Whites is drawn by this module's curve rather than the tone map: process V10 and above, Whites up
 /// ([`Whites`]). The tone map then leaves its white point where Whites 0 has it ([`crate::finish`]).
 pub fn whites_on_raw(s: &DevelopSettings) -> bool {
-    s.process.process() >= Process::V9 && s.light.whites > 0.0
+    s.process.process() >= Process::V10 && s.light.whites > 0.0
 }
 
 type Cached = (u64, Arc<Tones>);
@@ -490,7 +490,7 @@ fn tones(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) ->
     Some(t)
 }
 
-/// The V9 Highlights / Shadows table of `s` for the whole `frame` of `src`, or `None` when `s` doesn't use it
+/// The V10 Highlights / Shadows table of `s` for the whole `frame` of `src`, or `None` when `s` doesn't use it
 /// ([`active`]) or the frame is empty. `raw_tone` is a raw's default tone map (scene → display luminance), `None`
 /// for a display-referred source.
 pub fn for_frame(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, raw_tone: Option<&ToneMap>) -> Option<Arc<Lift>> {

@@ -7,7 +7,7 @@
 //! 3. Convert both candidates to CIELab and measure, per pixel, how many of its 4 neighbours lie within the
 //!    adaptive luminance / chrominance tolerances (ε_L, ε_C from the paper) — the homogeneity.
 //! 4. Sum homogeneity over a 3×3 window and pick the more homogeneous candidate (average on ties), as the paper does
-//!    ([`super::Method::Ahd`], processes V1-V8). [`super::Method::AhdBlend`] (process V9) blends the two by how far
+//!    ([`super::Method::Ahd`], processes V1-V9). [`super::Method::AhdBlend`] (process V10) blends the two by how far
 //!    apart their sums are (see [`BLEND`]), so a clear edge still takes one candidate.
 //!
 //! [`super::Method::AhdBlend`] also knows clipped samples: within [`REACH`] of one, every interpolated channel stays
@@ -60,8 +60,8 @@ const GUIDE_BRIGHT: (f32, f32) = (0.7, 0.95);
 /// Added to both sides of [`by_ratio`]'s ratio (of the white), so that it stays finite at black.
 const RATIO_FLOOR: f32 = 1e-3;
 
-/// `blend`: blend the two candidates where their homogeneity sums are close ([`BLEND`], process V9's
-/// [`super::Method::AhdBlend`]); false: the more homogeneous one outright, the average on ties (V1-V8).
+/// `blend`: blend the two candidates where their homogeneity sums are close ([`BLEND`], process V10's
+/// [`super::Method::AhdBlend`]); false: the more homogeneous one outright, the average on ties (V1-V9).
 pub(crate) fn ahd(m: &Mosaic, blend: bool) -> Rgb32f {
     ahd_with(m, blend, blend)
 }
@@ -145,7 +145,7 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize, blend: bool, cli
     }
     // flat indices of the pixels `d` or more from the buffer's edge, row by row
     let inner = |d: usize| (d..bh - d).flat_map(move |y| y * bw + d..y * bw + bw - d);
-    // process V9: the pixels whose candidates read a clipped sample (none in a tile without one)
+    // process V10: the pixels whose candidates read a clipped sample (none in a tile without one)
     let near = if clip_aware { near_clipped(&mos, bw, bh) } else { None };
     // and those within [`RATIO_REACH`] of one, whose red and blue follow green ([`by_ratio`])
     let near_ratio = if clip_aware { near_clipped_wide(m, &mos, (ox, oy), bw, bh) } else { None };
@@ -446,7 +446,7 @@ mod tests {
         (worst, n)
     }
 
-    /// Process V9: next to clipped samples no interpolated channel goes past its colour's samples around it (plain AHD
+    /// Process V10: next to clipped samples no interpolated channel goes past its colour's samples around it (plain AHD
     /// does here: a black speck or a neon pixel), and every pixel out of their reach is exactly plain AHD's.
     #[test]
     fn near_clipped_samples_the_colours_stay_within_their_samples() {
@@ -524,7 +524,7 @@ mod tests {
         (bad, n)
     }
 
-    /// Process V9: next to a clipped sky an edge's red and blue were green plus the difference of samples on either side
+    /// Process V10: next to a clipped sky an edge's red and blue were green plus the difference of samples on either side
     /// of it, which grows with the brightness, so a pixel between them took far too little of a colour (a neon
     /// green-cyan rim). As a ratio to green they keep the colours of the two sides.
     #[test]

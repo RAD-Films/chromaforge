@@ -224,10 +224,10 @@ const LRC_LOOK_FROM: f32 = -11.0;
 const LRC_LOOK_STEP: f32 = 0.5;
 
 /// Lightroom Classic's Contrast on a display value `p` (linear luminance to the power 1/2.2), `c` = Contrast / 100
-/// (process V9): `p + c·A·(p − m)·(1 − |2p − 1|)`, a tent-windowed S-curve anchored at black, white and its pivot
+/// (process V10): `p + c·A·(p − m)·(1 − |2p − 1|)`, a tent-windowed S-curve anchored at black, white and its pivot
 /// `m`, which sits a third of a stop over grey (0.18 · 2^0.34). Fitted on LrC 15.5 exports of a grey chart of
 /// our own at Contrast +45 and +63 (round 13, 8 Nov 2026; 0.12 / 0.09 L* rms, 0.22 L* worst): `A` = 0.734,
-/// `m` = 0.5112. V1–V8's curve pivots at grey with a narrower window and so darkens the deep tones about a third
+/// `m` = 0.5112. V1–V9's curve pivots at grey with a narrower window and so darkens the deep tones about a third
 /// less. Contrast below 0 mirrors it (not measured). Rises everywhere for |c| ≤ 1 (slope ≥ 0.25).
 pub fn lrc_contrast(p: f32, c: f32) -> f32 {
     const A: f32 = 0.734;
@@ -236,7 +236,7 @@ pub fn lrc_contrast(p: f32, c: f32) -> f32 {
     p + c * A * (p - PIVOT) * (1.0 - (2.0 * p - 1.0).abs()).max(0.0)
 }
 
-/// Lightroom Classic's base tone for a raw under a profile without a tone curve (process V9): display luminance
+/// Lightroom Classic's base tone for a raw under a profile without a tone curve (process V10): display luminance
 /// (linear, SDR white = 1) at scene luminance `2^(LRC_BASE_FROM + i·LRC_BASE_STEP)`. Our own measurement (8 Nov
 /// 2026): LrC 15.5 zero-slider exports of 50 Canon R5 C frames (our own window scenes in ±3 EV brackets, under the
 /// photographer's matrix-only camera profile) against the same frames' scene luminance from our renderer, matched
@@ -356,7 +356,7 @@ impl ToneMap {
         ToneMap::camera_with(|y| curve.apply_rolloff(y), curve.chroma, contrast, whites, blacks, peak)
     }
 
-    /// [`ToneMap::camera_rolloff_hdr`] for process V9: under a profile without a tone curve
+    /// [`ToneMap::camera_rolloff_hdr`] for process V10: under a profile without a tone curve
     /// ([`CameraTone::has_default_curve`]), Lightroom Classic's base tone ([`lrc_base`]) in place of the camera JPEG's;
     /// any other curve as V8 draws it.
     pub fn camera_lrc(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
@@ -367,7 +367,7 @@ impl ToneMap {
         ToneMap::camera_adjusted(|y| curve.apply_rolloff(y), curve.chroma, adjustment, contrast, whites, blacks, peak)
     }
 
-    /// Process V9's tone for a raw Lightroom Classic draws with its default curve: Lightroom Classic's base tone
+    /// Process V10's tone for a raw Lightroom Classic draws with its default curve: Lightroom Classic's base tone
     /// ([`lrc_base`]) with the sliders as [`ToneMap::camera_lrc`] applies them. For a camera tone kept under a profile
     /// without a curve, and for a raw with no camera tone at all (float and merged DNGs, a DNG whose profile has no
     /// curve, a body without a fitted look), which V8 draws with the generic roll-off ([`ToneMap::rolloff_hdr`]).
@@ -480,7 +480,7 @@ impl ToneMap {
         ToneMap::display_shaped(contrast, whites, blacks, peak, false)
     }
 
-    /// [`ToneMap::display_hdr`], with Lightroom Classic's Contrast ([`lrc_contrast`], process V9) when `lrc`.
+    /// [`ToneMap::display_hdr`], with Lightroom Classic's Contrast ([`lrc_contrast`], process V10) when `lrc`.
     fn display_shaped(contrast: f64, whites: f64, blacks: f64, peak: f32, lrc: bool) -> ToneMap {
         let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
         let c = (contrast / 100.0) as f32;
@@ -496,7 +496,7 @@ impl ToneMap {
                 let y = GREY * 2f32.powf(ev);
                 let mut p = y.powf(1.0 / 2.2);
                 if p <= 1.0 {
-                    // S-curve anchored at 0, grey and 1 (V9: Lightroom's, pivoting a third of a stop higher)
+                    // S-curve anchored at 0, grey and 1 (V10: Lightroom's, pivoting a third of a stop higher)
                     p = if lrc { lrc_contrast(p, c) } else { p + c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2)) };
                     // whites and blacks: broad tonal responses fitted to Lightroom's
                     p += w_b_shift(p, w, b);
@@ -519,7 +519,7 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
-    /// Process V9's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
+    /// Process V10's tone map for an SDR display-referred source (a JPEG, a TIFF): Exposure up, Whites and Blacks
     /// follow Lightroom Classic's responses measured on a grey wedge of our own ([`lrc_tables`]); Contrast is
     /// Lightroom's too ([`lrc_contrast`]). `exposure` (EV) is the gain already in the luminance this table is read at, so a
     /// brighter Exposure rolls the highlights off as Lightroom does instead of clipping them. Exposure down stays a
@@ -548,7 +548,7 @@ impl ToneMap {
         ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
     }
 
-    /// Lightroom Classic's HDR tone (process V9): the HDR value of each tone is a fixed function of the
+    /// Lightroom Classic's HDR tone (process V10): the HDR value of each tone is a fixed function of the
     /// SDR value `s` the same edit has with HDR off, `H = s · 2^G(s)` with
     /// `G = b·K·ln(1 + e^((−ln(1 − s) − a)/K))` stops ([`LRC_HDR_A`], [`LRC_HDR_B`], [`LRC_HDR_K`]), clipped at
     /// `peak`. `G` is about 0 up to the mid tones (the HDR render matches the SDR one there) and grows like
@@ -1178,7 +1178,7 @@ mod tests {
         lcc_color::transfer::linear_to_srgb(map.apply(lcc_color::transfer::srgb_to_linear(x) * ev.exp2()))
     }
 
-    /// V9's display tone map is the file itself at neutral settings.
+    /// V10's display tone map is the file itself at neutral settings.
     #[test]
     fn display_lrc_is_identity_when_neutral() {
         let map = ToneMap::display_lrc(0.0, 0.0, 0.0, 0.0);
@@ -1224,7 +1224,7 @@ mod tests {
 
     /// Lightroom Classic's Contrast +45 and +63 on a grey chart of our own (round 13: 18 greys from −8 to +2.2 EV,
     /// ProPhoto exports converted by their ICC profile; L* change from the unadjusted chart). It pivots about a
-    /// third of a stop over grey and darkens the deep tones more than V9's old S-curve did (+45 at −3.2 EV: −5.6 L*,
+    /// third of a stop over grey and darkens the deep tones more than V10's old S-curve did (+45 at −3.2 EV: −5.6 L*,
     /// the old curve −3.6).
     #[test]
     fn display_lrc_contrast_follows_lightroom() {
@@ -1242,7 +1242,7 @@ mod tests {
         }
     }
 
-    /// A raw under V9 takes the same Contrast as a JPEG, on top of its camera curve; V8 keeps its own.
+    /// A raw under V10 takes the same Contrast as a JPEG, on top of its camera curve; V8 keeps its own.
     #[test]
     fn v9_raw_contrast_is_lightrooms() {
         let knots = std::array::from_fn(|i| {

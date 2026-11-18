@@ -211,14 +211,14 @@ pub struct LoadOptions {
     /// and the clear ones this photo shows (`crate::files::repair_pixels`).
     pub pixel_fix: bool,
     /// Leave a raw's camera-profile tables (hue/saturation map, look table) out of the decoded pixels and hand them
-    /// to the pipeline, which applies them after the white balance at the chosen white (process V9,
+    /// to the pipeline, which applies them after the white balance at the chosen white (process V10,
     /// [`lcc_pipeline::CameraColor::deferred_tables_gain`]); false: applied while decoding, at the as-shot white
     /// (V1–V7).
     pub defer_tables: bool,
     /// Demosaic a raw with the AHD that blends its candidates where noise alone would pick one
-    /// ([`lcc_raw::Method::AhdBlend`], process V9); false: the outright pick of V1-V8 ([`lcc_raw::Method::Ahd`]).
+    /// ([`lcc_raw::Method::AhdBlend`], process V10); false: the outright pick of V1-V9 ([`lcc_raw::Method::Ahd`]).
     pub ahd_blend: bool,
-    /// Process V9's highlight rebuild (`crate::files::rebuild_of`): fully clipped highlights
+    /// Process V10's highlight rebuild (`crate::files::rebuild_of`): fully clipped highlights
     /// [`crate::files::HIGHLIGHT_HEADROOM`] stops above the sensor's clip, and partly clipped ones in their rim's hue
     /// ([`lcc_raw::highlight::Rebuild::rim_hue`]), as Lightroom Classic shows them when Exposure goes down.
     pub highlight_headroom: bool,
@@ -259,9 +259,9 @@ impl LoadOptions {
             camera: s.profile.camera.clone(),
             camera_look: s.keeps_camera_look(),
             pixel_fix: s.sensor.fixes_pixels(),
-            defer_tables: s.process.process() >= lcc_develop::Process::V9,
-            ahd_blend: s.process.process() >= lcc_develop::Process::V9,
-            highlight_headroom: s.process.process() >= lcc_develop::Process::V9,
+            defer_tables: s.process.process() >= lcc_develop::Process::V10,
+            ahd_blend: s.process.process() >= lcc_develop::Process::V10,
+            highlight_headroom: s.process.process() >= lcc_develop::Process::V10,
             process: s.process.process().version().0,
             path: None,
         }
@@ -3385,12 +3385,12 @@ pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync
 mod thumbnail_hash_tests {
     use super::*;
 
-    /// Process V9's decode rebuilds a raw's clipped highlights its own way (headroom, rim hue), older processes'
+    /// Process V10's decode rebuilds a raw's clipped highlights its own way (headroom, rim hue), older processes'
     /// don't; a decoded raw serves only the one it was made for, a decoded JPEG either.
     #[test]
     fn a_decoded_raw_serves_only_its_own_highlight_headroom() {
         use lcc_develop::Process;
-        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let mut s = DevelopSettings { process: Process::V10.version(), ..DevelopSettings::default() };
         let v9 = LoadOptions::of(&s);
         s.process = Process::V7.version();
         let v7 = LoadOptions::of(&s);
@@ -3401,7 +3401,7 @@ mod thumbnail_hash_tests {
         let without = LoadOptions { highlight_headroom: false, ..v9.clone() };
         let raw =
             DecodedSource { options: without.clone(), ..DecodedSource::new(img.clone(), Some(SourceInfo { raw: true, ..SourceInfo::default() })) };
-        // V9's rebuild (headroom, rim hue) changes the pixels, so it needs its own decode
+        // V10's rebuild (headroom, rim hue) changes the pixels, so it needs its own decode
         assert!(raw.serves(&without));
         assert!(!raw.serves(&v9));
         let jpeg = DecodedSource { options: v7.clone(), ..DecodedSource::new(img, Some(SourceInfo::default())) };
@@ -3844,7 +3844,7 @@ mod tests {
     #[test]
     fn a_raw_decoded_for_one_process_does_not_serve_another() {
         let latest = lcc_develop::DevelopSettings::default();
-        // a decode without a photo's settings names the latest process (its V9 decode switches stay off: callers
+        // a decode without a photo's settings names the latest process (its V10 decode switches stay off: callers
         // that use the pixels directly keep the camera profile's tables in them, see `LoadOptions::default`)
         assert_eq!(LoadOptions::default().process, LoadOptions::of(&latest).process);
         assert_eq!(LoadOptions::of(&latest).process, lcc_develop::Process::LATEST.version().0);

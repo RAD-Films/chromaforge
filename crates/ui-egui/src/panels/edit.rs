@@ -1901,7 +1901,7 @@ pub(crate) fn curve_editor(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, d: 
         if v.len() < 2 { vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)] } else { v }
     };
     let pts = pts_of(&curves);
-    // the spline the render applies: V9's Tone Curve is a natural spline, masks' Curves stay monotone
+    // the spline the render applies: V10's Tone Curve is a natural spline, masks' Curves stay monotone
     let natural = matches!(target, CurveTarget::Photo) && lcc_pipeline::finish::curves_before_output(d.process.process());
     let curve = lcc_color::spline::PointSpline::new(&pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>(), natural);
     let color = match ch.as_str() {

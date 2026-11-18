@@ -178,7 +178,7 @@ fn with_process(mut s: DevelopSettings, p: lcc_develop::Process) -> DevelopSetti
 /// Canon R5 C raws (medians over 1.5 M pixels, 7 Nov 2026, `_scratch/lrc-calib-2/hdr1`, `fit/hdr_transfer.py`).
 const LRC_RAW_PAIRS: [(f32, f32); 6] = [(0.45, 0.459), (0.55, 0.575), (0.65, 0.771), (0.75, 1.024), (0.85, 1.603), (0.925, 2.976)];
 
-/// V9's HDR tone of a raw is LrC's: each tone's HDR value follows LrC's measured transfer from that tone's
+/// V10's HDR tone of a raw is LrC's: each tone's HDR value follows LrC's measured transfer from that tone's
 /// HDR-off value within 0.1 EV, and the brightest tones reach the headroom exactly (LrC clips there; V7's
 /// shoulder only creeps toward it). Fails under V7, whose HDR highlights are up to 1 EV dimmer.
 #[test]
@@ -186,8 +186,8 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
     use crate::finish::base_tone;
     use lcc_develop::Process;
     for info in [camera_raw(), raw()] {
-        let hdr_s = with_process(hdr_on(2.3), Process::V9);
-        let sdr_s = with_process(DevelopSettings::default(), Process::V9);
+        let hdr_s = with_process(hdr_on(2.3), Process::V10);
+        let sdr_s = with_process(DevelopSettings::default(), Process::V10);
         let peak = hdr_s.hdr.peak();
         let (h, s) = (base_tone(&hdr_s, &info, peak), base_tone(&sdr_s, &info, 1.0));
         for &(sv, _) in &LRC_RAW_PAIRS {
@@ -204,7 +204,7 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
         }
         let top = *h.lut().last().expect("a table");
         assert_eq!(top, peak, "{info:?}: the brightest tones reach the headroom");
-        // the HDR curve V9 is built on (V8's) is dimmer above white: at SDR 0.85 by 0.30 stops (measured on the
+        // the HDR curve V10 is built on (V8's) is dimmer above white: at SDR 0.85 by 0.30 stops (measured on the
         // Canon raw, 8 Nov 2026; V7's by 0.27 there, V8's roll-off already lifts its highlights), so more than 0.2
         let v8 = base_tone(&with_process(hdr_on(2.3), Process::V8), &info, peak);
         let v7 = base_tone(&with_process(hdr_on(2.3), Process::V7), &info, peak);
@@ -221,10 +221,10 @@ fn v10_hdr_tone_follows_lightroom_from_the_sdr_tone() {
     }
 }
 
-/// V9's HDR tone changes only the HDR render: a raw's SDR edits, and the SDR rendition of its HDR edits, tone as
-/// under V8 at these settings (no slider that V9's Lightroom Classic tone draws differently), for a raw with a
+/// V10's HDR tone changes only the HDR render: a raw's SDR edits, and the SDR rendition of its HDR edits, tone as
+/// under V8 at these settings (no slider that V10's Lightroom Classic tone draws differently), for a raw with a
 /// camera curve of its own. A raw without a camera tone takes Lightroom Classic's base tone in both
-/// ([`crate::tone::ToneMap::lrc_default`]). Display-referred sources are left out: V9 draws their SDR tone in
+/// ([`crate::tone::ToneMap::lrc_default`]). Display-referred sources are left out: V10 draws their SDR tone in
 /// Lightroom Classic's display look.
 #[test]
 fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
@@ -233,7 +233,7 @@ fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
     for info in [camera_raw(), raw()] {
         for s in [DevelopSettings::default(), hdr_on(3.0)] {
             let sdr = s.sdr_rendition().into_owned();
-            let a = base_tone(&with_process(sdr.clone(), Process::V9), &info, 1.0);
+            let a = base_tone(&with_process(sdr.clone(), Process::V10), &info, 1.0);
             let b = if info.camera_tone.is_some() {
                 base_tone(&with_process(sdr, Process::V8), &info, 1.0)
             } else {
@@ -247,7 +247,7 @@ fn v10_keeps_sdr_renders_and_the_sdr_rendition_of_v7() {
     }
 }
 
-/// Under V9 a raw edited with Whites −100 still reaches the headroom in HDR, as in Lightroom Classic (4.9 of a
+/// Under V10 a raw edited with Whites −100 still reaches the headroom in HDR, as in Lightroom Classic (4.9 of a
 /// 4.9 peak on R5 C raws), and stays brighter than its SDR curve above the mid tones. Failed before the shoulder
 /// unrolled toward the SDR curve's own top: the HDR peak stopped at 1.05.
 #[test]
@@ -256,9 +256,9 @@ fn v10_hdr_reaches_the_headroom_with_whites_lowered() {
     use lcc_develop::Process;
     for info in [camera_raw(), raw()] {
         for whites in [-100.0, -50.0] {
-            let mut hdr_s = with_process(hdr_on(2.3), Process::V9);
+            let mut hdr_s = with_process(hdr_on(2.3), Process::V10);
             hdr_s.light.whites = whites;
-            let mut sdr_s = with_process(DevelopSettings::default(), Process::V9);
+            let mut sdr_s = with_process(DevelopSettings::default(), Process::V10);
             sdr_s.light.whites = whites;
             let peak = hdr_s.hdr.peak();
             let (h, s) = (base_tone(&hdr_s, &info, peak), base_tone(&sdr_s, &info, 1.0));
@@ -269,8 +269,8 @@ fn v10_hdr_reaches_the_headroom_with_whites_lowered() {
     }
 }
 
-/// V9 keeps V7's HDR curve for display-referred sources (float TIFFs, JPEGs): it matched LrC within 0.2 EV on
-/// float TIFF charts, and LrC's raw tone made them 0.4-0.7 EV too bright above white. Failed when V9 gave every
+/// V10 keeps V7's HDR curve for display-referred sources (float TIFFs, JPEGs): it matched LrC within 0.2 EV on
+/// float TIFF charts, and LrC's raw tone made them 0.4-0.7 EV too bright above white. Failed when V10 gave every
 /// source the raw tone.
 #[test]
 fn v10_keeps_the_v7_hdr_tone_of_display_referred_sources() {
@@ -279,7 +279,7 @@ fn v10_keeps_the_v7_hdr_tone_of_display_referred_sources() {
     let info = SourceInfo::default();
     let s = hdr_on(2.3);
     let peak = s.hdr.peak();
-    let a = base_tone(&with_process(s.clone(), Process::V9), &info, peak);
+    let a = base_tone(&with_process(s.clone(), Process::V10), &info, peak);
     let b = base_tone(&with_process(s, Process::V7), &info, peak);
     assert_eq!(a.lut(), b.lut());
 }

@@ -66,7 +66,7 @@ fn lut_at(o: u32, x: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
-// Process V9's Highlights / Shadows shift at base tone `ev` (`tone_lift::Lift::at`).
+// Process V10's Highlights / Shadows shift at base tone `ev` (`tone_lift::Lift::at`).
 fn lift_at(ev: f32) -> f32 {
     let o = pu(F_LIFT_OFF);
     let n = pu(F_LIFT_N);
@@ -145,7 +145,7 @@ fn edge_cell_read(i: u32, wo: u32, eo: u32, so: u32, pw: u32, ph: u32, shift: f3
     return r;
 }
 
-// Process V9's highlight lift under a negative Exposure (`negev_lift::NegEvLift::at`) for the white-balanced colour
+// Process V10's highlight lift under a negative Exposure (`negev_lift::NegEvLift::at`) for the white-balanced colour
 // `raw` before the Exposure: the table at its brightest channel's headroom under white and that channel's gap over
 // its luminance.
 fn negev_at(raw: vec3<f32>) -> f32 {
@@ -181,8 +181,8 @@ fn negev_at(raw: vec3<f32>) -> f32 {
     return a + (b - a) * t;
 }
 
-// Process V9's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
-// `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V9 Highlights grid (EDGE_W × EDGE_H in aux), each
+// Process V10's raw Highlights pull at pixel (x, y), whose tone a mask moved by `shift` and whose own base tone is
+// `own` (`hl_edge::EdgePull::at`): the four nearest cells of the V10 Highlights grid (EDGE_W × EDGE_H in aux), each
 // read by tone over its own neighbourhood (`edge_cell_read`), blended bilinearly.
 fn edge_at(x: u32, y: u32, shift: f32, own: f32) -> f32 {
     let pw = pu(F_EDGE_W);
@@ -258,7 +258,7 @@ fn curve(ch: u32, x: f32, hdr: bool) -> f32 {
     return lut_hdr(pu(F_CURVE_OFF) + ch * CURVE_N, x, hdr);
 }
 
-// `finish::curves_in_prophoto`: process V9's Tone Curve on linear Rec.2020 `d`, before the output transform. To
+// `finish::curves_in_prophoto`: process V10's Tone Curve on linear Rec.2020 `d`, before the output transform. To
 // ProPhoto and sRGB-encoded, the master table (0) keeping hue (largest and smallest channel through it, the middle
 // one keeping its place between them), each channel's table (1-3), Refine Saturation, and back.
 fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
@@ -272,7 +272,7 @@ fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
         let c = clamp(q, vec3<f32>(0.0), vec3<f32>(1.0));
         e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
     }
-    // process V9's Levels, just before the curves (`FinishParams::levels_pp`)
+    // process V10's Levels, just before the curves (`FinishParams::levels_pp`)
     if (pu(F_LEVELS_PP) != 0u) {
         e0 = levels3(e0, hdr);
     }
@@ -476,7 +476,7 @@ fn mt_lookup(t: u32, h: f32, s: f32, v: f32) -> vec3<f32> {
     return d;
 }
 
-// `mixer_measured::Measured::apply`: process V9's Color Mixer whose block (`Measured::matrices`, then
+// `mixer_measured::Measured::apply`: process V10's Color Mixer whose block (`Measured::matrices`, then
 // `Measured::words`) starts at `aux[o]`, on display-linear Rec.2020 `rgb` at `strength`.
 fn measured_mixer(o: u32, rgb: vec3<f32>, strength: f32) -> vec3<f32> {
     if (strength <= 0.0) {
@@ -546,7 +546,7 @@ fn measured_mixer(o: u32, rgb: vec3<f32>, strength: f32) -> vec3<f32> {
 }
 
 // `finish::local_point_colors`: each mask's Color Mixer, then its Point Color samples at the mask's opacity (at most 1).
-// A V9 mixer (record word 1 = 2, its block's offset in word 2) acts on the linear colour, a V1–V8 one (word 1 = 1) in OkLCh.
+// A V10 mixer (record word 1 = 2, its block's offset in word 2) acts on the linear colour, a V1–V9 one (word 1 = 1) in OkLCh.
 // `i`, `n`: the pixel's index in the mask planes and their stride (`main`'s `mi`, `mn`).
 fn local_point_colors(d0: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
     var d = d0;
@@ -734,7 +734,7 @@ fn split_zone(at: u32, x: f32) -> f32 {
     return a + (pf(at + i + 1u) - a) * u;
 }
 
-// `split_v9::SplitK::offset`: process V9's shadows and highlights wheels as an OkLab offset (L, a, b).
+// `split_v9::SplitK::offset`: process V10's shadows and highlights wheels as an OkLab offset (L, a, b).
 fn split_offset(l: f32) -> vec3<f32> {
     let k = F_SPLIT_K;
     let ws = split_zone(F_SPLIT_ZSH, SPLIT_CENTRE + (l - pf(k + 6u) - SPLIT_CENTRE) / pf(k + 8u));
@@ -1303,7 +1303,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var delta = 0.0;
     var hh = pf(F_HL) + lt[4];
     var ss = pf(F_SH) + lt[5];
-    // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
+    // (V10: the global sliders are the picture's own curve; the masks' keep the response below)
     if (pu(F_LIFT) != 0u) {
         delta += lift_at(base);
         if (pu(F_EDGE_PULL) != 0u) {
@@ -1388,7 +1388,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let det = l_pre - tex[i];
         delta -= clamp(l_noise, -1.0, 1.0) * 0.9 * det * (1.0 - sstep(0.1, 0.5, abs(det)));
     }
-    // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+    // (V10, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
     var lift = 0.0;
     if (pu(F_NEGEV) != 0u) {
         lift = negev_at(vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]));
@@ -1408,7 +1408,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let deep = pu(F_DEEP) != 0u;
     var d = tone_map(c);
     if (lift > 0.0) {
-        // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+        // (V10's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
         d = negev_keep_colour(d, tone_map(c * exp2(lift)));
     }
 
@@ -1485,7 +1485,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+    // --- process V10's Tone Curve, before the output transform (the same picture in every export space)
     if (pu(F_PPCURVES) != 0u || pu(F_LEVELS_PP) != 0u) {
         d = curves_in_prophoto(d, hdr);
     }
@@ -1540,7 +1540,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             e = refine_saturation(e0, e, rs);
         }
     }
-    // --- process V9 Split Toning on the curved display colour (`finish::split_display`)
+    // --- process V10 Split Toning on the curved display colour (`finish::split_display`)
     if (pu(F_SPLIT) != 0u) {
         let lin = vec3<f32>(srgb_dec_odd(e.x), srgb_dec_odd(e.y), srgb_dec_odd(e.z));
         let lab = oklab(mul3(mat_at(F_OUT_INV), lin));
@@ -1801,7 +1801,7 @@ fn near_white(p: vec3<f32>, peak: f32) -> vec3<f32> {
     return p + (vec3<f32>(min(hi, peak)) - p) * t;
 }
 
-// `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V9)
+// `finish::top_shoulder`: bright colours move toward the tone curve taken per channel (process V10)
 fn top_shoulder(d: vec3<f32>, c: vec3<f32>, o: f32, peak: f32) -> vec3<f32> {
     let hi = max(d.x, max(d.y, d.z));
     if (!(peak > 0.0)) {

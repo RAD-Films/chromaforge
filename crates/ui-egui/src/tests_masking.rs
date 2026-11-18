@@ -502,7 +502,7 @@ fn the_object_tool_adds_no_click_on_the_selected_masks_own_pin() {
 #[test]
 fn all_masks_overlay_outlines_every_visible_mask_but_only_the_selected_one_is_draggable() {
     let mut h = detail("panel.masking");
-    // a darkened photo: under process V9's base tone the demo's sky is near white, which hides a white outline and
+    // a darkened photo: under process V10's base tone the demo's sky is near white, which hides a white outline and
     // which the overlay's red fill takes white pixels away from
     exec(&mut h, "develop.set", json!({"control": "light.exposure", "value": -2.0}));
     // Two visible radial masks; mask 2 ends up selected (mask.add selects the new one).

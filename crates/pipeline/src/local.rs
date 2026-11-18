@@ -12,13 +12,13 @@ use lcc_raster::{Plane, Rgb32f, par_join};
 use crate::geometry::Frame;
 use crate::{Prepared, Quality, SourceInfo, for_rows, masks, timed};
 
-/// White balance (relative to the source's as-shot white) and exposure, in place. Process V9: the camera profile's
+/// White balance (relative to the source's as-shot white) and exposure, in place. Process V10: the camera profile's
 /// tables between the two ([`wb_gain`]).
 pub fn scene_linear_pre(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings) {
     wb_gain(img, info, s, 2f32.powf(s.light.exposure as f32));
 }
 
-/// White balance only (exposure is applied by the per-pixel stage, see [`crate::Prepared`]); process V9: then the
+/// White balance only (exposure is applied by the per-pixel stage, see [`crate::Prepared`]); process V10: then the
 /// camera profile's tables ([`wb_gain`]).
 pub fn white_balance(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings) {
     wb_gain(img, info, s, 1.0);
@@ -81,11 +81,11 @@ pub fn deferred_tables(info: &SourceInfo, s: &DevelopSettings) -> Option<(lcc_ra
     Some((tables, gain))
 }
 
-/// The white balance, then (process V9, [`deferred_tables`]) the camera profile's tables (hue/saturation map,
+/// The white balance, then (process V10, [`deferred_tables`]) the camera profile's tables (hue/saturation map,
 /// baseline exposure, look table) in the order of the DNG specification (chapter 6), then `gain`, in place. The
 /// pixels carry the baseline-exposure gain already, so the map sees them without it, as it would in that order.
 /// Channels are clamped at zero only after the tables: a V1–V7 decode applied them to the unclamped colour, and at
-/// the as-shot white V9 gives what it gave.
+/// the as-shot white V10 gives what it gave.
 fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) {
     let m = wb_matrix_for(info, s);
     let tables = deferred_tables(info, s);
@@ -434,7 +434,7 @@ pub const DEHAZE_PATCH_MAX: usize = 64;
 pub fn dehaze_patch_radius(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 | Process::V2 => 0,
-        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 => {
+        Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 | Process::V10 => {
             ((DEHAZE_PATCH * px_per_long).round().max(1.0) as usize).min(DEHAZE_PATCH_MAX)
         }
     }
@@ -493,7 +493,7 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 => {
+        Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 | Process::V7 | Process::V8 | Process::V9 | Process::V10 => {
             base_detail_radius(px_per_long)
         }
     }
@@ -1610,7 +1610,7 @@ mod nrc_tests {
         assert!(worst < 0.0005, "the joint colour NR moved a channel's mean by {:.3} %", 100.0 * worst);
     }
 
-    /// Toned per ProPhoto channel (V9, a raw with the base curve), a magenta beyond ProPhoto's green edge keeps a green
+    /// Toned per ProPhoto channel (V10, a raw with the base curve), a magenta beyond ProPhoto's green edge keeps a green
     /// of exactly 0 there (as Lightroom Classic renders it), where the clip per Rec.2020 channel left it positive. A
     /// render without the per-channel tone keeps the clip in Rec.2020.
     #[test]

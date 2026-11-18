@@ -958,8 +958,8 @@ fn a_draft_has_the_large_scale_tone_of_the_full_render() {
     }
 }
 
-/// Process V9's Tone Curve gives the same picture in every export space: a Red-only curve rendered into sRGB and into
-/// ProPhoto (converted to sRGB) agrees wherever both hold the colour. Before V9 the curves ran on the output space's
+/// Process V10's Tone Curve gives the same picture in every export space: a Red-only curve rendered into sRGB and into
+/// ProPhoto (converted to sRGB) agrees wherever both hold the colour. Before V10 the curves ran on the output space's
 /// own encoded values, so the ProPhoto export of the same edit came out redder (round 18 charts: ΔE76 9.2 on the grey
 /// ramp between the two exports).
 #[test]

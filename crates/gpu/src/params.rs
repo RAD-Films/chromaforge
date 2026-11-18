@@ -26,7 +26,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("SRGB_OFF", 1),
     ("CURVE_OFF", 1),
     ("CURVES", 1),
-    // process V9's Tone Curve before the output transform (`FinishParams::curves_pp`): four tables at PPCURVE_OFF
+    // process V10's Tone Curve before the output transform (`FinishParams::curves_pp`): four tables at PPCURVE_OFF
     // (parametric ∘ master, red, green, blue) and the working ↔ ProPhoto matrices
     ("PPCURVES", 1),
     ("PPCURVE_OFF", 1),
@@ -44,13 +44,13 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR_PRE", 1),
     ("HL", 1),
     ("SH", 1),
-    // process V9's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
+    // process V10's global Highlights / Shadows (`FinishParams::lift`): its table in `aux` at LIFT_OFF
     ("LIFT", 1),
     ("LIFT_OFF", 1),
     ("LIFT_N", 1),
     ("LIFT_LO", 1),
     ("LIFT_STEP", 1),
-    // process V9's extra Highlights pull next to clipped areas (`FinishParams::edge_pull`): its plane in `aux` at
+    // process V10's extra Highlights pull next to clipped areas (`FinishParams::edge_pull`): its plane in `aux` at
     // EDGE_OFF, EDGE_W × EDGE_H, read at (origin + pixel + 0.5) · scale − 0.5 and scaled by EDGE_GAIN
     ("EDGE_PULL", 1),
     ("EDGE_OFF", 1),
@@ -76,7 +76,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("EDGE_CELL_SIDE", 1),
     ("EDGE_STEP_RAMP", 1),
     ("EDGE_STEP_TOP", 1),
-    // process V9's highlight lift under a negative Exposure (`FinishParams::negev_lift`): its table (NEGEV_N rows, by
+    // process V10's highlight lift under a negative Exposure (`FinishParams::negev_lift`): its table (NEGEV_N rows, by
     // headroom under NEGEV_WHITE in steps of NEGEV_STEP, of NEGEV_GAPS columns, by the brightest channel's gap over
     // luminance in steps of NEGEV_GAP_STEP) in `aux` at NEGEV_OFF
     ("NEGEV", 1),
@@ -95,7 +95,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("HUE_CLIP", 1),
     // process V8: 8-bit output is ordered-dithered (`lcc_pipeline::finish::bayer_dither_offset`)
     ("DITHER", 1),
-    // process V9: bright colours take the tone curve per channel (`lcc_pipeline::finish::top_shoulder`)
+    // process V10: bright colours take the tone curve per channel (`lcc_pipeline::finish::top_shoulder`)
     ("TOP_SHOULDER", 1),
     ("SHARPEN", 1),
     ("SHARPEN_MASK", 1),
@@ -114,7 +114,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("MIX_HUE", 8),
     ("MIX_SAT", 8),
     ("MIX_LUM", 8),
-    // process V9's measured Color Mixer (`ColorOps::measured`): its block in `aux` at MIXT_OFF
+    // process V10's measured Color Mixer (`ColorOps::measured`): its block in `aux` at MIXT_OFF
     ("MIXT", 1),
     ("MIXT_OFF", 1),
     ("NPC", 1),
@@ -151,7 +151,7 @@ const FIELDS: &[(&str, usize)] = &[
     // Levels (`LevelsK`) on the encoded values before the curves: the master stage, then red, green, blue,
     // each 8 words (active, black, 1/range, out black, span, slope at 0, slope at 1, has a midtone table)
     ("LEVELS", 1),
-    // Levels run in process V9's Tone Curve stage (`FinishParams::levels_pp`)
+    // Levels run in process V10's Tone Curve stage (`FinishParams::levels_pp`)
     ("LEVELS_PP", 1),
     ("LEVELS_M", 8),
     ("LEVELS_R", 8),
@@ -215,7 +215,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("REFINE_SAT", 1),
     ("CALIB", 1),
     ("CALIB_M", 9),
-    // process V9: the base tone on each linear ProPhoto channel (`FinishParams::tone_per_channel`), these matrices
+    // process V10: the base tone on each linear ProPhoto channel (`FinishParams::tone_per_channel`), these matrices
     // working space → ProPhoto and back
     ("TONE_PC", 1),
     ("TONE_PC_TO", 9),
@@ -379,13 +379,13 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some((l, _)) = lut {
         aux.extend(l.data.iter().flatten());
     }
-    // process V9's Highlights / Shadows table
+    // process V10's Highlights / Shadows table
     let lift_off = aux.len();
     let lift = fp.lift.as_ref().filter(|l| l.0.len() == lcc_pipeline::tone_lift::LIFT_N);
     if let Some(l) = lift {
         aux.extend_from_slice(&l.0);
     }
-    // process V9's raw Highlights pull (only with the table it adds to, as on the CPU)
+    // process V10's raw Highlights pull (only with the table it adds to, as on the CPU)
     let edge_off = aux.len();
     let edge = fp
         .edge_pull
@@ -407,7 +407,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         aux.extend_from_slice(&e.span.0.data);
         aux.extend_from_slice(&e.span.1.data);
     }
-    // process V9's highlight lift under a negative Exposure
+    // process V10's highlight lift under a negative Exposure
     let negev_off = aux.len();
     let negev =
         fp.negev_lift.as_ref().filter(|l| l.table.len() == lcc_pipeline::negev_lift::N * lcc_pipeline::negev_lift::GAPS && l.white.is_finite());
@@ -426,7 +426,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
     let mixers_ok = fp.local_mixers.len() == masks.len();
-    // process V9's measured Color Mixers: the colour-space matrices, then the tables; the global one,
+    // process V10's measured Color Mixers: the colour-space matrices, then the tables; the global one,
     // then each mask's (its record holds the offset)
     let measured_block = |m: &lcc_pipeline::mixer_measured::Measured, aux: &mut Vec<f32>| {
         let o = aux.len();

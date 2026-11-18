@@ -418,8 +418,8 @@ const HIGHLIGHT_CLIP: f32 = 0.99;
 pub(crate) const HIGHLIGHT_HEADROOM: f32 = 0.0;
 
 /// The headroom (stops) a decode with `options` rebuilds clipped highlights with.
-/// A raw file decoded as process number `process` reads it: V1 to V8 keep the levels they read a Sony 12-bit
-/// uncompressed file with ([`lcc_raw::decode_v8_levels`]), V9 takes upstream #3429's.
+/// A raw file decoded as process number `process` reads it: V1 to V9 keep the levels they read a Sony 12-bit
+/// uncompressed file with ([`lcc_raw::decode_v8_levels`]), V10 takes upstream #3429's.
 pub(crate) fn decode_raw_at(bytes: &[u8], process: u32) -> lcc_raw::Result<lcc_raw::RawImage> {
     match crate::camera_preview::FitGen::of_process(process) {
         crate::camera_preview::FitGen::V8 => lcc_raw::decode_v8_levels(bytes),
@@ -431,9 +431,9 @@ pub(crate) fn headroom_of(options: &LoadOptions) -> f32 {
     if options.highlight_headroom { HIGHLIGHT_HEADROOM } else { 0.0 }
 }
 
-/// How a decode with `options` rebuilds clipped highlights: process V9's ([`LoadOptions::highlight_headroom`])
+/// How a decode with `options` rebuilds clipped highlights: process V10's ([`LoadOptions::highlight_headroom`])
 /// with its headroom and partly clipped areas in their rim's hue ([`lcc_raw::highlight::Rebuild::rim_hue`]), as
-/// Lightroom Classic does; V1–V8 as before.
+/// Lightroom Classic does; V1–V9 as before.
 pub(crate) fn rebuild_of(options: &LoadOptions) -> lcc_raw::highlight::Rebuild {
     lcc_raw::highlight::Rebuild { headroom: headroom_of(options), rim_hue: options.highlight_headroom }
 }
@@ -465,7 +465,7 @@ impl CameraColourModel<'_> {
         lcc_raw::highlight::reconstruct_how(img, self.wb, HIGHLIGHT_CLIP, clipped_white(&self.matrix), how, Some(mask));
     }
 
-    /// [`Self::rebuild_highlights`] (or [`Self::rebuild_highlights_masked`] with a `mask`) followed by process V9's
+    /// [`Self::rebuild_highlights`] (or [`Self::rebuild_highlights_masked`] with a `mask`) followed by process V10's
     /// colour near the clip ([`NearClip`]), whose rims the rebuild reads in their moved colour: a clipped area meets its
     /// unclipped surroundings in the colour they end up with. A pixel with only red clipped keeps its rebuilt red while
     /// green and blue move as an unclipped neighbour's do, so the band where only red clips joins the wall around it
@@ -591,9 +591,9 @@ const NEAR_CLIP_MAGENTA_ONSET: f32 = 0.9;
 /// …as far as green lies this many stops under the lower of red and blue (white-balanced): magenta light.
 const NEAR_CLIP_MAGENTA_SIDE: f32 = 0.3;
 
-/// Lightroom Classic's colour near the sensor's clip (process V9), on warm light (red the brightest white-balanced
+/// Lightroom Classic's colour near the sensor's clip (process V10), on warm light (red the brightest white-balanced
 /// channel): as a raw channel nears the clip, LrC moves the colour toward its brightest channel, by the raw level and
-/// the same at every Exposure. Each linear ProPhoto channel (the space of V9's tone) other than the brightest moves
+/// the same at every Exposure. Each linear ProPhoto channel (the space of V10's tone) other than the brightest moves
 /// toward it by [`NEAR_CLIP_AMOUNT`] × ((raw − [`NEAR_CLIP_ONSET`]) / (1 − [`NEAR_CLIP_ONSET`]))^[`NEAR_CLIP_POWER`],
 /// `raw` the lower of the matching camera channel's level and red's (1 = the file's white level), so nothing under the
 /// onset changes. Fitted on Lightroom Classic exports of 68 R5 C frames, each raw at two to four Exposures from +1 to
@@ -1279,7 +1279,7 @@ fn load_bytes_now(
         let t_colour = web_time::Instant::now();
         // the source's segmentation mattes (DNG semantic masks), read while the starting colour is fitted
         let (((xy, t, camera_look), kept_tone), mattes) = rayon::join(
-            // (the fit of the photo's process: V1 to V8 keep theirs, `camera_preview::FitGen`)
+            // (the fit of the photo's process: V1 to V9 keep theirs, `camera_preview::FitGen`)
             || {
                 crate::camera_preview::with_fit_gen(crate::camera_preview::FitGen::of_process(options.process), || {
                     let removed = dng_lens_ops.map(|ops| std::mem::replace(&mut raw.opcodes.list3, ops));
@@ -1320,7 +1320,7 @@ fn load_bytes_now(
         let bin = bin_factor(&raw, max_edge);
         // (binned: block means, and which colours had a clipped sample in each block)
         let binned = match bin {
-            // process V9 (`rebuild_of`): the colour planes on the block centres, as a full-size render has them
+            // process V10 (`rebuild_of`): the colour planes on the block centres, as a full-size render has them
             Some(k) if options.highlight_headroom => raw.develop_binned_masked_aligned(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
             Some(k) => raw.develop_binned_masked(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
             None => None,
@@ -1349,7 +1349,7 @@ fn load_bytes_now(
         // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
         // existed render exactly as they did, `lcc_pipeline::local::legacy_white`).
         let own_model = scale.own_matrix && !t.matrix_is_fallback && (camera_look.is_none() || raw.format == lcc_raw::RawFormat::Dng || dcp);
-        // Process V9: the tables wait for the white balance (DNG spec ch. 6 order), which the pipeline applies after
+        // Process V10: the tables wait for the white balance (DNG spec ch. 6 order), which the pipeline applies after
         // re-balancing to the chosen white; only with the camera's own model (the white balance re-develops through
         // it) and no fitted look's hue/saturation step after them
         let defer = options.defer_tables && own_model && tables.is_some() && hue_sat.is_none();
@@ -1366,7 +1366,7 @@ fn load_bytes_now(
         let finish = |mut img: Rgb32f| {
             let mut stages = vec![("develop", t0.elapsed())];
             stages.push(("transform", t0.elapsed()));
-            // process V9: Lightroom Classic's colour near the clip, with the clipped highlights rebuilt to meet it
+            // process V10: Lightroom Classic's colour near the clip, with the clipped highlights rebuilt to meet it
             let near = options.highlight_headroom.then(|| NearClip::new(colour.wb, &colour.matrix)).flatten();
             match (&near, &clip_mask) {
                 (Some(nc), mask) => colour.rebuild_highlights_near_clip(&mut img, mask.as_deref(), rebuild_of(&options), nc),
@@ -3757,7 +3757,7 @@ pub(crate) mod tests {
         let (_, plain_info) = load_bytes(&plain, 64).unwrap();
         assert!(info.local_tone.is_some() && plain_info.local_tone.is_none());
         let req = RenderRequest::fit(64, 64);
-        // (process V8: V9 lifts bright tones under a negative Exposure, `negev_lift`, which would bend the plain
+        // (process V8: V10 lifts bright tones under a negative Exposure, `negev_lift`, which would bend the plain
         // render's columns this test compares)
         let mut s = lcc_develop::DevelopSettings { process: lcc_develop::Process::V8.version(), ..Default::default() };
         // (darker, so that ×4 never reaches white)

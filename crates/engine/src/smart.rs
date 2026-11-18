@@ -165,7 +165,7 @@ pub fn encode_with(img: &Rgb32f, info: Option<&SourceInfo>, headroom: f32) -> Re
 }
 
 /// [`encode_with`] for a source whose camera look is the fit of `look` ([`crate::camera_preview::FitGen::look_version`]:
-/// processes V1 to V8 keep an older fit than V9's).
+/// processes V1 to V9 keep an older fit than V10's).
 pub fn encode_for(img: &Rgb32f, info: Option<&SourceInfo>, headroom: f32, look: u32) -> Result<Vec<u8>, String> {
     // scale so all but the brightest 0.05 % fit into 0..1
     let mut lum: Vec<f32> = img.data.iter().map(|c| c[0].max(c[1]).max(c[2])).filter(|v| v.is_finite()).collect();
@@ -475,8 +475,8 @@ fn header_headroom(head: &serde_json::Value) -> f32 {
 /// headroom than the photo's decode now takes (`headroom`, stops; `None`: not a raw, not checked).
 ///
 /// `look` is the fit the photo's decode makes ([`crate::camera_preview::FitGen::look_version`]), `None` when it takes
-/// no per-file look. A photo on processes V1 to V8 keeps the fit of [`crate::camera_preview::LOOK_VERSION_V8`]: its
-/// proxy is current only at exactly that fit (a V9 build's newer one would show a look the photo doesn't have).
+/// no per-file look. A photo on processes V1 to V9 keeps the fit of [`crate::camera_preview::LOOK_VERSION_V8`]: its
+/// proxy is current only at exactly that fit (a V10 build's newer one would show a look the photo doesn't have).
 pub fn is_stale_for(path: &Path, look: Option<u32>, headroom: Option<f32>) -> bool {
     use std::io::Read;
     if !is_valid(path) {
@@ -521,8 +521,8 @@ pub fn look_checked(dir: &Path) -> bool {
         return false;
     }
     let mut versions = text.split_whitespace();
-    // (the third: the fit processes V1 to V8 keep; a marker written before it was recorded checks the folder once more,
-    // for the proxies of those photos a build fitted with V9's look)
+    // (the third: the fit processes V1 to V9 keep; a marker written before it was recorded checks the folder once more,
+    // for the proxies of those photos a build fitted with V10's look)
     let (Some(look), Some(enc), Some(v8)) = (versions.next(), versions.next(), versions.next()) else { return false };
     match (look.parse::<u64>(), enc.parse::<u64>(), v8.parse::<u32>()) {
         (Ok(look), Ok(enc), Ok(v8)) => {
@@ -773,8 +773,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A proxy records the camera-look fit it was made with: a photo on processes V1 to V8 takes exactly the fit of
-    /// LOOK 22 (one a V9 build fitted with its newer look is stale for it), a V9 photo the current fit or a newer one.
+    /// A proxy records the camera-look fit it was made with: a photo on processes V1 to V9 takes exactly the fit of
+    /// LOOK 22 (one a V10 build fitted with its newer look is stale for it), a V10 photo the current fit or a newer one.
     #[test]
     fn a_proxy_is_current_only_for_the_fit_of_its_photos_process() {
         use crate::camera_preview::{LOOK_VERSION, LOOK_VERSION_V8};

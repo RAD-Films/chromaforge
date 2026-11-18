@@ -91,7 +91,7 @@ pub struct CameraColor {
     pub tags: lcc_raw::ColorData,
     /// The white the source pixels were developed for.
     pub developed_for: lcc_color::Xy,
-    /// Process V9 (`LoadOptions::defer_tables`): the source pixels are white-balanced, matrixed and scaled by this
+    /// Process V10 (`LoadOptions::defer_tables`): the source pixels are white-balanced, matrixed and scaled by this
     /// baseline-exposure gain, but the tags' hue/saturation map and look table are not in them yet; the scene-linear
     /// stage applies them after the white balance, at the chosen white ([`local::white_balance`]). `None`: any
     /// tables were applied while decoding, at the as-shot white.
@@ -442,9 +442,9 @@ pub(crate) struct Prepared {
     pub masks: Vec<masks::Evaluated>,
     /// The masks' own Whites / Blacks tone ranges ([`Plan::mask_tone`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// The global Highlights / Shadows table of process V9 ([`Plan::tone_lift`]).
+    /// The global Highlights / Shadows table of process V10 ([`Plan::tone_lift`]).
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
-    /// Process V9's extra Highlights pull next to clipped areas ([`Plan::edge_pull`]).
+    /// Process V10's extra Highlights pull next to clipped areas ([`Plan::edge_pull`]).
     pub edge_pull: Option<Arc<hl_edge::EdgePull>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
@@ -647,10 +647,10 @@ pub struct Plan<'a> {
     /// render of the whole frame ([`mask_tone`]), so previews, zoomed windows and exports agree; empty when no mask
     /// has Whites or Blacks (the masks then use [`finish::DEFAULT_MASK_TONE`]).
     pub mask_tone: Vec<[f32; 4]>,
-    /// Process V9's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
-    /// the whole frame so previews, zoomed windows and exports agree; `None` before V9 or with both at 0.
+    /// Process V10's global Highlights / Shadows curve for this photo ([`tone_lift`]), from a fixed-size render of
+    /// the whole frame so previews, zoomed windows and exports agree; `None` before V10 or with both at 0.
     pub tone_lift: Option<Arc<tone_lift::Lift>>,
-    /// Process V9's extra pull of a raw's Highlights − next to clipped areas ([`hl_edge`]), over the whole output
+    /// Process V10's extra pull of a raw's Highlights − next to clipped areas ([`hl_edge`]), over the whole output
     /// frame; `None` without it.
     pub edge_pull: Option<Arc<hl_edge::EdgePull>>,
     /// A windowed render works on a larger window when spots reach into it (see
@@ -939,7 +939,7 @@ pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     }
     // (before the white balance: the gain's input is the as-shot development, as in the file)
     local_tone::apply(img, info, p);
-    // (process V9: the camera profile's tables with it, after the white balance, DNG spec ch. 6)
+    // (process V10: the camera profile's tables with it, after the white balance, DNG spec ch. 6)
     local::white_balance(img, info, s);
     optics::defringe(img, s, p.px_per_long / optics::DEFRINGE_REF_LONG);
     // a Generative spot changes nothing until its patch is there (not generated yet, moved since,

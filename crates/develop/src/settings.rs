@@ -243,11 +243,15 @@ pub enum Process {
     /// jointly, leaving Y alone, with edge-aware weights from a denoised guide and a brake for
     /// isolated colour specks (adapted from upstream #1348).
     V8,
+    /// Calibration's primary Saturation scales a primary's distance from the grey of its own luminance in linear light
+    /// instead of its OkLab chroma, so it no longer turns blues in hue like the Hue slider (fork issue #1031). Released
+    /// in 26.46.2.
+    V9,
     /// A raw's camera-profile tables (a calibration's or `.dcp`'s hue/saturation map and look table, a DNG's own)
     /// apply after the white balance, at the chosen white, in the order of the DNG specification (chapter 6): white
-    /// balance, matrix, hue/saturation map, exposure, look table. Before V9 they were applied while decoding, at the
+    /// balance, matrix, hue/saturation map, exposure, look table. Before V10 they were applied while decoding, at the
     /// as-shot white, and a white-balance change re-balanced colours the tables had already moved, so a grey picked
-    /// neutral stayed tinted (up to 12 b* on a Canon EOS R6 calibration from 5500 K to 3200 K). Built on V8.
+    /// neutral stayed tinted (up to 12 b* on a Canon EOS R6 calibration from 5500 K to 3200 K). Built on V9.
     ///
     /// The global Highlights and Shadows follow Lightroom Classic's: one tone curve per picture, its shape taken from
     /// the picture's own histogram (fitted to Lightroom Classic exports of our own procedural pictures; OneSlips).
@@ -262,9 +266,9 @@ pub enum Process {
     /// brightness (`finish::top_shoulder`) instead of its brightest channel going over white and the colour fading
     /// to white, as Lightroom Classic renders it (yellows and reds near white had lost two thirds of their chroma).
     ///
-    /// Calibration's primary Saturation scales a primary's distance from white in CIE xy (Lightroom Classic's model,
-    /// above), so it no longer turns blues in hue like the Hue slider (fork issue #1031).
-    V9,
+    /// Calibration moves each ProPhoto primary in CIE xy around white as Lightroom Classic does (hue turns it,
+    /// Saturation scales its distance from white), measured on Lightroom Classic's charts.
+    V10,
 }
 
 /// How much of the AI-denoised picture to mix in for a Denoise slider fraction `a` (0 to 1) under
@@ -274,15 +278,15 @@ pub fn denoise_weight(process: Process, a: f32) -> f32 {
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
     match process {
         Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 => a,
-        Process::V6 | Process::V7 | Process::V8 | Process::V9 => 1.0 - (1.0 - a).powi(3),
+        Process::V6 | Process::V7 | Process::V8 | Process::V9 | Process::V10 => 1.0 - (1.0 - a).powi(3),
     }
 }
 
 impl Process {
     /// Every process, oldest first.
-    pub const ALL: [Process; 9] =
-        [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8, Process::V9];
-    pub const LATEST: Process = Process::V9;
+    pub const ALL: [Process; 10] =
+        [Process::V1, Process::V2, Process::V3, Process::V4, Process::V5, Process::V6, Process::V7, Process::V8, Process::V9, Process::V10];
+    pub const LATEST: Process = Process::V10;
 
     pub const fn version(self) -> ProcessVersion {
         match self {
@@ -295,6 +299,7 @@ impl Process {
             Process::V7 => ProcessVersion(7),
             Process::V8 => ProcessVersion(8),
             Process::V9 => ProcessVersion(9),
+            Process::V10 => ProcessVersion(10),
         }
     }
 }

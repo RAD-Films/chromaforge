@@ -294,7 +294,7 @@ fn zoomed_in_the_after_side_shows_the_edits() {
                 assert!((luma(b) - luma(o)).abs() < 6.0, "{mode:?} {zoom:?}: the Before side {b:?} is the original {o:?}");
             } else {
                 // two views of the same part of the photo: the After one is the brighter (a wide patch: under process
-                // V9's base tone a small one can sit on near-white sky, where more exposure barely shows)
+                // V10's base tone a small one can sit on near-white sky, where more exposure barely shows)
                 let (a, b) = (mean_in(&s, after, 100, 70), mean_in(&s, before, 100, 70));
                 assert!(luma(a) > luma(b) + 30.0, "{mode:?} {zoom:?}: the After {a:?} is the edited photo, brighter than the Before {b:?}");
             }

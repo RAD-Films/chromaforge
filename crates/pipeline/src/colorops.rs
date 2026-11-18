@@ -269,7 +269,7 @@ pub fn mixer_apply(hue: &[f32; 8], sat: &[f32; 8], lum: &[f32; 8], lch: [f32; 3]
 }
 
 /// A Color Mixer as a rendering process applies it: V1–V8's band shifts in OkLCh ([`MixerK`]),
-/// from V9 Lightroom Classic's measured response ([`crate::mixer_measured`]).
+/// from V10 Lightroom Classic's measured response ([`crate::mixer_measured`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mixer {
     Bands(MixerK),
@@ -282,7 +282,7 @@ impl Mixer {
         if m.is_neutral() {
             return None;
         }
-        if process >= lcc_develop::Process::V9 {
+        if process >= lcc_develop::Process::V10 {
             let bands = m.bands();
             let fin = |v: f64| if v.is_finite() { (v / 100.0) as f32 } else { 0.0 };
             return crate::mixer_measured::measured(&bands.map(|b| fin(b.hue)), &bands.map(|b| fin(b.sat)), &bands.map(|b| fin(b.lum)))
@@ -313,7 +313,7 @@ pub struct ColorOps {
     pub lum: [f32; 8],
     /// A V1–V8 mixer ([`MixerK`]: `hue`, `sat`, `lum`) changes something.
     pub mixer: bool,
-    /// A V9 mixer (applied first, to the linear colour).
+    /// A V10 mixer (applied first, to the linear colour).
     pub measured: Option<Arc<crate::mixer_measured::Measured>>,
     /// Point Color samples that change something (applied after the mixer).
     pub points: Vec<PointK>,
@@ -325,7 +325,7 @@ pub struct ColorOps {
     pub primaries: Option<PrimariesK>,
     /// The HSL curves ([`HslK`]), applied after the colour mixer on the same OkLCh values.
     pub hsl: Option<HslK>,
-    /// Process V9: the shadows and highlights wheels' colour as Lightroom Classic applies it
+    /// Process V10: the shadows and highlights wheels' colour as Lightroom Classic applies it
     /// ([`crate::split_v9`]); their colour terms in [`Self::grading`] are then zero. Not applied by
     /// [`Self::apply`]: the finish adds it to the final display colour, after the tone curves.
     pub split: Option<crate::split_v9::SplitK>,
@@ -347,7 +347,7 @@ impl ColorOps {
             None => (MixerK::new(&s.mixer), None),
         };
         let g = &s.grading;
-        let split = if s.process.process() >= lcc_develop::Process::V9 { crate::split_v9::SplitK::new(g) } else { None };
+        let split = if s.process.process() >= lcc_develop::Process::V10 { crate::split_v9::SplitK::new(g) } else { None };
         ColorOps {
             vibrance: (s.color.vibrance / 100.0) as f32,
             saturation: (s.color.saturation / 100.0) as f32,
@@ -675,31 +675,38 @@ pub const CALIB_HUE: f32 = 0.5;
 /// Chroma scale of a calibration primary at ±100 (`1 ± CALIB_SAT`).
 pub const CALIB_SAT: f32 = 0.6;
 
-/// Hue rotation (degrees in CIE xy around the white point) of a ProPhoto primary at ±100 (process V9).
+/// Hue rotation (degrees in CIE xy around the white point) of a ProPhoto primary at ±100 (process V10).
 pub const CALIB_XY_HUE: f64 = 30.0;
-/// Saturation ±100 (process V9) scales a ProPhoto primary's xy distance from white by `1 + a·v + b·v²`
+/// Saturation ±100 (process V10) scales a ProPhoto primary's xy distance from white by `1 + a·v + b·v²`
 /// (`v` = slider / 100), per primary (red, green, blue): fitted to Lightroom Classic's round-17 charts.
 pub const CALIB_XY_SAT: [(f64, f64); 3] = [(1.367, 0.732), (1.656, 0.959), (0.96, 0.329)];
 
 /// The calibration panel's primaries as a white-preserving 3×3 matrix on linear Rec.2020 (row-major),
 /// `None` when neutral. V1–V8: each Rec.2020 primary is rotated in OkLCh hue and scaled in chroma at
-/// constant OkLab lightness. V9 follows Lightroom Classic ([`calibration_matrix_xy`]). Both rescale the
+/// constant OkLab lightness. V10 follows Lightroom Classic ([`calibration_matrix_xy`]). Both rescale the
 /// columns so that neutral (1, 1, 1) maps to itself.
+///
+/// V9 (`linear_sat`) keeps V1–V8's hue but Saturation instead scales the primary's distance from the grey of
+/// its own luminance in linear light (fork issue #1031). In OkLab the line from Rec.2020 blue to white
+/// bends towards cyan/violet, so scaling the primary's OkLab chroma moved every blue mixture in hue
+/// about as much as the Hue slider did, and barely changed its chroma. In linear light the
+/// primary and all its mixtures with grey stay on one straight line, so they keep their hue.
 pub fn calibration_matrix(c: &Calibration, process: lcc_develop::Process) -> Option<[[f32; 3]; 3]> {
     let prim = c.primaries();
     if prim.iter().all(|(h, s)| *h == 0.0 && *s == 0.0) {
         return None;
     }
-    if process >= lcc_develop::Process::V9 {
+    if process >= lcc_develop::Process::V10 {
         return calibration_matrix_xy(&prim);
     }
+    let linear_sat = process == lcc_develop::Process::V9;
     let mut p = [[0.0f64; 3]; 3];
     for (i, (hue, sat)) in prim.iter().enumerate() {
         let mut e = [0.0f32; 3];
         e[i] = 1.0;
         let [l, ch, h] = lab_to_lch(oklab_from_2020(e));
         let h2 = h + (hue.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_HUE;
-        let gain = 1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT;
+        let gain = if linear_sat { 1.0 } else { 1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT };
         let q = oklab_to_2020(lch_to_lab([l, ch * gain, h2]));
         for (r, row) in p.iter_mut().enumerate() {
             row[i] = q[r] as f64;
@@ -707,11 +714,37 @@ pub fn calibration_matrix(c: &Calibration, process: lcc_develop::Process) -> Opt
     }
     let m = Mat3(p);
     let k = m.inverse()?.apply([1.0, 1.0, 1.0]);
-    let out: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|col| p[r][col] * k[col]));
+    let mut out: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|col| p[r][col] * k[col]));
+    if linear_sat {
+        // S_i = I + g (e_i − Y_i·1)(e_i − y)ᵀ, y the luminance weights: it moves a colour along its
+        // primary's line through grey by g × how far its channel i stands above its luminance. Grey
+        // and luminance stay; the primary itself gets (1 + g) × its distance from grey.
+        let y: [f64; 3] = std::array::from_fn(|i| {
+            let mut e = [0.0f32; 3];
+            e[i] = 1.0;
+            lcc_color::luminance_2020(e) as f64
+        });
+        for (i, (_, sat)) in prim.iter().enumerate() {
+            let g = sat.clamp(-100.0, 100.0) / 100.0 * CALIB_SAT as f64;
+            if g == 0.0 {
+                continue;
+            }
+            let yi = y.get(i).copied().unwrap_or(0.0);
+            let s: [[f64; 3]; 3] = std::array::from_fn(|r| {
+                std::array::from_fn(|col| {
+                    let u = if r == i { 1.0 - yi } else { -yi };
+                    let v = if col == i { 1.0 - y[col] } else { -y[col] };
+                    let id = if r == col { 1.0 } else { 0.0 };
+                    id + g * u * v
+                })
+            });
+            out = std::array::from_fn(|r| std::array::from_fn(|col| (0..3).map(|t| s[r][t] * out[t][col]).sum()));
+        }
+    }
     Some(out.map(|row| row.map(|v| v as f32)))
 }
 
-/// Process V9 calibration, as measured on Lightroom Classic (round 17 charts): each ProPhoto primary,
+/// Process V10 calibration, as measured on Lightroom Classic (round 17 charts): each ProPhoto primary,
 /// adapted to D65, moves in CIE xy around the white point: hue turns it by up to ±[`CALIB_XY_HUE`]°,
 /// saturation scales its distance from white ([`CALIB_XY_SAT`]). The moved primaries, rescaled to keep
 /// white, replace the old ones: the matrix maps a colour's ProPhoto coordinates onto them.
@@ -818,8 +851,8 @@ mod tests {
 
     #[test]
     fn mixer_targets_its_band() {
-        // V8 greys the band out; V9, as Lightroom Classic, leaves a vivid blue a trace of colour
-        for (process, most) in [(lcc_develop::Process::V8, 0.02), (lcc_develop::Process::V9, 0.04)] {
+        // V8 greys the band out; V10, as Lightroom Classic, leaves a vivid blue a trace of colour
+        for (process, most) in [(lcc_develop::Process::V8, 0.02), (lcc_develop::Process::V10, 0.04)] {
             let mut s = DevelopSettings { process: process.version(), ..Default::default() };
             s.mixer.blue.sat = -100.0;
             let ops = ColorOps::new(&s);
@@ -854,7 +887,7 @@ mod tests {
         s
     }
 
-    /// Process V9's mixer against Lightroom Classic's own exports of our round-12 colour charts (one slider at a time,
+    /// Process V10's mixer against Lightroom Classic's own exports of our round-12 colour charts (one slider at a time,
     /// 8 Nov 2026; patches read through the files' embedded profiles): the chart's baseline colour in, and what
     /// Lightroom Classic made of it at that slider out. The measured tables
     /// ([`crate::mixer_measured`]) keep every patch close and the average hue within about 2° (8 Nov 2026: 2.3°, chroma
@@ -925,7 +958,7 @@ mod tests {
             }
             (sum, worst)
         };
-        let (v9, v9_worst) = err(lcc_develop::Process::V9);
+        let (v9, v9_worst) = err(lcc_develop::Process::V10);
         let (v8, _) = err(lcc_develop::Process::V8);
         let msg = format!("V9 mean hue {:.2}° chroma {:.3} L {:.4}, worst {v9_worst:?}; V8 mean {v8:?}", v9[0], v9[1], v9[2]);
         assert!(v9_worst[0] < 7.0 && v9_worst[1] < 0.15 && v9_worst[2] < 0.012, "{msg}");
@@ -942,9 +975,9 @@ mod tests {
         for p in [lcc_develop::Process::V8, lcc_develop::Process::V1] {
             assert_eq!(Mixer::new(&m, p), Some(Mixer::Bands(MixerK::new(&m))), "{p:?}");
         }
-        assert!(matches!(Mixer::new(&m, lcc_develop::Process::V9), Some(Mixer::Measured(_))));
-        assert_eq!(Mixer::new(&lcc_develop::Mixer::default(), lcc_develop::Process::V9), None);
-        let s = one_slider(lcc_develop::Process::V9, 2, 0, -1.0);
+        assert!(matches!(Mixer::new(&m, lcc_develop::Process::V10), Some(Mixer::Measured(_))));
+        assert_eq!(Mixer::new(&lcc_develop::Mixer::default(), lcc_develop::Process::V10), None);
+        let s = one_slider(lcc_develop::Process::V10, 2, 0, -1.0);
         let ops = ColorOps::new(&s);
         assert!(!ops.mixer && ops.measured.is_some() && !ops.is_identity());
         for g in [0.0, 0.18, 1.0] {
@@ -1380,9 +1413,9 @@ mod tests {
     #[test]
     fn v9_calibration_follows_lightroom_classic_on_our_charts() {
         let (v8, v8_worst) = r17_calibration_error(lcc_develop::Process::V8);
-        let (v9, v9_worst) = r17_calibration_error(lcc_develop::Process::V9);
+        let (v9, v9_worst) = r17_calibration_error(lcc_develop::Process::V10);
         eprintln!("round 17 calibration, mean / worst OkLab error: V8 {v8:.4} / {v8_worst:.4}, V9 {v9:.4} / {v9_worst:.4}");
-        // measured: V8 0.042 / 0.104, V9 0.020 / 0.058 (24 strongly coloured patches, every primary at ±100)
+        // measured: V8 0.042 / 0.104, V10 0.020 / 0.058 (24 strongly coloured patches, every primary at ±100)
         assert!(v9 < 0.025 && v9_worst < 0.07, "V9 {v9} / {v9_worst}");
         assert!(v9 < 0.6 * v8 && v9_worst < 0.7 * v8_worst, "V9 {v9} / {v9_worst} vs V8 {v8} / {v8_worst}");
     }
@@ -1390,12 +1423,12 @@ mod tests {
     #[test]
     fn v9_calibration_keeps_white_and_v8_keeps_its_matrix() {
         let cal = Calibration { red_hue: 60.0, green_sat: 100.0, blue_hue: -100.0, blue_sat: -100.0, ..Default::default() };
-        let m9 = calibration_matrix(&cal, lcc_develop::Process::V9).unwrap();
+        let m9 = calibration_matrix(&cal, lcc_develop::Process::V10).unwrap();
         for g in [0.01, 0.3, 4.0] {
             let o = calibrate([g; 3], Some(&m9), 0.0);
             assert!(o.iter().all(|v| (v - g).abs() < 1e-4 * g.max(1.0)), "{g} -> {o:?}");
         }
-        assert!(calibration_matrix(&Calibration::default(), lcc_develop::Process::V9).is_none());
+        assert!(calibration_matrix(&Calibration::default(), lcc_develop::Process::V10).is_none());
         // V1–V8 keep the OkLCh construction
         for p in [lcc_develop::Process::V1, lcc_develop::Process::V8] {
             assert_eq!(calibration_matrix(&cal, p), calibration_matrix(&cal, lcc_develop::Process::V7));
@@ -1404,7 +1437,7 @@ mod tests {
         // the full slider range, odd values included, stays finite
         for v in [-100.0, -99.9, 0.5, 100.0, 1e9, -1e9, f64::NAN] {
             let c = Calibration { red_hue: v, red_sat: v, green_hue: v, green_sat: v, blue_hue: v, blue_sat: v, ..Default::default() };
-            if let Some(m) = calibration_matrix(&c, lcc_develop::Process::V9) {
+            if let Some(m) = calibration_matrix(&c, lcc_develop::Process::V10) {
                 assert!(m.iter().flatten().all(|x| x.is_finite()), "{v}: {m:?}");
             }
         }
@@ -1416,30 +1449,36 @@ mod tests {
     fn primary_saturation_scales_chroma_not_hue() {
         let lch = |c: [f32; 3]| lab_to_lch(oklab_from_2020(c));
         let turn = |a: f32, b: f32| wrap(b - a).abs();
-        for (i, px) in [[0.4f32, 0.05, 0.03], [0.05, 0.35, 0.05], [0.03, 0.05, 0.4], [0.06, 0.08, 0.4]].into_iter().enumerate() {
-            let [_, c0, h0] = lch(px);
-            let prim = if i < 2 { i } else { 2 };
-            let cal = |hue: f64, sat: f64| {
-                let mut c = Calibration::default();
-                match prim {
-                    0 => (c.red_hue, c.red_sat) = (hue, sat),
-                    1 => (c.green_hue, c.green_sat) = (hue, sat),
-                    _ => (c.blue_hue, c.blue_sat) = (hue, sat),
+        // V9's linear-light Saturation (#1031) and V10's Lightroom Classic model both keep the hue
+        for process in [lcc_develop::Process::V9, lcc_develop::Process::V10] {
+            for (i, px) in [[0.4f32, 0.05, 0.03], [0.05, 0.35, 0.05], [0.03, 0.05, 0.4], [0.06, 0.08, 0.4]].into_iter().enumerate() {
+                let [_, c0, h0] = lch(px);
+                let prim = if i < 2 { i } else { 2 };
+                let cal = |hue: f64, sat: f64| {
+                    let mut c = Calibration::default();
+                    match prim {
+                        0 => (c.red_hue, c.red_sat) = (hue, sat),
+                        1 => (c.green_hue, c.green_sat) = (hue, sat),
+                        _ => (c.blue_hue, c.blue_sat) = (hue, sat),
+                    }
+                    calibration_matrix(&c, process).unwrap()
+                };
+                let more = cal(0.0, 100.0);
+                let less = cal(0.0, -100.0);
+                let hue = cal(100.0, 0.0);
+                let [_, c_more, h_more] = lch(calibrate(px, Some(&more), 0.0));
+                let [_, c_less, h_less] = lch(calibrate(px, Some(&less), 0.0));
+                let [_, _, h_hue] = lch(calibrate(px, Some(&hue), 0.0));
+                assert!(c_more > c0 * 1.15 && c_less < c0 * 0.85, "{px:?}: chroma {c0} -> {c_less} / {c_more}");
+                let rotated = turn(h0, h_hue);
+                assert!(
+                    turn(h0, h_more) < rotated * 0.5 && turn(h0, h_less) < rotated * 0.5,
+                    "{px:?}: hue {h0} -> {h_less} / {h_more} (Hue: {h_hue})"
+                );
+                for m in [more, less, hue] {
+                    let grey = calibrate([0.3, 0.3, 0.3], Some(&m), 0.0);
+                    assert!(grey.iter().all(|v| (v - 0.3).abs() < 1e-4), "{grey:?}");
                 }
-                calibration_matrix(&c, lcc_develop::Process::V9).unwrap()
-            };
-            let more = cal(0.0, 100.0);
-            let less = cal(0.0, -100.0);
-            let hue = cal(100.0, 0.0);
-            let [_, c_more, h_more] = lch(calibrate(px, Some(&more), 0.0));
-            let [_, c_less, h_less] = lch(calibrate(px, Some(&less), 0.0));
-            let [_, _, h_hue] = lch(calibrate(px, Some(&hue), 0.0));
-            assert!(c_more > c0 * 1.15 && c_less < c0 * 0.85, "{px:?}: chroma {c0} -> {c_less} / {c_more}");
-            let rotated = turn(h0, h_hue);
-            assert!(turn(h0, h_more) < rotated * 0.5 && turn(h0, h_less) < rotated * 0.5, "{px:?}: hue {h0} -> {h_less} / {h_more} (Hue: {h_hue})");
-            for m in [more, less, hue] {
-                let grey = calibrate([0.3, 0.3, 0.3], Some(&m), 0.0);
-                assert!(grey.iter().all(|v| (v - 0.3).abs() < 1e-4), "{grey:?}");
             }
         }
     }
@@ -1498,7 +1537,7 @@ mod tests {
         let mut s = DevelopSettings::default();
         s.grading.shadows = lcc_develop::Wheel { hue: 220.0, sat: 60.0, lum: 0.0 };
         let ops = ColorOps::new(&s);
-        // process V9's split goes on in the finish, after the curves: add it as there (no curves here)
+        // process V10's split goes on in the finish, after the curves: add it as there (no curves here)
         let apply = |c: [f32; 3]| {
             let mut lab = oklab_from_2020(ops.apply(c, 0.0, 0.0));
             if let Some(k) = &ops.split {

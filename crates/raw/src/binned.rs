@@ -16,7 +16,7 @@
 //! speckle once reconstructed. [`RawImage::develop_binned`] instead gives such a channel the block's
 //! maximum sample of the colour, so that plain value thresholds see it as clipped.
 //!
-//! Process V9 ([`RawImage::develop_binned_masked_aligned`]) reads a Bayer mosaic's colour planes at the block centres,
+//! Process V10 ([`RawImage::develop_binned_masked_aligned`]) reads a Bayer mosaic's colour planes at the block centres,
 //! and at the edges of clipped areas red and blue follow green's shape across the blocks (`follow_green`): read
 //! between neighbouring blocks alone, a steep edge from dark branches to a bright sky took red from more of one side
 //! than green, and blue from more of the other, a lavender line that a full-size render doesn't have.
@@ -147,7 +147,7 @@ impl RawImage {
         {
             let offsets = plane_offsets(layout, k);
             let means = align_planes(&mut out, offsets);
-            // process V9, at the edges of clipped areas: red and blue follow green's shape ([`follow_green`])
+            // process V10, at the edges of clipped areas: red and blue follow green's shape ([`follow_green`])
             if let Some(means) = means
                 && let Some(near) = near_clipped(&mask, bw, bh, REACH.div_ceil(k))
             {
@@ -209,7 +209,7 @@ fn plane_offsets(layout: &[u8], k: usize) -> [(f32, f32); 3] {
     })
 }
 
-/// How far (sensor pixels) from a clipped sample [`follow_green`] reaches: the reach of process V9's full-size demosaic
+/// How far (sensor pixels) from a clipped sample [`follow_green`] reaches: the reach of process V10's full-size demosaic
 /// near clipped samples (its candidates read 3 px around and their homogeneity 3 px more, `demosaic::ahd`). An edge
 /// in front of a clipped sky is often a few pixels short of the clipping: the sky dims toward it.
 const REACH: usize = 6;
@@ -299,7 +299,7 @@ fn green_at(at: &impl Fn(isize, isize) -> f32, x: isize, y: isize) -> f32 {
     if g.is_finite() { g } else { 0.0 }
 }
 
-/// Process V9, the blocks `near` marks (the edges of clipped areas, [`near_clipped`]): red and blue take green's shape.
+/// Process V10, the blocks `near` marks (the edges of clipped areas, [`near_clipped`]): red and blue take green's shape.
 /// [`align_planes`] reads each of them between its own block's samples and the next block's, which on a steep edge
 /// takes red from more of one side than green and blue from more of the other: a lavender line where dark branches
 /// cross a bright sky at fit size (the sky near its clip, the edge's blocks holding no clipped sample themselves). Here

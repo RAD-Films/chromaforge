@@ -1,7 +1,7 @@
-//! The golden set of processes V1 to V8: every photo of the CC0 raw corpus and a few procedural scenes, rendered
+//! The golden set of processes V1 to V9: every photo of the CC0 raw corpus and a few procedural scenes, rendered
 //! under each frozen process with the import defaults, a busy edit, a 16-bit ProPhoto export and an HDR edit (and a raw's
 //! full-size, demosaiced decode with the import defaults), must
-//! keep the exact pixels they had when the hashes were recorded (on main at Clyde's V8, before process V9 was
+//! keep the exact pixels they had when the hashes were recorded (on main at Clyde's V8, before process V10 was
 //! stacked on it). A newer process may change anything; an older one never changes a saved photo's look.
 //!
 //! The hashes are per platform (`tests/data/process-golden/<os>-<arch>.json`: the maths libraries round the last

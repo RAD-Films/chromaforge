@@ -833,7 +833,7 @@ pub fn build_after_import(s: &mut Session, ids: &[lcc_catalog::PhotoId]) {
 type SmartJob = (lcc_catalog::PhotoId, std::path::PathBuf, Option<crate::media::SourceRef>, Option<u32>, Option<f32>);
 
 /// The camera-look fit a photo's proxy must have been made with (`smart::is_stale_for`), `None` when it takes no
-/// per-file look: that of its process (V1 to V8 keep an older fit than V9's, `camera_preview::FitGen`).
+/// per-file look: that of its process (V1 to V9 keep an older fit than V10's, `camera_preview::FitGen`).
 #[cfg(not(target_arch = "wasm32"))]
 fn proxy_look(p: &lcc_catalog::Photo) -> Option<u32> {
     preview_fitted_look(p).then(|| crate::camera_preview::FitGen::of_process(crate::media::LoadOptions::of(&p.develop).process).look_version())

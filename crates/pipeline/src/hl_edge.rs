@@ -1,4 +1,4 @@
-//! A raw's Highlights − in process V9, read per pixel: the picture's pull ([`crate::tone_lift::pull_table`]) at the
+//! A raw's Highlights − in process V10, read per pixel: the picture's pull ([`crate::tone_lift::pull_table`]) at the
 //! tone of each pixel's surroundings, and a little more next to clipped areas.
 //!
 //! **The surroundings.** Lightroom Classic keeps the detail inside bright areas when it pulls them: clouds in a
@@ -341,7 +341,7 @@ type Cached = (u64, Arc<Plane>, Arc<Plane>);
 static LAST: Mutex<Option<Cached>> = Mutex::new(None);
 
 /// The extra Highlights pull of `s` for a render of `full` output pixels (the rendered ones from `origin`) of the
-/// whole `frame` of `src`, or `None` when it has none: not process V9's Highlights ([`crate::tone_lift::active`]),
+/// whole `frame` of `src`, or `None` when it has none: not process V10's Highlights ([`crate::tone_lift::active`]),
 /// Highlights not below 0, not a raw (`raw_tone`, its default tone map, `None`), or nothing to measure.
 pub fn for_frame(
     src: &Rgb32f,

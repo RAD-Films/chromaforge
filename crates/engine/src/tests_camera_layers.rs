@@ -260,7 +260,7 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     eprintln!("luma standard deviation under the matrix-only profile: {kept:.2} (default tone before: {flat:.2})");
     assert!(kept > flat * 1.05, "the photo's tone keeps more contrast: {kept} vs {flat}");
     // process 9 draws the kept tone in Lightroom's default look: lighter than process 7
-    let (v7, v9) = (luma(&info, lcc_develop::Process::V7).0, luma(&info, lcc_develop::Process::V9).0);
+    let (v7, v9) = (luma(&info, lcc_develop::Process::V7).0, luma(&info, lcc_develop::Process::V10).0);
     assert!(v9 > v7 + 2.0, "process 9 renders the kept tone lighter: {v9} vs {v7}");
 
     // An imported photo carries its camera profile in its settings (`develop.profile.camera`, from the import's
@@ -298,9 +298,9 @@ fn saturation_map_profile() -> lcc_raw::dcp::Dcp {
     d
 }
 
-/// Process V9 decodes a raw without its camera profile's tables and hands them to the pipeline, which applies them
+/// Process V10 decodes a raw without its camera profile's tables and hands them to the pipeline, which applies them
 /// after the white balance; V1–V7 photos decode as they always did (the tables at the as-shot white). At the as-shot
-/// white both render alike; away from it they differ (the V9 order).
+/// white both render alike; away from it they differ (the V10 order).
 #[test]
 fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     use lcc_develop::{DevelopSettings, Process, WbMode, WbScale};
@@ -320,7 +320,7 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     // the settings choose the decode
     let mut v7 = DevelopSettings::for_raw(info7.as_shot_temp, info7.as_shot_tint);
     v7.process = Process::V7.version();
-    let v9 = DevelopSettings { process: Process::V9.version(), ..v7.clone() };
+    let v9 = DevelopSettings { process: Process::V10.version(), ..v7.clone() };
     assert!(!LoadOptions::of(&v7).defer_tables && LoadOptions::of(&v9).defer_tables);
     // a decode without a photo's settings is the default settings' (the latest process): its cached source serves them
     // (a plain decode keeps the tables in the pixels, for callers that use them without the pipeline)
@@ -329,7 +329,7 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     let max_diff = |a: &lcc_raster::Rgba8, b: &lcc_raster::Rgba8| {
         a.data.iter().zip(&b.data).flat_map(|(p, q)| (0..3).map(move |k| (i32::from(p[k]) - i32::from(q[k])).abs())).max().unwrap_or(0)
     };
-    // the same V9 render from either decode (V9's own tone is not V7's: it is built on V8 and draws a profile
+    // the same V10 render from either decode (V10's own tone is not V7's: it is built on V8 and draws a profile
     // without a tone curve in Lightroom's default look), so only where the tables are applied differs
     let at_shot = max_diff(&lcc_pipeline::render(&img7, &info7, &v9, &req).image, &lcc_pipeline::render(&img9, &info9, &v9, &req).image);
     assert!(at_shot <= 2, "at the as-shot white the deferred tables render as the decoded ones: {at_shot} levels apart");
@@ -343,10 +343,10 @@ fn process_v9_hands_the_profile_tables_to_the_white_balance() {
     assert!(moved >= 3, "away from it the tables follow the chosen white: {moved} levels apart");
 }
 
-/// Process V9 on a real calibrated raw (the public Canon EOS R6 sample, skipped without the corpus). Decoded at a size
+/// Process V10 on a real calibrated raw (the public Canon EOS R6 sample, skipped without the corpus). Decoded at a size
 /// the sensor bins to exactly (684 px: nothing resamples it after the colour model), the scene-linear picture after
-/// V9's white balance is V7's decode at the as-shot white, pixel for pixel; away from it the two differ. (Where a
-/// render resamples the source before the white balance, V9 applies the tables to the resampled pixels and V7 had
+/// V10's white balance is V7's decode at the as-shot white, pixel for pixel; away from it the two differ. (Where a
+/// render resamples the source before the white balance, V10 applies the tables to the resampled pixels and V7 had
 /// them in the pixels before: on this calibration's look table that moves a 1600 px preview by about 1 dE on average.)
 #[test]
 fn corpus_v9_at_the_as_shot_white_develops_a_calibrated_raw_as_v7() {
@@ -366,7 +366,7 @@ fn corpus_v9_at_the_as_shot_white_develops_a_calibrated_raw_as_v7() {
     assert!(info9.camera_color.as_ref().is_some_and(|c| c.deferred_tables_gain.is_some()), "the R6 calibration's tables wait");
     let mut v7 = DevelopSettings::for_raw(info7.as_shot_temp, info7.as_shot_tint);
     v7.process = Process::V7.version();
-    let v9 = DevelopSettings { process: Process::V9.version(), ..v7.clone() };
+    let v9 = DevelopSettings { process: Process::V10.version(), ..v7.clone() };
     let developed = |img: &lcc_raster::Rgb32f, info: &lcc_pipeline::SourceInfo, s: &DevelopSettings| {
         let mut img = img.clone();
         lcc_pipeline::local::white_balance(&mut img, info, s);

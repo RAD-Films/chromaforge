@@ -2,7 +2,7 @@
 //!
 //! Lightroom-style tone curve parametric model: four regions (shadows, darks, lights, highlights)
 //! separated by three split points. Up to process V7 each region contributes a cosine-windowed bump,
-//! summed and forced monotone. From V9 each region bends the curve as Lightroom Classic's does,
+//! summed and forced monotone. From V10 each region bends the curve as Lightroom Classic's does,
 //! read off tables measured on a grey wedge of our own ([`tables`]), and the region shifts are
 //! summed and forced monotone.
 
@@ -24,7 +24,7 @@ pub const PARAM_LUT: usize = 1024;
 enum Shape {
     /// V1–V7: a cosine bump per region, `0.22 · amount` high at its centre.
     Bumps,
-    /// V9 on: Lightroom Classic's measured region curves.
+    /// V10 on: Lightroom Classic's measured region curves.
     Measured,
 }
 
@@ -86,7 +86,7 @@ impl ParametricCurve {
         let s2 = if c.split_highlights.is_nan() { 0.75_f64.max(s1) } else { (c.split_highlights / 100.0).clamp(s1, 1.0) };
         let clean_amt = |a: f64| if a.is_nan() { 0.0 } else { a.clamp(-100.0, 100.0) };
         let amounts = [clean_amt(c.shadows), clean_amt(c.darks), clean_amt(c.lights), clean_amt(c.highlights)];
-        if p < Process::V9 {
+        if p < Process::V10 {
             return ParametricCurve::bumps(c);
         }
         let shape = Shape::Measured;
@@ -103,7 +103,7 @@ impl ParametricCurve {
         m
     }
 
-    /// The V1–V8 curve, computed exactly as those processes always have (in `f32`), so their renders never change.
+    /// The V1–V9 curve, computed exactly as those processes always have (in `f32`), so their renders never change.
     fn bumps(c: &ToneCurve) -> ParametricCurve {
         let s0 = if c.split_shadows.is_nan() { 0.25 } else { (c.split_shadows / 100.0).clamp(0.0, 1.0) as f32 };
         let s1 = if c.split_mid.is_nan() { 0.50_f32.max(s0) } else { (c.split_mid / 100.0).clamp(s0 as f64, 1.0) as f32 };
@@ -318,7 +318,7 @@ impl ParametricCurve {
         }
     }
 
-    /// The V9 amount that puts region `region`'s curve at `level` at `x`. Where the curve is flat in the amount
+    /// The V10 amount that puts region `region`'s curve at `level` at `x`. Where the curve is flat in the amount
     /// (pinned at black or white), several amounts give that level: `prefer` is kept when it is one of them,
     /// so a drag never jumps the slider along a stretch the eye can't see move.
     fn measured_amount(&self, region: usize, level: f64, x: f64, prefer: f64) -> f64 {
@@ -426,20 +426,20 @@ mod tests {
 
     /// Darks and Lights at full strength bend the V1–V7 curve so far that it folds back, and the
     /// monotone pass turns that into a flat band: a range of mid-tones that all come out the same level
-    /// (posterised skies and skin). Lightroom's curve keeps rising through the mid-tones, and so does V9's.
+    /// (posterised skies and skin). Lightroom's curve keeps rising through the mid-tones, and so does V10's.
     #[test]
     fn v8_darks_and_lights_never_flatten_the_mid_tones() {
         let mut old_flat = 0;
         for (darks, lights) in [(-100.0, 0.0), (100.0, 0.0), (0.0, -100.0), (0.0, 100.0), (-100.0, 100.0), (100.0, -100.0)] {
             let c = ToneCurve { darks, lights, ..Default::default() };
             old_flat = old_flat.max(longest_flat_run(&ParametricCurve::for_process(&c, Process::V7), 0.2, 0.8));
-            let new = longest_flat_run(&ParametricCurve::for_process(&c, Process::V9), 0.2, 0.8);
+            let new = longest_flat_run(&ParametricCurve::for_process(&c, Process::V10), 0.2, 0.8);
             assert!(new <= 2, "Darks {darks}, Lights {lights}: V9 is flat over {new} of 512 steps");
         }
         assert!(old_flat > 20, "the old curve's flat band, or this proves nothing: {old_flat}");
     }
 
-    /// V9's region curves go through Lightroom Classic's measured levels on the wedge, at every patch and
+    /// V10's region curves go through Lightroom Classic's measured levels on the wedge, at every patch and
     /// every amount measured, and halfway between 0 and ±50 they are halfway there.
     #[test]
     fn v8_regions_follow_the_wedge() {
@@ -452,7 +452,7 @@ mod tests {
                     2 => c.lights = amount,
                     _ => c.highlights = amount,
                 }
-                let m = ParametricCurve::for_process(&c, Process::V9);
+                let m = ParametricCurve::for_process(&c, Process::V10);
                 let mut half = c.clone();
                 match r {
                     0 => half.shadows = amount / 2.0,
@@ -460,7 +460,7 @@ mod tests {
                     2 => half.lights = amount / 2.0,
                     _ => half.highlights = amount / 2.0,
                 }
-                let h = ParametricCurve::for_process(&half, Process::V9);
+                let h = ParametricCurve::for_process(&half, Process::V10);
                 for (i, &x) in tables::X.iter().enumerate() {
                     let want = tables::Y[r][k][i] as f64;
                     let got = m.at(x as f64);
@@ -474,10 +474,10 @@ mod tests {
         }
     }
 
-    /// The flat curve stays the diagonal, and V9 handles the same hostile settings as V7.
+    /// The flat curve stays the diagonal, and V10 handles the same hostile settings as V7.
     #[test]
     fn v8_flat_and_hostile_curves() {
-        let m = ParametricCurve::for_process(&ToneCurve::default(), Process::V9);
+        let m = ParametricCurve::for_process(&ToneCurve::default(), Process::V10);
         for i in 0..=20 {
             let x = i as f64 / 20.0;
             assert!((m.at(x) - x).abs() < 0.002, "no sliders, no change at {x}: {}", m.at(x));
@@ -492,7 +492,7 @@ mod tests {
             highlights: f64::NEG_INFINITY,
             ..Default::default()
         };
-        let m = ParametricCurve::for_process(&c, Process::V9);
+        let m = ParametricCurve::for_process(&c, Process::V10);
         let mut prev = 0.0;
         for i in 0..=100 {
             let y = m.at(i as f64 / 100.0);
@@ -527,7 +527,7 @@ mod tests {
     fn v9_moved_splits_keep_lightrooms_darks_bell() {
         const LRC: [f64; 18] = [0.2, 0.3, 0.4, 0.7, 1.2, 1.7, 2.2, 2.6, 2.9, 3.6, 4.0, 4.0, 4.2, 3.9, 3.5, 2.4, 1.0, 0.2];
         let c = ToneCurve { darks: 21.0, split_shadows: 10.0, split_mid: 56.0, split_highlights: 90.0, ..Default::default() };
-        let m = ParametricCurve::for_process(&c, Process::V9);
+        let m = ParametricCurve::for_process(&c, Process::V10);
         for (i, want) in LRC.into_iter().enumerate() {
             let ev = -8.0 + 0.6 * i as f64;
             let x = srgb_encode(0.18 * 2.0_f64.powf(ev));
@@ -554,7 +554,7 @@ mod tests {
     }
 
     /// Moved splits never put a step in a smooth ramp. At the default splits the slope changes by at most 0.67
-    /// between neighbouring steps (every region at +100); the warp V9 had before jumped 2.7 for Darks +21 alone
+    /// between neighbouring steps (every region at +100); the warp V10 had before jumped 2.7 for Darks +21 alone
     /// at splits 10 / 56 / 90. Any split, any setting, stays under 1.2.
     #[test]
     fn v9_moved_splits_put_no_step_in_a_ramp() {
@@ -581,7 +581,7 @@ mod tests {
             for (s0, s1, s2) in splits {
                 let c =
                     ToneCurve { shadows, darks, lights, highlights, split_shadows: s0, split_mid: s1, split_highlights: s2, ..Default::default() };
-                let k = worst_kink(&ParametricCurve::for_process(&c, Process::V9));
+                let k = worst_kink(&ParametricCurve::for_process(&c, Process::V10));
                 assert!(k < 1.2, "{shadows}/{darks}/{lights}/{highlights} at {s0}/{s1}/{s2}: slope jumps {k:.2}");
             }
         }
@@ -592,7 +592,7 @@ mod tests {
     /// Darks ignores where its splits sit.
     #[test]
     fn v9_only_the_highlight_split_moves_its_region() {
-        let at = |c: ToneCurve| ParametricCurve::for_process(&c, Process::V9);
+        let at = |c: ToneCurve| ParametricCurve::for_process(&c, Process::V10);
         let plain = at(ToneCurve { darks: 50.0, ..Default::default() });
         let wide = at(ToneCurve { darks: 50.0, split_shadows: 15.0, split_mid: 40.0, split_highlights: 75.0, ..Default::default() });
         for i in 0..=20 {
@@ -607,11 +607,11 @@ mod tests {
         }
     }
 
-    /// Where V9's curve is pinned at white, a drag that has not moved up or down keeps the slider where it was
+    /// Where V10's curve is pinned at white, a drag that has not moved up or down keeps the slider where it was
     /// (Highlights +100 grabbed near white used to drop to 36 on the first frame).
     #[test]
     fn v8_a_still_drag_keeps_the_slider() {
-        let m = ParametricCurve::for_process(&ToneCurve { highlights: 100.0, ..Default::default() }, Process::V9);
+        let m = ParametricCurve::for_process(&ToneCurve { highlights: 100.0, ..Default::default() }, Process::V10);
         assert_eq!(m.amount_after_drag(3, 100.0, 0.0, 0.875), 100.0);
         assert_eq!(m.amount_at_level(3, m.at(0.875), 0.875), 100.0);
         assert!(m.amount_after_drag(3, 100.0, -0.05, 0.875) < 100.0, "a drag down still lowers it");

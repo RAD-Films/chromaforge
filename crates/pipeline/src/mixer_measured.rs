@@ -1,4 +1,4 @@
-//! Process V9's Color Mixer: the measured response of Lightroom Classic's Hue, Saturation and
+//! Process V10's Color Mixer: the measured response of Lightroom Classic's Hue, Saturation and
 //! Luminance sliders, as tables over hue × saturation × value in HSV of linear ProPhoto RGB (the
 //! hue/saturation/value space of the public DNG spec's hue/sat maps).
 //!
@@ -138,7 +138,7 @@ fn at_value(tables: &[Vec<[f32; 3]>], u: f32, node: usize) -> [f32; 3] {
     [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * t)
 }
 
-/// A V9 Color Mixer: its three tables (Luminance, Saturation, Hue), each [`NODES`] entries or
+/// A V10 Color Mixer: its three tables (Luminance, Saturation, Hue), each [`NODES`] entries or
 /// empty when that kind's sliders are all 0.
 #[derive(Debug, PartialEq)]
 pub struct Measured {

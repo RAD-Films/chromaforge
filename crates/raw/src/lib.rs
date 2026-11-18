@@ -396,8 +396,8 @@ pub fn decode(bytes: &[u8]) -> Result<RawImage> {
     decode_with(bytes, Mode::Full)
 }
 
-/// [`decode`] as processes V1 to V8 read a file: a Sony "12-bit uncompressed" ARW takes its black and white levels
-/// from its brightest sample (upstream #3429 reads them from the word layout, process V9), so a photo edited under
+/// [`decode`] as processes V1 to V9 read a file: a Sony "12-bit uncompressed" ARW takes its black and white levels
+/// from its brightest sample (upstream #3429 reads them from the word layout, process V10), so a photo edited under
 /// those processes keeps its pixels. Every other file decodes as [`decode`] does.
 pub fn decode_v8_levels(bytes: &[u8]) -> Result<RawImage> {
     match probe(bytes).ok_or(RawError::NotRaw)? {

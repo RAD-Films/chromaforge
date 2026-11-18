@@ -110,7 +110,7 @@ const WARM_CONVERGE: f32 = 0.4;
 /// many times green's over blue, so the pixel keeps one warm hue however far blue lies below its clip. Left to the rim
 /// colour and the fade, a pale one came out with red at green (hue 100–117°, an olive band around warm highlights) and a
 /// rich one too red; Lightroom Classic shows 77–85° on R5 C frames of both bodies. With the middle channel toned in
-/// its place (the V9 tone under a profile without a curve), 1.0 gives the hue Lightroom Classic shows: within 1° on
+/// its place (the V10 tone under a profile without a curve), 1.0 gives the hue Lightroom Classic shows: within 1° on
 /// nine frames of one body, where it was chosen, and 1–3° on ten of the other (1.3 gave 6–12° too red). Only where both
 /// are clipped: phased in as green neared its clip, it set the red of the band where only red clipped from green's lead
 /// over blue, often under red's own clip, and with the engine's near-clip colour on that band's unclipped green drew a
@@ -555,7 +555,7 @@ pub struct Rebuild {
     /// them to neutral as more channels clip. That is what Lightroom Classic does, measured on its exports at
     /// Exposure −1 and −3 (85 frames, about 2,300 clipped regions): partly clipped areas keep their rim's hue
     /// (median 2–3° off) at reduced chroma, fully clipped ones are neutral. A pale sky above bright foliage stays
-    /// the sky's blue instead of turning teal. Off: V1–V8, unchanged.
+    /// the sky's blue instead of turning teal. Off: V1–V9, unchanged.
     pub rim_hue: bool,
 }
 
@@ -569,7 +569,7 @@ pub fn reconstruct_how(img: &mut Rgb32f, wb: [f32; 3], clip: f32, white: [f32; 3
 pub type RimColour<'a> = &'a (dyn Fn([f32; 3]) -> [f32; 3] + Sync);
 
 /// [`reconstruct_how`], with each rim pixel's colour ([`Rebuild::rim_hue`]) as `rim_colour` changes it: the colour the
-/// unclipped pixels around a clipped area will have after a later per-pixel step (process V9's near-clip colour), so
+/// unclipped pixels around a clipped area will have after a later per-pixel step (process V10's near-clip colour), so
 /// the rebuilt area meets them in that colour instead of in the one they had before it.
 pub fn reconstruct_how_rim(
     img: &mut Rgb32f,
@@ -1145,7 +1145,7 @@ mod tests {
     fn with_rim_hue_a_partly_clipped_sky_keeps_its_rims_hue_above_a_bright_teal_surface() {
         let worst = worst_sky_off(true);
         assert!(worst < 0.001, "partly clipped sky off its own way to neutral by {worst}");
-        // the V1-V8 rebuild lets the teal in (what this changes): 0.008 off
+        // the V1-V9 rebuild lets the teal in (what this changes): 0.008 off
         let before = worst_sky_off(false);
         assert!(before > 0.005, "V1-V8 off by {before}, rim hue {worst}");
     }
@@ -1486,7 +1486,7 @@ mod tests {
         assert!((0.7..1.1).contains(&c), "caps at {c} of their orange's chroma");
     }
 
-    /// Without [`Rebuild::rim_hue`] (V1–V8) the rebuild is exactly [`reconstruct_brighter`]'s, masked or not.
+    /// Without [`Rebuild::rim_hue`] (V1–V9) the rebuild is exactly [`reconstruct_brighter`]'s, masked or not.
     #[test]
     fn without_rim_hue_the_rebuild_is_unchanged() {
         let (img0, _, _) = sky_beside_teal();

@@ -33,11 +33,11 @@ pub enum Method {
     Bilinear,
     Ppg,
     /// Adaptive homogeneity-directed: per pixel, the horizontal or vertical candidate that is more homogeneous
-    /// (processes V1-V8).
+    /// (processes V1-V9).
     #[default]
     Ahd,
     /// [`Method::Ahd`] that blends the two candidates where their homogeneity is close, so noise alone no longer picks
-    /// one and flat noisy areas don't turn into a maze (process V9, upstream #2094).
+    /// one and flat noisy areas don't turn into a maze (process V10, upstream #2094).
     AhdBlend,
     /// Enhance ▸ Raw Details: gradient-weighted green and edge-aware residual red/blue (`detail.rs`). Slower than
     /// AHD; used for the enhanced DNG, not live previews. Non-Bayer patterns use the directional method.
@@ -307,7 +307,7 @@ mod tests {
         eprintln!("anisotropy: ahd {outright:.3e}, blended {ahd:.3e}, bilinear {bilinear:.3e}");
         // the hard choice gave about 11 times bilinear's, the blend about 7.5 times
         assert!(ahd < 9.0 * bilinear, "ahd {ahd:.3e} bilinear {bilinear:.3e}");
-        // processes V1-V8 keep the outright pick, maze and all (their renders don't change)
+        // processes V1-V9 keep the outright pick, maze and all (their renders don't change)
         assert!(outright > 9.0 * bilinear, "outright ahd {outright:.3e} bilinear {bilinear:.3e}");
     }
 

@@ -1298,7 +1298,7 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
     let s = &*plan.settings;
-    // (process V9: a camera profile's tables after the white balance; `None` inside when they don't fit the kernel)
+    // (process V10: a camera profile's tables after the white balance; `None` inside when they don't fit the kernel)
     let tables = local::deferred_tables(info, s).map(|(t, gain)| profile_table_words(&t, gain));
     let img = if lcc_pipeline::lin_needs_cpu(s, info) || matches!(tables, Some(None)) {
         // content-aware Fill spots / the camera's local tone map: the whole stage on the CPU

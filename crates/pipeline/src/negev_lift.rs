@@ -1,4 +1,4 @@
-//! Process V9's highlight lift under a negative Exposure, for raws: bright tones near the sensor's clip are rendered
+//! Process V10's highlight lift under a negative Exposure, for raws: bright tones near the sensor's clip are rendered
 //! lighter than a plain gain puts them, as Lightroom Classic does.
 //!
 //! **Measured.** Lightroom Classic exports of our own Canon EOS R5 C raws (rounds 10, 23 and 24, OneSlips, Nov 2026),
@@ -177,7 +177,7 @@ mod tests {
 
     fn tone() -> ToneMap {
         let s = lcc_develop::DevelopSettings::default();
-        assert_eq!(s.process.process(), lcc_develop::Process::V9);
+        assert_eq!(s.process.process(), lcc_develop::Process::V10);
         let info = crate::SourceInfo { raw: true, camera_tone: None, ..Default::default() };
         crate::finish::base_tone(&s, &info, 1.0)
     }
@@ -249,7 +249,7 @@ mod tests {
         assert!(half.at(m) > 0.0 && half.at(m) < full.at(m), "{} vs {}", half.at(m), full.at(m));
     }
 
-    /// Only a process-V9 raw rendered for SDR under a negative Exposure carries the lift; everything else renders
+    /// Only a process-V10 raw rendered for SDR under a negative Exposure carries the lift; everything else renders
     /// exactly as before (no lift in its parameters), and the render at −1 EV does lift a pixel near the clip.
     #[test]
     fn only_a_v9_raw_under_a_negative_exposure_is_lifted() {
@@ -267,12 +267,12 @@ mod tests {
             s
         };
         for ev in [0.0, 0.01, 0.5, 2.0] {
-            assert!(fp_of(&at(ev, lcc_develop::Process::V9), &raw).is_none(), "{ev} EV");
+            assert!(fp_of(&at(ev, lcc_develop::Process::V10), &raw).is_none(), "{ev} EV");
         }
-        assert!(fp_of(&at(-1.0, lcc_develop::Process::V9), &raw).is_some(), "V9 raw at -1 EV");
+        assert!(fp_of(&at(-1.0, lcc_develop::Process::V10), &raw).is_some(), "V9 raw at -1 EV");
         assert!(fp_of(&at(-1.0, lcc_develop::Process::V8), &raw).is_none(), "V8");
-        assert!(fp_of(&at(-1.0, lcc_develop::Process::V9), &jpeg).is_none(), "a JPEG");
-        let mut hdr = at(-1.0, lcc_develop::Process::V9);
+        assert!(fp_of(&at(-1.0, lcc_develop::Process::V10), &jpeg).is_none(), "a JPEG");
+        let mut hdr = at(-1.0, lcc_develop::Process::V10);
         hdr.hdr.enabled = true;
         if hdr.hdr.peak() > 1.0 {
             assert!(fp_of(&hdr, &raw).is_none(), "an HDR render");

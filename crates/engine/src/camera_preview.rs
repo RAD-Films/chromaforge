@@ -60,18 +60,18 @@ use lcc_raw::{
 /// 25: fitted tone curves no steeper than a log-log slope of 4 between knots (upstream #1904 / #2656).
 /// 26: a Sony "12-bit uncompressed" ARW takes the 14-bit scale from its word layout, not its brightest sample, so a
 /// dark frame is no longer fitted on the wrong black and white levels (upstream #3429).
-/// 27 to 30: no fit change. Working builds of process V9 used 27; 30 (with main of 18 Nov 2026 merged in) makes every
+/// 27 to 30: no fit change. Working builds of process V10 used 27; 30 (with main of 18 Nov 2026 merged in) makes every
 /// smart preview written by an earlier build fit again.
 ///
-/// 23 to 30 are process V9's: a photo on V1 to V8 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
+/// 23 to 30 are process V10's: a photo on V1 to V9 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
 pub const LOOK_VERSION: u32 = 30;
 
-/// The fit of [`LOOK_VERSION`] 22, the last one processes V1 to V8 had.
+/// The fit of [`LOOK_VERSION`] 22, the last one processes V1 to V9 had.
 pub const LOOK_VERSION_V8: u32 = 22;
 
-/// Which camera-look fit a decode makes: the one of its photo's process. Processes V1 to V8 keep the fit of
+/// Which camera-look fit a decode makes: the one of its photo's process. Processes V1 to V9 keep the fit of
 /// [`LOOK_VERSION_V8`] (the tone curve smoothed by its slope alone, no bound on its steepness), so an edit saved under
-/// them looks as it did; V9 takes every later fit change (23 to 26).
+/// them looks as it did; V10 takes every later fit change (23 to 26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FitGen {
     V8,
@@ -81,7 +81,7 @@ pub(crate) enum FitGen {
 impl FitGen {
     /// The fit of process number `process` (`LoadOptions::process`).
     pub(crate) fn of_process(process: u32) -> FitGen {
-        if process >= lcc_develop::Process::V9.version().0 { FitGen::Current } else { FitGen::V8 }
+        if process >= lcc_develop::Process::V10.version().0 { FitGen::Current } else { FitGen::V8 }
     }
 
     /// The [`LOOK_VERSION`] this fit writes into a smart preview.
@@ -892,7 +892,7 @@ fn with_smooth_tone(look: CameraLook) -> CameraLook {
     let values: Vec<f64> = grid.xs.iter().map(|&x| ln(look.tone.apply(x))).collect();
     let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return look };
     let curve = if fit_gen() == FitGen::V8 {
-        // (the fit of processes V1 to V8: the slope blurred and integrated back, both ends kept)
+        // (the fit of processes V1 to V9: the slope blurred and integrated back, both ends kept)
         let slope: Vec<f64> = values.windows(2).map(|w| (w[1] - w[0]) / grid.step).collect();
         let smooth = blur_mirrored(&slope, TONE_SMOOTHING / grid.step);
         let total = smooth.iter().sum::<f64>() * grid.step;
@@ -2861,7 +2861,7 @@ fn fit_tone(pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
     CameraTone::new(bounded(knots, &pairs)?)
 }
 
-/// `knots` under [`MAX_TONE_ELASTICITY`] ([`limit_elasticity`]); the fit of processes V1 to V8 has no bound.
+/// `knots` under [`MAX_TONE_ELASTICITY`] ([`limit_elasticity`]); the fit of processes V1 to V9 has no bound.
 fn bounded(knots: [[f32; 2]; 32], pairs: &[(f64, f64)]) -> Option<[[f32; 2]; 32]> {
     match fit_gen() {
         FitGen::V8 => Some(knots),
@@ -4549,8 +4549,8 @@ mod tests {
         }
     }
 
-    /// Processes V1 to V8 keep the camera-look fit they had (LOOK 22): the two-population step of #1904 is not
-    /// bounded and the smoothed curve is not held at the fitted level, both only for V9's fit; the fit is chosen per
+    /// Processes V1 to V9 keep the camera-look fit they had (LOOK 22): the two-population step of #1904 is not
+    /// bounded and the smoothed curve is not held at the fitted level, both only for V10's fit; the fit is chosen per
     /// decode and put back after it.
     #[test]
     fn processes_v1_to_v8_keep_the_fit_of_look_22() {

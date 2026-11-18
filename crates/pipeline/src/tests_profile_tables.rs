@@ -1,4 +1,4 @@
-//! Process V9: a raw's camera-profile tables (hue/saturation map, look table) apply after the white balance, at the
+//! Process V10: a raw's camera-profile tables (hue/saturation map, look table) apply after the white balance, at the
 //! chosen white (DNG spec ch. 6), instead of at load at the as-shot white with the white balance re-balancing the
 //! colours they had already moved. A grey that the chosen white makes neutral renders neutral.
 
@@ -37,7 +37,7 @@ fn tags() -> lcc_raw::ColorData {
     tags
 }
 
-/// A raw source developed for the as-shot white; `deferred`: its tables wait for the white balance (V9 decode).
+/// A raw source developed for the as-shot white; `deferred`: its tables wait for the white balance (V10 decode).
 fn info(deferred: bool) -> SourceInfo {
     let mut tags = tags();
     if !deferred {
@@ -82,7 +82,7 @@ fn a_grey_the_chosen_white_makes_neutral_stays_neutral_through_the_tables() {
     let grey = grey_as_shot(0.18);
     assert!(spread(grey) > 1.3, "the as-shot development is far from neutral: {grey:?}");
 
-    // V9: white balance, then the tables at the chosen white
+    // V10: white balance, then the tables at the chosen white
     let info9 = info(true);
     let mut img = Rgb32f::from_fn(1, 1, |_, _| grey);
     local::white_balance(&mut img, &info9, &s);

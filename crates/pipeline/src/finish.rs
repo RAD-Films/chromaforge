@@ -106,14 +106,14 @@ fn curve_luts(c: &ToneCurve, process: Process) -> Option<[Lut1; 3]> {
     }))
 }
 
-/// Whether `process` runs the Tone Curve before the output transform, in ProPhoto ([`curves_in_prophoto`]): V9 on.
+/// Whether `process` runs the Tone Curve before the output transform, in ProPhoto ([`curves_in_prophoto`]): V10 on.
 pub fn curves_before_output(process: Process) -> bool {
-    process >= Process::V9
+    process >= Process::V10
 }
 
-/// Process V9's Tone Curve tables: `[parametric ∘ master, red, green, blue]` (identity tables for curves left
+/// Process V10's Tone Curve tables: `[parametric ∘ master, red, green, blue]` (identity tables for curves left
 /// linear), or `None` while every curve is linear. Point curves are natural cubic splines, as Lightroom
-/// Classic's measure (round 18 charts); the parametric regions are V9's own table.
+/// Classic's measure (round 18 charts); the parametric regions are V10's own table.
 pub fn curve_luts_pp(c: &ToneCurve, process: Process) -> Option<[Lut1; 4]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
     let master = !ToneCurve::point_curve_is_identity(&c.master);
@@ -161,11 +161,11 @@ fn hue_keeping(l: &Lut1, e: [f32; 3], hdr: bool) -> [f32; 3] {
     e.map(|v| flo + (v - lo) * k)
 }
 
-/// Process V9's Tone Curve on linear Rec.2020 `d` ([`curve_luts_pp`]): to ProPhoto, sRGB-encode, the master curve
+/// Process V10's Tone Curve on linear Rec.2020 `d` ([`curve_luts_pp`]): to ProPhoto, sRGB-encode, the master curve
 /// keeping hue, each channel's curve, Refine Saturation, and back. Lightroom Classic's curves measure in this space
 /// (round 18: ΔE76 ≤ 0.07 on one-channel curves, against 0.8–2.4 in ProPhoto's own gamma 1.8).
 ///
-/// `levels` (process V9's Levels, [`FinishParams::levels_pp`]) run first, on the same encoded ProPhoto values, so Levels
+/// `levels` (process V10's Levels, [`FinishParams::levels_pp`]) run first, on the same encoded ProPhoto values, so Levels
 /// stays before the Tone Curve as it is before the output-space curves of earlier processes.
 pub fn curves_in_prophoto(l: Option<&[Lut1; 4]>, levels: Option<&crate::levels::LevelsK>, d: [f32; 3], hdr: bool, refine_sat: f32) -> [f32; 3] {
     let (to_pp, from_pp) = prophoto_matrices();
@@ -368,16 +368,16 @@ pub struct FinishParams {
     pub calib: Option<[[f32; 3]; 3]>,
     pub shadow_tint: f32,
     /// Tone curves (parametric ∘ point, per channel) on encoded values, 1024 entries each. Before
-    /// process V9 only: they run on the output space's sRGB-encoded values, after the output transform.
+    /// process V10 only: they run on the output space's sRGB-encoded values, after the output transform.
     pub curves: Option<[Lut1; 3]>,
-    /// Process V9's tone curves ([`curve_luts_pp`]): `[parametric ∘ master, red, green, blue]`, run before the
+    /// Process V10's tone curves ([`curve_luts_pp`]): `[parametric ∘ master, red, green, blue]`, run before the
     /// output transform on sRGB-encoded ProPhoto values, so every export space gets the same picture
     /// ([`curves_in_prophoto`]).
     pub curves_pp: Option<[Lut1; 4]>,
     /// Levels (beyond Lightroom) on encoded values, after Exposure and right before the Tone Curve; `None` while
     /// neutral. See [`crate::levels`].
     pub levels: Option<crate::levels::LevelsK>,
-    /// Process V9 and later: [`FinishParams::levels`] run in the Tone Curve's stage before the output transform
+    /// Process V10 and later: [`FinishParams::levels`] run in the Tone Curve's stage before the output transform
     /// ([`curves_in_prophoto`]), still just before the curves, instead of on the encoded output values.
     pub levels_pp: bool,
     /// Refine Saturation as 0..1 (1 = the curves' own saturation).
@@ -392,13 +392,13 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     pub hl: f32,
     pub sh: f32,
-    /// Process V9's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
+    /// Process V10's global Highlights / Shadows: the shift (EV) of each base tone ([`crate::tone_lift`]), which
     /// then replaces `hl` / `sh` (masks keep their own Highlights / Shadows response). Set by the caller from the
     /// render's plan.
     pub lift: Option<std::sync::Arc<crate::tone_lift::Lift>>,
-    /// Process V9's extra Highlights pull next to clipped areas ([`crate::hl_edge`]), added to the table's shift.
+    /// Process V10's extra Highlights pull next to clipped areas ([`crate::hl_edge`]), added to the table's shift.
     pub edge_pull: Option<std::sync::Arc<crate::hl_edge::EdgePull>>,
-    /// Process V9's highlight lift under a negative Exposure for raws ([`crate::negev_lift`]): a lightness lift at the
+    /// Process V10's highlight lift under a negative Exposure for raws ([`crate::negev_lift`]): a lightness lift at the
     /// tone map by each pixel's headroom under the clip, keeping its colour. `None` at Exposure 0 and above (renders bit-identical there).
     pub negev_lift: Option<std::sync::Arc<crate::negev_lift::NegEvLift>>,
     pub clar: f32,
@@ -414,7 +414,7 @@ pub struct FinishParams {
     pub hue_clip: bool,
     /// 8-bit output is dithered with [`bayer_dither_offset`] (process V8) instead of rounded.
     pub dither: bool,
-    /// Bright colours take the tone curve per channel ([`top_shoulder`], process V9), so they keep
+    /// Bright colours take the tone curve per channel ([`top_shoulder`], process V10), so they keep
     /// their saturation near white instead of fading to it.
     pub top_shoulder: bool,
     pub sharpen: f32,
@@ -444,7 +444,7 @@ pub struct FinishParams {
     /// Peak linear output relative to SDR white: 1 for SDR renders; `2^max_ev` for an HDR render
     /// ([`OutputDepth::F32Hdr`] with HDR on), which keeps values above 1 instead of clipping them.
     pub peak: f32,
-    /// Process V9 tones a raw under a profile without a tone curve as Lightroom Classic does: [`ToneMap::camera_lrc`]'s
+    /// Process V10 tones a raw under a profile without a tone curve as Lightroom Classic does: [`ToneMap::camera_lrc`]'s
     /// base curve on each channel in linear ProPhoto (these matrices: working space to ProPhoto and back) instead of on
     /// luminance with the colour scaled along ([`tone_per_channel`]). `None`: on luminance. The curve takes the
     /// brightest and darkest channel; the middle one keeps its place between them ([`tone_keeping_hue`]). Such a
@@ -487,7 +487,7 @@ impl FinishParams {
             && out_to_norm.0.iter().all(|v| v.is_finite());
         let v7 = match s.process.process() {
             Process::V1 | Process::V2 | Process::V3 | Process::V4 | Process::V5 | Process::V6 => false,
-            Process::V7 | Process::V8 | Process::V9 => true,
+            Process::V7 | Process::V8 | Process::V9 | Process::V10 => true,
         };
         let particles = if effects && finite_frame && v7 { crate::grain::GrainParams::new(&s.grain, px_per_long) } else { None };
         let grain = (s.grain.amount > 0.0 && effects && finite_frame && !v7).then(|| {
@@ -502,7 +502,7 @@ impl FinishParams {
         let peak = s.hdr.peak();
         let per_channel = tone_per_channel(s, info, peak);
         let full = base_tone(s, info, peak);
-        let negev_lift = (s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info) && peak <= 1.0)
+        let negev_lift = (s.process.process() >= lcc_develop::Process::V10 && tones_as_raw(s, info) && peak <= 1.0)
             .then(|| crate::negev_lift::NegEvLift::new(&full, ev, s.light.highlights as f32))
             .flatten()
             .map(std::sync::Arc::new);
@@ -517,7 +517,7 @@ impl FinishParams {
         };
         FinishParams {
             // a render toned per channel already has the shoulder this step adds
-            top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V9 && tones_as_raw(s, info),
+            top_shoulder: per_channel.is_none() && s.process.process() >= lcc_develop::Process::V10 && tones_as_raw(s, info),
             tone_per_channel: per_channel,
             peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration, s.process.process()) } else { None },
@@ -594,7 +594,7 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
 pub fn base_tone_with_contrast_blacks(s: &DevelopSettings, info: &SourceInfo, peak: f32, contrast: f64, blacks: f64) -> ToneMap {
     // the SDR rendition of an HDR edit: the HDR curve, its highlights rolled off into SDR white
     // (issue #69); SDR edits never get here (their rolloff peak is 1). It keeps the HDR curve it was
-    // tuned on under every process: V9 changes only the HDR render, and this rendition already matches
+    // tuned on under every process: V10 changes only the HDR render, and this rendition already matches
     // Lightroom Classic's SDR version of an HDR edit on real raws within 0.16 EV rms
     let rolloff = s.hdr.rolloff_peak();
     if peak <= 1.0 && rolloff > 1.0 {
@@ -611,7 +611,7 @@ fn tones_as_raw(s: &DevelopSettings, info: &SourceInfo) -> bool {
             && crate::plugin_filters::Stack::resolve(info, s, lcc_develop::FilterStage::Source).neutral_base_tone())
 }
 
-/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V9's
+/// The default rendering (Contrast, Whites and Blacks at 0, SDR) of a raw's scene tones, which process V10's
 /// Highlights / Shadows curve is applied in ([`crate::tone_lift`]); `None` for a display-referred source.
 pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
     if !tones_as_raw(s, info) {
@@ -624,7 +624,7 @@ pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
     Some(base_tone_at(&d, info, 1.0, true, d.light.contrast, d.light.blacks))
 }
 
-/// [`FinishParams::tone_per_channel`]: process V9's SDR render of a raw whose tone is Lightroom Classic's base curve
+/// [`FinishParams::tone_per_channel`]: process V10's SDR render of a raw whose tone is Lightroom Classic's base curve
 /// ([`ToneMap::camera_lrc`] under a profile without a tone curve). On LrC exports of our own R5 C frames (8 Nov 2026)
 /// the tone on each linear ProPhoto channel keeps LrC's colour where the tone on luminance did not: with the base
 /// curve, chroma within 2 % of LrC's in every tone band of 13 held-out frames (0.58–1.34 before), sunlit grass
@@ -632,7 +632,7 @@ pub fn shown_tone(s: &DevelopSettings, info: &SourceInfo) -> Option<ToneMap> {
 /// (0.22 vs 0.25; 0.40 before). Lightness is unchanged. HDR renders keep the tone on luminance (not measured). A raw
 /// without a camera tone takes the same base curve ([`ToneMap::lrc_default`]) on luminance: its colour isn't measured.
 fn tone_per_channel(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> Option<[[[f32; 3]; 3]; 2]> {
-    let lrc_base = s.process.process() == Process::V9
+    let lrc_base = s.process.process() == Process::V10
         && peak <= 1.0
         && tones_as_raw(s, info)
         && info.camera_tone.as_ref().is_some_and(crate::tone::CameraTone::has_default_curve);
@@ -651,12 +651,12 @@ pub(crate) fn prophoto_floor(s: &DevelopSettings, info: &SourceInfo) -> Option<[
     tone_per_channel(s, info, 1.0)
 }
 
-/// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V9 takes Lightroom Classic's HDR tone
-/// ([`ToneMap::hdr_from_sdr`] of V9's SDR tone map); `false` keeps V9's own curves at `peak`.
+/// `lrc_hdr`: an HDR render (`peak` > 1) of a raw under V10 takes Lightroom Classic's HDR tone
+/// ([`ToneMap::hdr_from_sdr`] of V10's SDR tone map); `false` keeps V10's own curves at `peak`.
 fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool, contrast: f64, blacks: f64) -> ToneMap {
     let l = &s.light;
     let raw = tones_as_raw(s, info);
-    // V9's tone at `peak`: V8's roll-off curves with Lightroom Classic's Whites on a raw and kept camera-JPEG tone
+    // V10's tone at `peak`: V8's roll-off curves with Lightroom Classic's Whites on a raw and kept camera-JPEG tone
     let v9 = |peak: f32| {
         // a raw's Whites up is drawn by the Highlights / Shadows curve ([`crate::tone_lift::whites_on_raw`])
         let whites = if raw && crate::tone_lift::whites_on_raw(s) { 0.0 } else { l.whites };
@@ -680,18 +680,18 @@ fn base_tone_at(s: &DevelopSettings, info: &SourceInfo, peak: f32, lrc_hdr: bool
         }
         // a raw's tone curve rolls off into white in stops: a camera curve past its last knot, the
         // generic curve from half a stop below its white point instead of clipping (upstream #3783)
-        Process::V8 => match info.camera_tone.as_ref().filter(|_| raw) {
+        Process::V8 | Process::V9 => match info.camera_tone.as_ref().filter(|_| raw) {
             Some(curve) => ToneMap::camera_rolloff_hdr(curve, contrast, l.whites, blacks, peak),
             None if raw => ToneMap::rolloff_hdr(contrast, l.whites, blacks, peak),
             None => ToneMap::display_hdr(contrast, l.whites, blacks, peak),
         },
-        // V9: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
-        Process::V9 if !raw && peak <= 1.0 => ToneMap::display_lrc(contrast, l.whites, blacks, l.exposure),
+        // V10: an SDR display-referred source's Exposure up, Whites and Blacks follow Lightroom Classic's
+        Process::V10 if !raw && peak <= 1.0 => ToneMap::display_lrc(contrast, l.whites, blacks, l.exposure),
         // an HDR render of a raw unrolls the SDR curve's shoulder up to the headroom. Display-referred sources
         // (float TIFFs, JPEGs) keep the older HDR curve: it already matched LrC's within 0.2 EV on float TIFF charts,
         // and the LrC raw tone put them 0.4-0.7 EV too bright
-        Process::V9 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&v9(1.0), peak),
-        Process::V9 => v9(peak),
+        Process::V10 if lrc_hdr && raw && peak > 1.0 => ToneMap::hdr_from_sdr(&v9(1.0), peak),
+        Process::V10 => v9(peak),
     }
 }
 
@@ -861,7 +861,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         particles,
         ..
     } = fp;
-    // process V9's Split Toning works on the final display colour (after the curves), as LrC's does
+    // process V10's Split Toning works on the final display colour (after the curves), as LrC's does
     let split_out = ops.split.zip(inv3(to_out));
     let dehaze_v3 = *dehaze_v3;
     let sharpen_v4 = *sharpen_v4;
@@ -996,7 +996,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let shift = l1 - l0;
             let base = p.base.data[i] + ev + shift;
             let mut delta = 0.0f32;
-            // (V9: the global sliders are the picture's own curve; the masks' keep the response below)
+            // (V10: the global sliders are the picture's own curve; the masks' keep the response below)
             let (hh, ss) = if let Some(lf) = lift {
                 delta += lf.at(base) + fp.edge_pull.as_deref().map_or(0.0, |e| e.at(x, y, shift, base));
                 (l_hl, l_sh)
@@ -1068,7 +1068,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let det = l_pre - b.data[i];
                 delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
             }
-            // (V9, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
+            // (V10, a raw under a negative Exposure: bright tones near the clip, by their headroom before the Exposure)
             let lift = fp.negev_lift.as_deref().map_or(0.0, |nl| nl.at(raw));
             if delta != 0.0 {
                 let g = delta.exp2();
@@ -1116,7 +1116,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             };
             let mut d = tone_map(c);
             if lift > 0.0 {
-                // (V9's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
+                // (V10's negative-Exposure lift: the lightness of the lifted tone, the colour of the unlifted one)
                 d = crate::negev_lift::keep_colour(d, tone_map(c.map(|v| v * lift.exp2())));
             }
 
@@ -1166,7 +1166,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
             }
 
-            // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
+            // --- process V10's Tone Curve, before the output transform (the same picture in every export space)
             let levels_pp = fp.levels.as_ref().filter(|_| fp.levels_pp);
             if curves_pp.is_some() || levels_pp.is_some() {
                 d = curves_in_prophoto(curves_pp.as_ref(), levels_pp, d, hdr, fp.refine_sat);
@@ -1221,7 +1221,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 r.map(|v| encode_srgb(srgb, v))
             };
             // --- Levels: the one call site of the stage (see `crate::levels`): after the gamut map and the encode above, so
-            // on the final in-gamut display values, and before the Tone Curve (process V9: with its Tone Curve, above).
+            // on the final in-gamut display values, and before the Tone Curve (process V10: with its Tone Curve, above).
             if let Some(lv) = fp.levels.as_ref().filter(|_| !fp.levels_pp) {
                 e = lv.apply(e, hdr);
             }
@@ -1301,8 +1301,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 
 /// The masks' local Color Mixer and Point Color on display-linear Rec.2020 colour `d` of pixel `i`:
 /// each mask's mixer, then its samples, at the mask's opacity there (at most 1). `mixers` and
-/// `local` are each empty or one entry per mask. A V9 mixer acts on the linear colour (blended by
-/// the opacity), a V1–V8 one in OkLCh like the samples.
+/// `local` are each empty or one entry per mask. A V10 mixer acts on the linear colour (blended by
+/// the opacity), a V1–V9 one in OkLCh like the samples.
 #[inline]
 fn local_point_colors(
     d: [f32; 3],
@@ -1313,7 +1313,7 @@ fn local_point_colors(
 ) -> [f32; 3] {
     use crate::colorops::Mixer;
     use lcc_color::perceptual::{lab_to_lch, lch_to_lab, oklab_from_2020, oklab_to_2020};
-    // the colour so far: linear (`d`), or in OkLCh once a sample or a V1–V8 mixer has worked on it
+    // the colour so far: linear (`d`), or in OkLCh once a sample or a V1–V9 mixer has worked on it
     let (mut d, mut lch): ([f32; 3], Option<[f32; 3]>) = (d, None);
     for (mi, m) in masks.iter().enumerate() {
         let mixer = mixers.get(mi).and_then(Option::as_ref);
@@ -1384,7 +1384,7 @@ fn srgb_enc_odd(v: f32) -> f32 {
     linear_to_srgb(v.abs()).copysign(v)
 }
 
-/// Process V9 Split Toning on a curved, sRGB-encoded colour `e` in the output primaries: its OkLab offset at the
+/// Process V10 Split Toning on a curved, sRGB-encoded colour `e` in the output primaries: its OkLab offset at the
 /// colour's own lightness (`from_out` / `to_out`: output ↔ linear Rec.2020). The GPU mirrors it in `finish.wgsl`.
 pub fn split_display(k: &crate::split_v9::SplitK, from_out: &[[f32; 3]; 3], to_out: &[[f32; 3]; 3], e: [f32; 3]) -> [f32; 3] {
     use lcc_color::perceptual::{oklab_from_2020, oklab_to_2020};
@@ -1438,7 +1438,7 @@ pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
 /// (1,704 patches, chroma by brightness; lightness held within about 0.5 L*). Mirrored in `finish.wgsl`.
 pub const TOP_SHOULDER: [f32; 6] = [0.7, 1.5, 0.6, 1.0, 0.9, 1.4];
 
-/// Process V9's bright colours: `d` (scene colour `c` tone mapped on its luminance `o`, ratios kept)
+/// Process V10's bright colours: `d` (scene colour `c` tone mapped on its luminance `o`, ratios kept)
 /// moved toward `c` tone mapped per channel, as far as [`TOP_SHOULDER`] says. Per channel, the
 /// curve's shoulder compresses the brightest channel more than the others, so a bright colour
 /// keeps its saturation at about its brightness; on luminance alone its brightest channel went
@@ -1723,7 +1723,7 @@ fn enc(v: f32, dither: f32) -> u8 {
 mod tests {
     use super::*;
 
-    /// Process V9 tones a raw under a profile without a tone curve on each ProPhoto channel (SDR only); every other
+    /// Process V10 tones a raw under a profile without a tone curve on each ProPhoto channel (SDR only); every other
     /// process, source and curve keeps the tone on luminance. A grey comes out the same either way.
     #[test]
     fn v9_tones_lightrooms_base_curve_per_prophoto_channel() {
@@ -1734,7 +1734,7 @@ mod tests {
         let plain = crate::tone::CameraTone::new(knots).unwrap();
         let raw = SourceInfo { raw: true, camera_tone: Some(plain.under_default_curve()), ..Default::default() };
         let v9 = DevelopSettings::default();
-        assert_eq!(v9.process.process(), Process::V9);
+        assert_eq!(v9.process.process(), Process::V10);
         let [to, from] = tone_per_channel(&v9, &raw, 1.0).expect("V9 raw under a profile without a curve");
         let v8 = DevelopSettings { process: Process::V8.version(), ..DevelopSettings::default() };
         assert!(tone_per_channel(&v8, &raw, 1.0).is_none(), "V8 unchanged");
@@ -1758,7 +1758,7 @@ mod tests {
         assert!(d[1] > d[0] && d[0] > d[2] && d.iter().all(|v| v.is_finite() && *v <= 1.0), "{d:?}");
     }
 
-    /// Process V9 draws a raw without a camera tone (a float or merged DNG, a DNG whose profile has no curve, a body
+    /// Process V10 draws a raw without a camera tone (a float or merged DNG, a DNG whose profile has no curve, a body
     /// without a fitted look) with Lightroom Classic's base tone, as it does a camera tone kept under a profile without
     /// a curve: mid grey near LrC's display 0.45 (L* ≈ 73, measured on the hdr1 float DNG ramp), not the generic
     /// roll-off's 0.19. V8 keeps the roll-off, a JPEG keeps its display tone.
@@ -1766,7 +1766,7 @@ mod tests {
     fn v9_raw_without_a_camera_tone_takes_lightrooms_base_tone() {
         let dng = SourceInfo { raw: true, camera_tone: None, ..Default::default() };
         let v9 = DevelopSettings::default();
-        assert_eq!(v9.process.process(), Process::V9);
+        assert_eq!(v9.process.process(), Process::V10);
         let g = crate::tone::GREY;
         let lrc = crate::tone::lrc_base(g);
         let tone = base_tone(&v9, &dng, 1.0);
@@ -1851,7 +1851,7 @@ mod tests {
         assert!(tone_keeping_hue([f32::NAN, -1.0, f32::INFINITY], tone).iter().all(|v| v.is_finite()));
     }
 
-    /// Bright warm light in a V9 render under a profile without a tone curve stays coloured: red at the top, green and
+    /// Bright warm light in a V10 render under a profile without a tone curve stays coloured: red at the top, green and
     /// blue well below it, where the tone on each channel and the pull towards luminance made it nearly white. V8
     /// renders it exactly as before.
     #[test]
@@ -2043,7 +2043,7 @@ mod tests {
         assert_eq!(lift_negatives([1.6, 0.2, 0.05], luma, 1.0), [1.6, 0.2, 0.05]);
     }
 
-    /// Levels run just before the Tone Curve under every process: process V9 moved its Tone Curve before the output
+    /// Levels run just before the Tone Curve under every process: process V10 moved its Tone Curve before the output
     /// transform (`curves_pp`), and its Levels moved with it. Output white 128 halves a light grey and a curve doubling
     /// the lower half brings it back; in the other order the curve clips it first and Levels halves white.
     #[test]
@@ -2052,7 +2052,7 @@ mod tests {
         let src = lcc_raster::Rgb32f::filled(8, 8, [0.45, 0.45, 0.45]);
         let req = crate::RenderRequest::fit(8, 8);
         let grey = |s: &DevelopSettings| crate::render(&src, &SourceInfo::default(), s, &req).image.get(4, 4)[1];
-        for process in [Process::V8, Process::V9] {
+        for process in [Process::V8, Process::V10] {
             let base = DevelopSettings { process: process.version(), ..DevelopSettings::default() };
             let plain = grey(&base);
             assert!((150..240).contains(&plain), "{process:?}: a light grey to start from: {plain}");

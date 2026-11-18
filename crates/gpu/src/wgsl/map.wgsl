@@ -149,7 +149,7 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
     put_rgb(i, wb_floor(c, 11u));
 }
 
-// White balance, then (process V9) a camera profile's tables: `wb_k`, then `lcc_raw::profile::ProfileTables::apply`
+// White balance, then (process V10) a camera profile's tables: `wb_k`, then `lcc_raw::profile::ProfileTables::apply`
 // (into linear ProPhoto, hue/saturation map, baseline gain, look table, back), as `lcc_pipeline::local::wb_gain` does;
 // non-finite channels become 0, then clamped at 0. P[1] = has matrix, P[2..11] the matrix, P[11..20] into ProPhoto,
 // P[20..29] out of it, P[29] the baseline gain, P[30..36] the hue/saturation map's and P[36..42] the look table's
