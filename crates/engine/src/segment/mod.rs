@@ -17,6 +17,7 @@
 //! commands return at once and [`Session::segment_poll`] applies the results; without it (CLI,
 //! MCP, tests) they wait for the worker.
 
+pub mod depth;
 #[cfg(feature = "sam")]
 mod download;
 pub mod models;
@@ -169,9 +170,14 @@ pub struct Segmenter {
     scene_model: models::SceneModel,
     /// The scene model as installed in the pipeline.
     pub scene: scene::SceneMasks,
+    /// The depth model as installed in the pipeline (Depth Range masks).
+    pub depth: depth::DepthMasks,
     #[cfg(feature = "sam")]
     model_downloads: std::collections::HashMap<&'static str, download::Downloader>,
     pending: Option<PendingClicks>,
+    /// Remove ▸ Detect Objects, background mode: the Object mask `(photo, mask, spot mode)` whose
+    /// clicks are queued becomes a Remove spot when its selection arrives (`spot.detectObject`).
+    pub(crate) then_remove: Option<(PhotoId, u32, String)>,
     messages: Vec<String>,
     /// Smooth Skin and Find Blemishes requests ([`skin`]).
     pub(crate) skin: skin::SkinJobs,
@@ -206,9 +212,11 @@ impl Default for Segmenter {
             object_model: models::ObjectModel::default(),
             scene_model: models::SceneModel::default(),
             scene: scene::SceneMasks::default(),
+            depth: depth::DepthMasks::default(),
             #[cfg(feature = "sam")]
             model_downloads: std::collections::HashMap::new(),
             pending: None,
+            then_remove: None,
             messages: Vec::new(),
             skin: skin::SkinJobs::default(),
             parts: parts::RetouchJobs::default(),
@@ -876,6 +884,16 @@ impl Session {
         }
     }
 
+    /// Remove the Object mask a Detect Objects stroke made when nothing came of it.
+    #[cfg(feature = "sam")]
+    fn drop_detect_mask(&mut self, photo: PhotoId, mask: u32) {
+        if let Some(d) = self.develop_of(photo) {
+            let mut d = (*d).clone();
+            d.masks.retain(|m| m.id != mask);
+            let _ = self.set_develop(photo, d, "Remove");
+        }
+    }
+
     /// Background mode: queue a Describe selection; the mask (or component, combined by `op`
     /// into mask `mask`) is created by [`Session::segment_poll`] when something matches.
     pub(crate) fn segment_text_later(&mut self, id: PhotoId, mask: Option<u32>, op: &str, name: Option<String>, text: &str) -> Result<(), String> {
@@ -1066,17 +1084,31 @@ impl Session {
             if self.segmenter.recompute.as_ref().is_some_and(|r| r.cancel.load(std::sync::atomic::Ordering::SeqCst)) {
                 self.segmenter.recompute = None;
             }
-            // (before draining: a worker that is idle now has sent everything)
-            let idle = !self.segmenter.busy();
-            let done: Vec<worker::Outcome> = self.segmenter.results.1.try_iter().collect();
-            for o in done {
-                self.apply_outcome(o, &mut polled);
-            }
-            // clicks whose request was lost (the worker restarted) aren't pending forever
-            if idle {
-                self.segmenter.pending = None;
-                // (nor is a batch whose replies were lost)
-                self.segmenter.recompute = None;
+            // Observe idleness and drain replies together: a finishing worker can't be between
+            // decrementing its counter and sending its reply while this runs (upstream #4221).
+            // While it is delivering one, the next poll takes it.
+            if let Some((idle, done)) = self.segmenter.worker.completed(&self.segmenter.results.1) {
+                // A lost click (the worker restarted) isn't pending forever; a reply to it in this
+                // very poll isn't lost. Cleared before outcomes apply: one may queue a new click.
+                let lost_clicks = idle
+                    && self.segmenter.pending.as_ref().is_some_and(|pending| {
+                        !done.iter().any(|o| {
+                            !o.superseded
+                                && matches!(&o.tag, Tag::Clicks { photo, mask, comp, hint, exclude }
+                                    if *photo == pending.photo && *mask == pending.mask && *comp == pending.comp
+                                        && *hint == pending.hint && *exclude == pending.exclude)
+                        })
+                    });
+                if lost_clicks {
+                    self.segmenter.pending = None;
+                }
+                // (nor is a batch whose replies were lost; one that replied now finishes itself)
+                if idle && !done.iter().any(|o| matches!(o.tag, Tag::Recompute { .. })) {
+                    self.segmenter.recompute = None;
+                }
+                for o in done {
+                    self.apply_outcome(o, &mut polled);
+                }
             }
             // what the batch's row says follows the worker: its photo at work, or what it waits for
             self.update_recompute_row();
@@ -1106,8 +1138,19 @@ impl Session {
                     return; // newer clicks are on their way
                 }
                 self.segmenter.pending = None;
+                // Remove ▸ Detect Objects: this selection is for a spot, not a mask of its own
+                let removal = match &self.segmenter.then_remove {
+                    Some((p, m, _)) if (*p, *m) == (photo, mask) => self.segmenter.then_remove.take().map(|(_, _, mode)| mode),
+                    _ => None,
+                };
                 let seg = match o.result {
                     Ok(Some(seg)) => seg,
+                    Ok(None) | Err(_) if removal.is_some() => {
+                        self.drop_detect_mask(photo, mask);
+                        let why = o.result.err().unwrap_or_else(|| "No object was found where you painted.".to_string());
+                        polled.changed = true;
+                        return polled.messages.push(why);
+                    }
                     Ok(None) => return,
                     Err(e) => return polled.messages.push(e),
                 };
@@ -1117,6 +1160,14 @@ impl Session {
                 let MaskShape::Object { edge, .. } = c.shape else { return };
                 c.shape = MaskShape::Object { hint: latest.hint, exclude: latest.exclude, seg: Some(seg), detail: vec![], edge };
                 match self.set_develop(photo, d, "Object Mask") {
+                    Ok(()) if removal.is_some() => {
+                        polled.changed = true;
+                        let mode = removal.unwrap_or_default();
+                        if let Err(e) = self.execute("spot.fromMask", &serde_json::json!({"mask": mask, "mode": mode, "deleteMask": true})) {
+                            self.drop_detect_mask(photo, mask);
+                            polled.messages.push(e.to_string());
+                        }
+                    }
                     Ok(()) => {
                         polled.changed = true;
                         polled.refine = Some(mask);
@@ -1396,6 +1447,67 @@ mod tests {
         let polled = s.segment_poll();
         assert_eq!(polled.messages, vec![worker::GPU_FAILED.to_string()]);
         assert!(s.segment_poll().messages.is_empty(), "once");
+    }
+
+    // A reply racing the session poll must not be mistaken for a lost click (upstream #4221).
+    #[cfg(feature = "sam")]
+    #[test]
+    fn idle_before_click_reply_must_not_discard_the_outcome() {
+        use std::{sync::mpsc, time::Duration};
+        let (setup_tx, setup_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let session = std::thread::spawn(move || {
+            let mut s = Session::with_demo();
+            let photo = s.active().unwrap();
+            let latest = PendingClicks { photo, mask: 1, comp: 0, hint: vec![], exclude: vec![] };
+            s.segmenter.pending = Some(latest.clone());
+            let tag = Tag::Clicks { photo, mask: 1, comp: 0, hint: latest.hint, exclude: latest.exclude };
+            setup_tx.send((s.segmenter.worker.shared.clone(), s.segmenter.results.0.clone(), tag)).unwrap();
+            go_rx.recv().unwrap();
+            let first = s.segment_poll();
+            first_tx.send((first.messages.is_empty(), s.segmenter.pending.is_some())).unwrap();
+            resume_rx.recv().unwrap();
+            let second = s.segment_poll();
+            (second.messages, s.segmenter.pending.is_none())
+        });
+        let (shared, replies, tag) = setup_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // hold the delivery point while polling: a blocking poll fails within the timeout, never hangs
+        let delivery = shared.delivery.lock().unwrap();
+        go_tx.send(()).unwrap();
+        let first = first_rx.recv_timeout(Duration::from_secs(5));
+        replies.send(worker::Outcome { tag, result: Err("reply arrived".into()), superseded: false, notice: None, extra: None }).unwrap();
+        drop(delivery);
+        resume_tx.send(()).unwrap();
+        let (messages, cleared) = session.join().unwrap();
+        assert_eq!(first.expect("poll blocked while a reply was being delivered"), (true, true));
+        assert_eq!(messages, vec!["reply arrived"]);
+        assert!(cleared);
+    }
+
+    #[cfg(feature = "sam")]
+    #[test]
+    fn an_idle_worker_with_no_reply_clears_lost_clicks() {
+        let mut s = Session::with_demo();
+        s.segmenter.pending = Some(PendingClicks { photo: s.active().unwrap(), mask: 1, comp: 0, hint: vec![], exclude: vec![] });
+        assert!(!s.segmenter.busy());
+        s.segment_poll();
+        assert!(s.segmenter.pending.is_none());
+    }
+
+    #[cfg(feature = "sam")]
+    #[test]
+    fn a_superseded_reply_does_not_hide_the_latest_click_reply() {
+        let mut s = Session::with_demo();
+        let photo = s.active().unwrap();
+        s.segmenter.pending = Some(PendingClicks { photo, mask: 1, comp: 0, hint: vec![], exclude: vec![] });
+        for (superseded, message) in [(true, "old reply"), (false, "latest reply")] {
+            let tag = Tag::Clicks { photo, mask: 1, comp: 0, hint: vec![], exclude: vec![] };
+            s.segmenter.results.0.send(worker::Outcome { tag, result: Err(message.into()), superseded, notice: None, extra: None }).unwrap();
+        }
+        assert_eq!(s.segment_poll().messages, vec!["latest reply"]);
+        assert!(s.segmenter.pending.is_none());
     }
 
     fn seg_box(side: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> SegMask {

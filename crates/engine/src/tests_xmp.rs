@@ -28,11 +28,9 @@ pub(crate) fn same_path_for_volume(a: &Path, b: &Path) -> bool {
     a == b || (a.parent().is_some_and(case_insensitive) && a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()))
 }
 
-pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("lc-xmp-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A test's folder in Temp, removed when the test ends (other test modules use it too).
+pub(crate) fn temp_dir(tag: &str) -> lcc_testkit::TempDir {
+    lcc_testkit::TempDir::new(&format!("lc-xmp-{tag}"))
 }
 
 /// The temp volume ignores letter case (Windows, default macOS): `a.xmp` and `a.XMP` are one file
@@ -669,6 +667,44 @@ fn regions_drawn_on_the_photo_as_stored_land_on_the_upright_photo() {
         assert_eq!(read["read"].as_array().map(Vec::len), Some(1), "{what}: {read}");
         assert_on_the_upright_face(&s, id, &format!("{what}, read again"));
     }
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A hand-drawn face region is a normal face region: undoable, catalog-only (the sidecar is untouched), listed
+/// with the rest, and refused when it is not a real box.
+#[test]
+fn adding_a_region_draws_a_face_and_refuses_bad_boxes() {
+    let src = temp_dir("region-add");
+    write_png(&src.join("portrait.png"), 9);
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.active().unwrap();
+    let n = s.catalog.photo(id).unwrap().meta.regions.len();
+    let commits = s.commits();
+    for bad in [
+        json!({}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": 0.1, "y1": 0.5}}),
+        json!({"rect": {"x0": -0.1, "y0": 0.1, "x1": 0.5, "y1": 0.5}}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": 1.5, "y1": 0.5}}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": "a", "y1": 0.5}}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": 0.5}}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": 0.5, "y1": 0.5}, "kind": "tree"}),
+        json!({"rect": {"x0": 0.1, "y0": 0.1, "x1": 0.5, "y1": 0.5}, "name": 7}),
+    ] {
+        assert!(s.execute("photo.addRegion", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.commits(), commits, "nothing changed");
+    // corners given in any order
+    let r = s.execute("photo.addRegion", &json!({"rect": {"x0": 0.5, "y0": 0.6, "x1": 0.2, "y1": 0.1}})).unwrap();
+    assert_eq!(r["index"], n);
+    let region = s.catalog.photo(id).unwrap().meta.regions.get(n).unwrap().clone();
+    assert_eq!(region.kind, lcc_meta::RegionKind::Face);
+    assert!(region.name.is_none() && region.rect.x0 < region.rect.x1 && region.rect.y0 < region.rect.y1);
+    s.execute("photo.addRegion", &json!({"rect": {"x0": 0.6, "y0": 0.1, "x1": 0.9, "y1": 0.4}, "name": " Ann "})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.get(n + 1).unwrap().name.as_deref(), Some("Ann"));
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.len(), n);
     let _ = std::fs::remove_dir_all(&src);
 }
 
@@ -2153,6 +2189,17 @@ fn saving_merges_into_another_apps_sidecar() {
     assert_ne!(second, backup);
     assert_eq!(std::fs::read(&backup).unwrap(), b"<not xmp");
     assert_eq!(std::fs::read(&second).unwrap(), b"<still not xmp");
+    // a sidecar over the parser's complexity limit (upstream #3696) holds metadata that could be read: the
+    // save leaves it as it is, without a backup, rather than replacing it
+    let decls: String = (0..600).map(|i| format!(" xmlns:n{i}=\"urn:n:{i}\"")).collect();
+    let complex = format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"{decls}><rdf:Description rdf:about=\"\"/></rdf:RDF></x:xmpmeta>"
+    );
+    std::fs::write(src.join("shot.xmp"), &complex).unwrap();
+    let before = std::fs::read_dir(&src).unwrap().count();
+    let r = s.execute("photo.saveMetadataToFile", &json!({}));
+    assert_eq!(std::fs::read_to_string(src.join("shot.xmp")).unwrap(), complex, "{r:?}");
+    assert_eq!(std::fs::read_dir(&src).unwrap().count(), before, "no backup was made");
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&lib);
 }
@@ -2394,17 +2441,15 @@ fn a_queued_write_whose_original_went_away_waits_for_a_retry() {
     s.flush_sidecar_writes();
     let id = |s: &Session, name: &str| s.catalog.photos().find(|p| p.file_name == name).unwrap().id.0;
     let (a, b) = (id(&s, "a.png"), id(&s, "b.png"));
-    // a.png's sidecar is a FIFO: its write blocks the writer until something opens the other end
-    let fifo = src.join("a.xmp");
-    let _ = std::fs::remove_file(&fifo);
-    if !std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|st| st.success()) {
-        return;
-    }
+    // a.png's sidecar write is held: it blocks the writer until released
+    let held = src.join("a.xmp");
+    let _ = std::fs::remove_file(&held);
+    crate::sidecar_writer::stall::hold(&held);
     s.execute("photo.rate", &json!({"ids": [a], "rating": 1})).unwrap();
     s.execute("photo.rate", &json!({"ids": [b], "rating": 2})).unwrap();
     // b's original goes away while its write waits in the queue
     std::fs::rename(src.join("b.png"), src.join("away.png")).unwrap();
-    drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    crate::sidecar_writer::stall::release(&held);
     s.flush_sidecar_writes();
     assert_eq!(s.unsaved_sidecars(), 1, "b's write waits for its original");
     std::fs::rename(src.join("away.png"), src.join("b.png")).unwrap();
@@ -2415,7 +2460,7 @@ fn a_queued_write_whose_original_went_away_waits_for_a_retry() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
-/// While a background sidecar write is stuck (a share that stopped answering; here a FIFO nobody writes to), the file
+/// While a background sidecar write is stuck (a share that stopped answering; here a held write), the file
 /// operations it could race refuse with an error that says so, instead of going ahead after the wait: a rename, a
 /// sidecar read or save on request, a change of the sidecar preferences. Once the write lands they work again.
 #[cfg(unix)]
@@ -2429,11 +2474,9 @@ fn file_operations_refuse_while_a_sidecar_write_is_stuck() {
     s.set_background_sidecar_writes(true);
     s.flush_sidecar_writes();
     s.set_sidecar_flush_limit(std::time::Duration::from_millis(100));
-    let fifo = src.join("a.xmp");
-    let _ = std::fs::remove_file(&fifo);
-    if !std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|st| st.success()) {
-        return;
-    }
+    let held = src.join("a.xmp");
+    let _ = std::fs::remove_file(&held);
+    crate::sidecar_writer::stall::hold(&held);
     let id = s.catalog.photos().next().unwrap().id.0;
     s.execute("photo.rate", &json!({"ids": [id], "rating": 3})).unwrap();
     for (command, params) in [
@@ -2447,7 +2490,7 @@ fn file_operations_refuse_while_a_sidecar_write_is_stuck() {
     }
     assert!(src.join("a.png").exists(), "nothing was renamed");
     // the share answers: the write lands and the rename goes ahead
-    drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    crate::sidecar_writer::stall::release(&held);
     s.set_sidecar_flush_limit(std::time::Duration::from_secs(10));
     s.execute("photo.rename", &json!({"ids": [id], "template": "renamed"})).unwrap();
     assert!(std::fs::read_to_string(src.join("renamed.xmp")).unwrap().contains("<xmp:Rating>3</xmp:Rating>"));
@@ -2456,7 +2499,7 @@ fn file_operations_refuse_while_a_sidecar_write_is_stuck() {
 }
 
 /// Opening another library while a background sidecar write of this one is stuck (a share that stopped answering;
-/// here a FIFO nobody writes to) refuses, as the file operations do: the write's result belongs to this library's
+/// here a held write) refuses, as the file operations do: the write's result belongs to this library's
 /// photos, so switching would lose it or pin it on a photo of the next library. Once the write lands it opens.
 #[cfg(unix)]
 #[test]
@@ -2472,11 +2515,9 @@ fn opening_another_library_refuses_while_a_sidecar_write_is_stuck() {
     s.set_background_sidecar_writes(true);
     s.flush_sidecar_writes();
     s.set_sidecar_flush_limit(std::time::Duration::from_millis(100));
-    let fifo = photos.join("a.xmp");
-    let _ = std::fs::remove_file(&fifo);
-    if !std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|st| st.success()) {
-        return;
-    }
+    let held = photos.join("a.xmp");
+    let _ = std::fs::remove_file(&held);
+    crate::sidecar_writer::stall::hold(&held);
     let id = s.catalog.photos().next().unwrap().id;
     let smart_dir = s.media.smart_dir.clone();
     s.execute("photo.rate", &json!({"ids": [id.0], "rating": 5})).unwrap();
@@ -2484,7 +2525,7 @@ fn opening_another_library_refuses_while_a_sidecar_write_is_stuck() {
     assert!(e.contains("still running"), "{e}");
     assert!(s.catalog.photo(id).is_some(), "still the first library");
     assert_eq!(s.media.smart_dir, smart_dir, "and still its smart previews");
-    drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    crate::sidecar_writer::stall::release(&held);
     s.set_sidecar_flush_limit(std::time::Duration::from_secs(10));
     s.open_library(base.join("two"), false).unwrap();
     assert!(std::fs::read_to_string(photos.join("a.xmp")).unwrap().contains("<xmp:Rating>5</xmp:Rating>"));

@@ -336,6 +336,7 @@ impl Op {
             | Op::PushHistory { id, .. }
             | Op::SetHistoryCursor { id, .. }
             | Op::SetBefore { id, .. }
+            | Op::SetExported { id, .. }
             | Op::SetCaptured { id, .. }
             | Op::SetAnalysis { id, .. }
             | Op::SetFile { id, .. }
@@ -372,7 +373,9 @@ impl Op {
             | Op::SetKeyword { .. }
             | Op::SetBrowsed { .. }
             | Op::SetFolderRecord { .. }
-            | Op::SetSavedLocation { .. } => {}
+            | Op::SetSavedLocation { .. }
+            | Op::AddVignettingMap { .. }
+            | Op::SetVignettingMapState { .. } => {}
         }
     }
 }

@@ -157,13 +157,26 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_read_in_pieces_is_the_hash_of_the_whole() {
-        // longer than one piece, so the read loop runs more than once
-        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let whole = lcc_preview::hash_bytes(&bytes).to_string();
-        assert_eq!(hash_reader(bytes.as_slice()).as_deref(), Some(whole.as_str()));
-        assert_eq!(hash_reader(Trickle(&bytes[..1000], false)).as_deref(), Some(lcc_preview::hash_bytes(&bytes[..1000]).to_string().as_str()));
-        assert_eq!(hash_reader(std::io::empty()).as_deref(), Some(lcc_preview::hash_bytes(&[]).to_string().as_str()));
+    fn a_hash_read_in_pieces_is_the_hash_of_the_whole_and_a_file_hash_is_the_import_hash() {
+        // a hash read in pieces is the hash of the whole
+        {
+            // longer than one piece, so the read loop runs more than once
+            let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let whole = lcc_preview::hash_bytes(&bytes).to_string();
+            assert_eq!(hash_reader(bytes.as_slice()).as_deref(), Some(whole.as_str()));
+            assert_eq!(hash_reader(Trickle(&bytes[..1000], false)).as_deref(), Some(lcc_preview::hash_bytes(&bytes[..1000]).to_string().as_str()));
+            assert_eq!(hash_reader(std::io::empty()).as_deref(), Some(lcc_preview::hash_bytes(&[]).to_string().as_str()));
+        }
+        // a file hash is the import hash and a missing file has none
+        {
+            let dir = Scratch(std::env::temp_dir().join(format!("lc-file-hash-{}", std::process::id())));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let f = dir.0.join("a.bin");
+            std::fs::write(&f, b"pixels").unwrap();
+            assert_eq!(file_hash(f.to_str().unwrap()), Some(lcc_preview::hash_bytes(b"pixels").to_string()));
+            assert_eq!(file_hash(dir.0.join("nope").to_str().unwrap()), None);
+        }
     }
 
     /// A scratch folder that goes away with the test, however it ends.
@@ -173,17 +186,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[test]
-    fn a_file_hash_is_the_import_hash_and_a_missing_file_has_none() {
-        let dir = Scratch(std::env::temp_dir().join(format!("lc-file-hash-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&dir.0);
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let f = dir.0.join("a.bin");
-        std::fs::write(&f, b"pixels").unwrap();
-        assert_eq!(file_hash(f.to_str().unwrap()), Some(lcc_preview::hash_bytes(b"pixels").to_string()));
-        assert_eq!(file_hash(dir.0.join("nope").to_str().unwrap()), None);
     }
 }
 
@@ -486,6 +488,19 @@ fn find_missing(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            query "dng.validate",
+            "Validate DNG Files",
+            [],
+            None,
+            "{ids?}: recompute the raw-image digest (NewRawImageDigest, else RawImageDigest) of the selected photos' DNG files and compare it with the stored one; runs here on the calling thread (the app's Library ▸ Validate DNG Files does it in the background with a cancel) → {total, checked, intact, damaged: [{file, why}] (digest mismatch, unreadable raw data or file), unverifiable: [{file, why}] (no digest in the file, or a layout the check does not cover), cancelled}",
+            super::has_selection,
+            |s, p| {
+                let ids = s.targets(p)?;
+                let targets = crate::dng_validate::dng_targets(s, &ids);
+                Ok(crate::dng_validate::validate(&targets, &std::sync::atomic::AtomicBool::new(false), &|_| {}).to_json())
+            }
+        ),
         cmd!(query "library.missing", "Missing Photos", [], None, "{} → [{id, path}]: photos whose original file isn't where the library expects it", always, |s, _| {
             Ok(Value::Array(missing(s).into_iter().map(|(id, path)| json!({"id": id.0, "path": path})).collect()))
         }),

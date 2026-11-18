@@ -167,8 +167,16 @@ fn watermark_preview(app: &mut LccApp, ui: &mut egui::Ui, wm: &lcc_engine::expor
     crate::widgets::register(ui.ctx(), "image:exportWatermarkPreview", r.rect);
 }
 
-/// About dialog tabs: (widget id suffix, label). The credits come from `crate::credits`.
-pub const ABOUT_TABS: &[(&str, &str)] = &[("about", "About"), ("contributors", "Contributors"), ("models", "Models")];
+/// The width most dialogs open at (points).
+const DIALOG_W: f32 = 380.0;
+
+/// Help ▸ What's New's width on a window `screen_w` points wide: three times a dialog's
+/// ([`DIALOG_W`]), so its long lines read as paragraphs, unless the window is narrower than that
+/// (then the window's width, less [`crate::dialog_frame::SCREEN_MARGIN`] each side).
+pub(crate) fn whats_new_width(screen_w: f32) -> f32 {
+    let room = if screen_w.is_finite() { screen_w - 2.0 * crate::dialog_frame::SCREEN_MARGIN } else { 0.0 };
+    (3.0 * DIALOG_W).min(room).max(1.0)
+}
 
 /// Help ▸ What's New: upstream's docs/whats-new.md and our docs/whats-new/ entries, joined by build.rs.
 pub const WHATS_NEW: &str = include_str!(concat!(env!("OUT_DIR"), "/whats-new.md"));
@@ -260,6 +268,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
         Dialog::NewSmartAlbum { .. } => "Create Smart Collection",
         Dialog::AllMetadata { .. } => "All Metadata",
         Dialog::SystemInfo { .. } => "System Info",
+        Dialog::DngValidation { .. } => "Validate DNG Files",
         Dialog::DenoiseModel { .. } => "AI Denoise Model",
         Dialog::FaceModel { info, .. } if info["download"].is_string() => "Download Face Model",
         Dialog::FaceModel { .. } => "Add Face Model",
@@ -268,15 +277,21 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
         Dialog::SmartRules { id: None, .. } => "Create Smart Collection",
         Dialog::SmartRules { .. } => "Edit Smart Collection",
         Dialog::AutoStack { .. } => "Auto-Stack by Capture Time",
+        Dialog::AdvancedSearch { .. } => "Advanced Search",
         Dialog::CreatePreset { .. } => "Create Preset",
         Dialog::UpdatePreset { .. } => "Update Preset with Current Settings",
         Dialog::CreatePresetFolder { .. } => "Create Preset Folder",
         Dialog::CopySettings { .. } => "Choose Edit Settings to Copy",
         Dialog::PasteSettings { .. } => "Paste Selected Settings",
         Dialog::SyncSettings { .. } => "Synchronize Settings",
+        Dialog::SyncCopies { .. } => "Synchronize Copies",
+        Dialog::SyncSnapshots { .. } => "Synchronize Snapshots",
         Dialog::Export { .. } => "Export",
         Dialog::ContactSheet { .. } => "Contact Sheet PDF",
         Dialog::Timelapse { .. } => "Timelapse Video",
+        Dialog::CropOverlays { .. } => "Choose Overlays to Cycle",
+        Dialog::BookPrefs { .. } => "Book Preferences",
+        Dialog::EmailPhoto { .. } => "Email Photo",
         Dialog::SlideshowExport { .. } => "Export Slideshow",
         Dialog::Print => "Print",
         Dialog::Merge { opts } => opts.title(),
@@ -299,6 +314,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
         Dialog::DeleteEffects { .. } => "Delete Effect Presets",
         Dialog::DeleteRejected { .. } => "Delete Rejected Photos",
         Dialog::StopWaiting { .. } => "Stop Waiting",
+        Dialog::VignettingCreateAnyway { .. } | Dialog::VignettingReplace { .. } => "Vignetting Calibration",
         Dialog::RemoveFolder { disk: true, .. } => "Remove Disk from Catalog",
         Dialog::RemoveFolder { .. } => "Remove Folder from Catalog",
         Dialog::SynchronizeFolder { .. } => "Synchronize Folder",
@@ -384,6 +400,8 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             sheet_w(screen, insets)
         } else if presets {
             crate::panels::presets_manager::MIN_SIZE[0].min(presets_max.x)
+        } else if matches!(dlg, Dialog::WhatsNew) {
+            whats_new_width(screen.width())
         } else {
             widest
         })
@@ -404,6 +422,8 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             Dialog::ChartProfile { .. } => 900.0,
             Dialog::AllMetadata { .. } => 620.0,
             Dialog::Update => 500.0,
+            Dialog::About => 480.0,
+            Dialog::WhatsNew => whats_new_width(screen.width()),
             Dialog::Print => 1100.0,
             Dialog::FaceModel { .. } => 460.0,
             Dialog::LightroomCatalog { .. } => 440.0,
@@ -412,9 +432,9 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             Dialog::PresetsManager { .. } | Dialog::ProfileManager { .. } => presets_size.x,
             // (the preset column beside a form: its label column, then the controls)
             Dialog::Export { .. } => 900.0_f32.min(screen.width() - 2.0 * crate::dialog_frame::SCREEN_MARGIN),
-            Dialog::Rename { .. } | Dialog::ContactSheet { .. } | Dialog::Timelapse { .. } | Dialog::SlideshowExport { .. } => 480.0,
+            Dialog::Rename { .. } | Dialog::ContactSheet { .. } | Dialog::Timelapse { .. } | Dialog::SlideshowExport { .. } | Dialog::EmailPhoto { .. } => 480.0,
             Dialog::CaptureTime { .. } | Dialog::LabelNames { .. } | Dialog::CreatePreset { .. } | Dialog::CreatePresetFolder { .. } => 440.0,
-            _ => 380.0,
+            _ => DIALOG_W,
         } })
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -432,9 +452,6 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             } else {
                 crate::dialog_frame::ModalLayout::begin(ui, window_id)
             };
-            if matches!(dlg, Dialog::About) {
-                about_tabs(ui);
-            }
             // (Settings keeps its category list in place and scrolls its content itself)
             let settings_height = layout.body_max_height(ui);
             // dialogs laid out as a form (a label column beside the controls)
@@ -445,12 +462,14 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     | Dialog::Rename { .. }
                     | Dialog::ContactSheet { .. }
                     | Dialog::Timelapse { .. }
+                    | Dialog::EmailPhoto { .. }
                     | Dialog::CaptureTime { .. }
                     | Dialog::LabelNames { .. }
                     | Dialog::Watermark { .. }
                     | Dialog::SlideshowExport { .. }
             );
             let mut body = |ui: &mut egui::Ui| match &mut dlg {
+                Dialog::AdvancedSearch { search } => crate::advanced_search::body(ui, search, app),
                 Dialog::AutoStack { gap } => {
                     ui.label(egui::RichText::new(crate::i18n::tr("Stack photos taken within this time of each other:")).color(t.text_label));
                     let r = ui.add(
@@ -470,7 +489,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                         }).color(t.text_dim),
                     );
                 }
-                Dialog::Cull { reject_below, pick_best, burst_gap, similarity, closed_eyes, blurry_eyes, soft_eyes, everyone } => {
+                Dialog::Cull { reject_below, pick_best, suggest_stars, suggest_flags, burst_gap, similarity, closed_eyes, blurry_eyes, soft_eyes, everyone } => {
                     let n = app.session.selection.ids.len();
                     let scope = if n > 1 { crate::i18n::tr_format!("the {n} selected photos", n = n) } else { crate::i18n::tr_format!("the {} photos in view", app.session.visible_cloned().len()) };
                     ui.label(egui::RichText::new(crate::i18n::tr_format!("Scores {scope} for focus and exposure and finds similar shots taken within seconds of each other (bursts).", scope = scope)).color(t.text_label));
@@ -480,6 +499,15 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr(if *reject_below > 0.0 { "Blurry photos below the score are flagged as rejects." } else { "0: nothing is rejected." })).color(t.text_dim));
                     let r = crate::dialog_frame::checkbox(ui, pick_best, crate::i18n::tr("Pick the sharpest photo of each burst"));
                     crate::widgets::register(ui.ctx(), "check:cullPick", r.rect);
+                    // the suggestions (issue #489): stars and flags from the scores, only where
+                    // the user has not decided
+                    let r = crate::dialog_frame::checkbox(ui, suggest_stars, crate::i18n::tr("Suggest star ratings"));
+                    crate::widgets::register(ui.ctx(), "check:cullSuggestStars", r.rect);
+                    let r = crate::dialog_frame::checkbox(ui, suggest_flags, crate::i18n::tr("Suggest Pick and Reject flags"));
+                    crate::widgets::register(ui.ctx(), "check:cullSuggestFlags", r.rect);
+                    if *suggest_stars || *suggest_flags {
+                        crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr("Photos you have not rated or flagged get stars and flags from their scores; yours are never overwritten.")).color(t.text_dim));
+                    }
                     // the eyes, judged as the eye strip judges them
                     let r = crate::dialog_frame::checkbox(ui, closed_eyes, crate::i18n::tr("Reject photos with closed eyes"));
                     crate::widgets::register(ui.ctx(), "check:cullClosedEyes", r.rect);
@@ -575,6 +603,21 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     }
                     for detail in details.iter() {
                         ui.add(egui::Label::new(detail).wrap().selectable(true));
+                    }
+                }
+                Dialog::DngValidation { summary, damaged, unverifiable } => {
+                    ui.label(summary.as_str());
+                    for (heading, lines) in [(crate::i18n::tr("Damaged files"), damaged), (crate::i18n::tr("Could not be verified"), unverifiable)] {
+                        if lines.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(heading).color(t.text_dim));
+                        egui::ScrollArea::vertical().id_salt(heading).max_height(160.0).show(ui, |ui| {
+                            for line in lines.iter() {
+                                ui.add(egui::Label::new(line.as_str()).wrap().selectable(true));
+                            }
+                        });
                     }
                 }
                 Dialog::SystemInfo { rows } => {
@@ -676,7 +719,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                             .color(t.text_dim),
                     );
                 }
-                Dialog::CaptureTime { mode, time, days, hours, minutes, zone } => {
+                Dialog::CaptureTime { mode, time, days, hours, minutes, zone, each } => {
                     let n = app.session.selected().len();
                     field(ui, "Change", |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -692,7 +735,12 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                                 let r = ui.add(egui::TextEdit::singleline(time).hint_text("2026-09-30 14:05:00 · 1983-04 · 1983").desired_width(f32::INFINITY));
                                 crate::widgets::register(ui.ctx(), "field:captureTime", r.rect);
                             });
-                            json!({"time": time})
+                            // several photos: give them all this time, rather than move them by the active photo's change
+                            if n > 1 {
+                                let r = ui.checkbox(each, crate::i18n::tr("Give every selected photo this time"));
+                                crate::widgets::register(ui.ctx(), "captureTimeEach", r.rect);
+                            }
+                            json!({"time": time, "each": *each})
                         }
                         "shift" => {
                             field(ui, "Shift", |ui| {
@@ -739,6 +787,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                         let after = match (mode.as_str(), unreadable && n == 1) {
                             ("name", _) => lcc_catalog::dates::date_from_filename(&name),
                             ("set", _) if partial(time) => Some(time.trim().to_string()),
+                            ("set", _) if *each && n > 1 => lcc_catalog::dates::normalize_iso(time),
                             // alone, it simply gets the time typed (photo.setCaptureTime repairs it)
                             ("set", true) => lcc_catalog::dates::normalize_iso(time),
                             _ => delta.and_then(|d| lcc_catalog::dates::shift_iso(&cur, d)),
@@ -761,6 +810,8 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     }
                     if n > 1 && mode == "set" && lcc_catalog::dates::partial_capture(time.trim()).is_some() {
                         crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr_format!("All {n} selected photos get this date.", n = n)).color(t.text_dim));
+                    } else if n > 1 && mode == "set" && *each {
+                        crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr_format!("All {n} selected photos get this time.", n = n)).color(t.text_dim));
                     } else if n > 1 && !matches!(mode.as_str(), "file" | "name") {
                         crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr_format!("All {n} selected photos move by the same amount.", n = n)).color(t.text_dim));
                     }
@@ -1003,6 +1054,22 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     controls.clear();
                     let _ = group_checklist(ui, "syncGroup", groups, None);
                 }
+                Dialog::SyncCopies { groups } => {
+                    crate::dialog_frame::note(
+                        ui,
+                        egui::RichText::new(crate::i18n::tr("The checked settings of the active photo are copied to its master photo and virtual copies"))
+                            .color(t.text_dim),
+                    );
+                    let _ = group_checklist(ui, "syncCopiesGroup", groups, None);
+                }
+                Dialog::SyncSnapshots { groups } => {
+                    crate::dialog_frame::note(
+                        ui,
+                        egui::RichText::new(crate::i18n::tr("The checked settings of the current edit are applied to each snapshot of the photo"))
+                            .color(t.text_dim),
+                    );
+                    let _ = group_checklist(ui, "syncSnapshotsGroup", groups, None);
+                }
                 Dialog::PasteSettings { groups } => {
                     let n = app.session.selected().len();
                     crate::dialog_frame::note(ui,
@@ -1013,6 +1080,8 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     let _ = group_checklist(ui, "pasteGroup", groups, Some(&copied));
                 }
                 Dialog::SlideshowExport { settings } => slideshow_export_body(app, ui, settings),
+                Dialog::CropOverlays { picked } => crop_overlays_body(ui, picked),
+                Dialog::BookPrefs { prefs } => book_prefs_body(ui, prefs),
                 Dialog::ContactSheet { options } => {
                     options.columns = options.columns.clamp(1, 8);
                     options.rows = options.rows.clamp(1, 10);
@@ -1060,6 +1129,19 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     choices(ui, "Format", "timelapseFormat", &[(false, "H.264 (MP4)"), (true, "ProRes 422 (MOV)")], prores);
                     field(ui, "Quality", |ui| { ui.add(egui::Slider::new(quality, 1..=100)); });
                     crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr("Each photo with its own edits, in the order shown. No audio.")).color(t.text_dim));
+                }
+                Dialog::EmailPhoto { long_edge, quality } => {
+                    let n = app.session.selected().len();
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} photos", n = n)).color(t.text_dim));
+                    let edges: Vec<(u32, String)> = crate::email_photo::EDGES.iter().map(|e| (*e, e.to_string())).collect();
+                    let options: Vec<(u32, &str)> = edges.iter().map(|(v, l)| (*v, l.as_str())).collect();
+                    choices(ui, "Long Edge (pixels)", "emailEdge", &options, long_edge);
+                    field(ui, "Quality", |ui| { ui.add(egui::Slider::new(quality, 10..=100)); });
+                    crate::dialog_frame::note(
+                        ui,
+                        egui::RichText::new(crate::i18n::tr("JPEG copies with their edits, sRGB, without the location; then a new message opens in your mail program."))
+                            .color(t.text_dim),
+                    );
                 }
                 Dialog::Export { opts, full_size, resize, preset_name, limit_kb, dir } => {
                     export_body(app, ui, ExportForm { opts, full_size, resize, preset_name, limit_kb, dir }, window_id, settings_height)
@@ -1272,6 +1354,17 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     ui.label(crate::i18n::tr_format!("Stop waiting: {task}?", task = task));
                     crate::dialog_frame::note(ui, egui::RichText::new(warning.as_str()).color(t.text_dim));
                 }
+                Dialog::VignettingReplace { question, .. } => {
+                    ui.label(question.as_str());
+                    crate::dialog_frame::note(
+                        ui,
+                        egui::RichText::new(crate::i18n::tr("Photos that use the old reference keep it.")).color(t.text_dim),
+                    );
+                }
+                Dialog::VignettingCreateAnyway { reasons, .. } => {
+                    ui.label(crate::i18n::tr("This photo doesn't look like a flat-field reference. Create the vignetting calibration anyway?"));
+                    crate::dialog_frame::note(ui, egui::RichText::new(reasons.as_str()).color(t.text_dim));
+                }
                 Dialog::DeleteRejected { count, recycle } => {
                     ui.label(crate::i18n::tr_format!("Delete the {n} rejected photos of this view?", n = count));
                     ui.add_space(6.0);
@@ -1304,32 +1397,25 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     );
                 }
                 Dialog::About => {
-                    ui.set_min_width(680.0);
-                    let tab = ui.data_mut(|d| d.get_temp::<u8>(egui::Id::new(ABOUT_TAB_ID))).unwrap_or(0);
-                    match tab {
-                        1 => crate::credits::contributors_ui(app, ui),
-                        2 => crate::credits::models_ui(ui),
-                        _ => {
-                            ui.label(egui::RichText::new(lcc_brand::DISPLAY_NAME).font(t.semibold(20.0)).color(t.text));
-                            ui.label(crate::i18n::tr_format!("Version {}. A clean-room, pure-Rust photo library and raw developer.", env!("CARGO_PKG_VERSION")));
-                            ui.label(crate::i18n::tr_format!(
-                                "MIT AND Apache-2.0. Fonts: {} (OFL). Icons: original.",
-                                crate::theme::font_credits(app.chinese_font.is_some())
-                            ));
-                            ui.add_space(10.0);
-                            for (label, url) in [
-                                ("{app} website", crate::links::APP_PAGE),
-                                ("Source code", crate::links::GITHUB),
-                                ("Join the Discord", crate::links::DISCORD),
-                            ]
-                            .into_iter()
-                            .filter(|(_, url)| !url.is_empty())
-                            {
-                                let r = ui.link(crate::i18n::tr(label)).on_hover_text(url);
-                                if r.clicked() {
-                                    let _ = crate::links::open(app, url);
-                                }
-                            }
+                    ui.label(egui::RichText::new(lcc_brand::DISPLAY_NAME).font(t.semibold(20.0)).color(t.text));
+                    ui.label(crate::i18n::tr_format!("Version {}. A clean-room, pure-Rust photo library and raw developer.", env!("CARGO_PKG_VERSION")));
+                    ui.label(crate::i18n::tr_format!(
+                        "MIT AND Apache-2.0. Fonts: {} (OFL). Icons: original.",
+                        crate::theme::font_credits(app.chinese_font.is_some())
+                    ));
+                    ui.add_space(10.0);
+                    for (id, label, url) in [
+                        ("website", "{app} website", crate::links::APP_PAGE),
+                        ("source", "Source code", crate::links::GITHUB),
+                        ("discord", "Join the Discord", crate::links::DISCORD),
+                    ]
+                    .into_iter()
+                    .filter(|(_, _, url)| !url.is_empty())
+                    {
+                        let r = ui.link(crate::i18n::tr(label)).on_hover_text(url);
+                        crate::widgets::register(ui.ctx(), format!("link:about-{id}"), r.rect);
+                        if r.clicked() {
+                            let _ = crate::links::open(app, url);
                         }
                     }
                 }
@@ -1534,6 +1620,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     Dialog::LightroomResult { first: Some(_), .. } => "Show in Library",
                     Dialog::ContactSheet { .. } => "Choose PDF…",
                     Dialog::Timelapse { .. } => "Choose File…",
+                    Dialog::EmailPhoto { .. } => "Export",
                     Dialog::SlideshowExport { .. } => "Export…",
                     Dialog::Print => "Print to PDF…",
                     Dialog::Merge { .. } => "Merge",
@@ -1558,10 +1645,14 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     Dialog::DeleteRejected { recycle: true, .. } => "Move to Trash",
                     Dialog::DeleteRejected { .. } => "Remove",
                     Dialog::StopWaiting { .. } => "Stop Waiting",
+                    Dialog::VignettingCreateAnyway { .. } => "Create Anyway",
+                    Dialog::VignettingReplace { .. } => "Replace",
                     Dialog::LightroomCatalog { .. } => "Import Lightroom Catalog…",
                     d @ Dialog::LightroomDestination { .. } => crate::lightroom_destination::ok_label(d),
                     Dialog::SynchronizeFolder { .. } if informational => "Close",
-                    Dialog::SynchronizeFolder { .. } | Dialog::SyncSettings { .. } => "Synchronize",
+                    Dialog::SynchronizeFolder { .. } | Dialog::SyncSettings { .. } | Dialog::SyncCopies { .. } | Dialog::SyncSnapshots { .. } => {
+                        "Synchronize"
+                    }
                     Dialog::ChartProfile { opts } if crate::chart_profile::is_built(app, opts) => "Profile created ✓",
                     Dialog::ChartProfile { .. } => "Create Profile",
                     Dialog::SamModel { then: Some(_), .. } if sam_installed => "Continue",
@@ -1583,6 +1674,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                     Dialog::RenameAlbum { .. } | Dialog::Rename { .. } | Dialog::RenameKeyword { .. } | Dialog::RenamePerson { .. } => "Rename",
                     Dialog::MergeKeywords { .. } => "Merge Keywords",
                     Dialog::AutoStack { .. } => "Create Stacks",
+                    Dialog::AdvancedSearch { .. } => "Search",
                     Dialog::CaptureTime { .. } => "Change Time",
                     Dialog::Cull { .. } => "Cull",
                     Dialog::CopySettings { .. } => "Copy",
@@ -1696,6 +1788,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                         | Dialog::Export { .. }
                         | Dialog::ContactSheet { .. }
                         | Dialog::Timelapse { .. }
+                        | Dialog::EmailPhoto { .. }
                         | Dialog::SlideshowExport { .. }
                         | Dialog::Print
                         | Dialog::NewAlbum { .. }
@@ -1706,6 +1799,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                         | Dialog::SynchronizeFolder { .. }
                         | Dialog::SaveEffect { .. }
                         | Dialog::CaptureTime { .. }
+                        | Dialog::AdvancedSearch { .. }
                 ) =>
             {
                 app.toast(ctx, e)
@@ -1880,33 +1974,28 @@ pub fn clamp_cull_burst(gap: &mut f32, similarity: &mut f32) {
 }
 
 /// The `photo.analyze` parameters of the Assisted Culling dialog, its values as they are.
-pub fn cull_params(reject_below: f32, pick_best: bool, burst_gap: f32, similarity: f32) -> serde_json::Value {
+pub fn cull_params(
+    reject_below: f32,
+    pick_best: bool,
+    suggest_stars: bool,
+    suggest_flags: bool,
+    burst_gap: f32,
+    similarity: f32,
+) -> serde_json::Value {
     let mut p = json!({"pickBest": pick_best, "burstGap": burst_gap, "similarity": similarity});
     if reject_below > 0.0 {
         p["rejectBelow"] = json!(reject_below);
+    }
+    if suggest_stars {
+        p["applyRatings"] = json!(true);
+    }
+    if suggest_flags {
+        p["applyFlags"] = json!(true);
     }
     p
 }
 
 /// `90` → `1 min 30 s`.
-/// The About dialog's tabs: the header above its scrolling body.
-const ABOUT_TAB_ID: &str = "about_tab";
-fn about_tabs(ui: &mut egui::Ui) {
-    ui.set_min_width(680.0);
-    let tab_id = egui::Id::new(ABOUT_TAB_ID);
-    let mut tab = ui.data_mut(|d| d.get_temp::<u8>(tab_id)).unwrap_or(0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (i, (id, label)) in ABOUT_TABS.iter().enumerate() {
-            if crate::widgets::text_button(ui, &format!("aboutTab-{id}"), label, usize::from(tab) == i).clicked() {
-                tab = u8::try_from(i).unwrap_or(0);
-            }
-        }
-    });
-    ui.data_mut(|d| d.insert_temp(tab_id, tab));
-    ui.separator();
-}
-
 pub fn fmt_gap(v: f64) -> String {
     let v = v.round() as u64;
     match v {
@@ -2108,12 +2197,12 @@ pub fn confirm_dialog(app: &mut LccApp, dlg: &Dialog) -> Result<serde_json::Valu
             p[key.as_str()] = json!(value.trim());
             app.run(command, p)
         }
-        Dialog::CaptureTime { mode, time, days, hours, minutes, zone } => app.run(
+        Dialog::CaptureTime { mode, time, days, hours, minutes, zone, each } => app.run(
             "photo.setCaptureTime",
             match mode.as_str() {
                 // a year or a month alone has no time to move the others by: every photo gets it
                 "set" if lcc_catalog::dates::partial_capture(time.trim()).is_some() => json!({"time": time, "each": true}),
-                "set" => json!({"time": time}),
+                "set" => json!({"time": time, "each": each}),
                 "shift" => json!({"shift": *days as i64 * 86_400 + *hours as i64 * 3600 + *minutes as i64 * 60}),
                 "file" => json!({"fromFile": true}),
                 "name" => json!({"fromFilename": true}),
@@ -2237,12 +2326,29 @@ pub fn confirm_dialog(app: &mut LccApp, dlg: &Dialog) -> Result<serde_json::Valu
         }
         Dialog::MergeKeywords { from, into } => app.run("keyword.merge", json!({"from": from, "into": into})),
         Dialog::AutoStack { gap } => app.run("stack.auto", json!({"gap": gap})),
+        Dialog::AdvancedSearch { search } => {
+            // a half-typed number or an unsupported condition keeps the panel open on the problem
+            crate::advanced_search::draft_query(search).and_then(|query| app.run("library.advancedSearch", json!({"query": query})))
+        }
         Dialog::DenoiseModel { info, accepted } => crate::panels::denoise::install(app, info, *accepted),
         Dialog::FaceModel { path, info, accepted } => crate::panels::faces::install(app, path, info, *accepted),
-        Dialog::AllMetadata { .. } | Dialog::SystemInfo { .. } | Dialog::WhatsNew | Dialog::AiModels { .. } => Ok(serde_json::Value::Null),
-        Dialog::Cull { reject_below, pick_best, burst_gap, similarity, closed_eyes, blurry_eyes, soft_eyes, everyone } => {
+        Dialog::AllMetadata { .. } | Dialog::SystemInfo { .. } | Dialog::DngValidation { .. } | Dialog::WhatsNew | Dialog::AiModels { .. } => {
+            Ok(serde_json::Value::Null)
+        }
+        Dialog::Cull {
+            reject_below,
+            pick_best,
+            suggest_stars,
+            suggest_flags,
+            burst_gap,
+            similarity,
+            closed_eyes,
+            blurry_eyes,
+            soft_eyes,
+            everyone,
+        } => {
             app.ui.cull_burst = Some((*burst_gap, *similarity));
-            let r = app.run("photo.analyze", cull_params(*reject_below, *pick_best, *burst_gap, *similarity));
+            let r = app.run("photo.analyze", cull_params(*reject_below, *pick_best, *suggest_stars, *suggest_flags, *burst_gap, *similarity));
             if r.is_ok() && (*closed_eyes || *blurry_eyes) {
                 // the eyes take longer: judged in the background, the rejects come as one step
                 app.run("photo.rejectEyes", json!({"closed": closed_eyes, "blurry": blurry_eyes, "soft": soft_eyes, "mainOnly": !everyone}))?;
@@ -2288,11 +2394,22 @@ pub fn confirm_dialog(app: &mut LccApp, dlg: &Dialog) -> Result<serde_json::Valu
         }
         Dialog::ContactSheet { options } => app.run("app.contactSheet", json!(options)),
         Dialog::Timelapse { .. } => app.run("app.timelapse", crate::timelapse_ui::dialog_params(dlg).unwrap_or_default()),
+        Dialog::EmailPhoto { .. } => app.run("app.emailPhoto", crate::email_photo::dialog_params(dlg).unwrap_or_default()),
         Dialog::SlideshowExport { settings } => app.run("app.slideshowExport", json!(settings)),
         Dialog::Print => app.run("app.print", json!({})),
+        Dialog::CropOverlays { picked } => app.run("view.cropOverlays", json!({"overlays": picked})),
+        Dialog::BookPrefs { prefs } => app.run("book.preferences", json!(prefs)),
         Dialog::CopySettings { groups } => app.run("develop.copy", pick_params(groups)),
         Dialog::PasteSettings { groups } => app.run("develop.paste", pick_params(groups)),
         Dialog::SyncSettings { groups, .. } => app.run("develop.sync", pick_params(groups)),
+        Dialog::SyncCopies { groups } => {
+            let mut params = pick_params(groups);
+            if let Some(o) = params.as_object_mut() {
+                o.insert("copies".into(), json!(true));
+            }
+            app.run("develop.sync", params)
+        }
+        Dialog::SyncSnapshots { groups } => app.run("version.sync", pick_params(groups)),
         Dialog::Export { opts, full_size, resize, limit_kb, dir, preset_name } => {
             start_export(app, opts, *full_size, resize, *limit_kb, dir, preset_name)
         }
@@ -2331,6 +2448,8 @@ pub fn confirm_dialog(app: &mut LccApp, dlg: &Dialog) -> Result<serde_json::Valu
             crate::panels::activity::cancel(app, *id);
             Ok(serde_json::Value::Null)
         }
+        Dialog::VignettingCreateAnyway { photo, .. } => crate::panels::edit::create_vignetting_calibration_anyway(app, *photo),
+        Dialog::VignettingReplace { photo, .. } => crate::panels::edit::replace_vignetting_calibration(app, *photo),
         Dialog::DeleteRejected { recycle, .. } => {
             let r = app.run("library.deleteRejected", json!({"files": if *recycle { "recycle" } else { "keep" }, "confirm": true}));
             if let Ok(v) = &r {
@@ -2385,6 +2504,7 @@ fn prompt_verb(command: &str) -> &'static str {
         | "mask.renameEffect"
         | "printui.renameTemplateFolder"
         | "slideshow.renameTemplateFolder"
+        | "app.renameLibrary"
         | "print.template.folder.rename" => "Rename",
         "folder.create"
         | "mask.setEffectGroup"
@@ -3745,6 +3865,47 @@ fn num(ui: &mut egui::Ui, spec: &ControlSpec, v: &mut f64) -> bool {
 /// A labelled row (fixed label column).
 /// View ▸ Export Slideshow…: what to write (PDF, JPEG sequence, video) and how big; where comes
 /// after (a save dialog).
+/// Choose Overlays to Cycle…: one checkbox per crop guide; the last ticked one can't be cleared.
+fn crop_overlays_body(ui: &mut egui::Ui, picked: &mut Vec<crate::state::CropOverlay>) {
+    use crate::state::CropOverlay as O;
+    let t = Tokens::get(ui.ctx());
+    crate::dialog_frame::note(ui, egui::RichText::new(crate::i18n::tr("The crop guides that Cycle Crop Overlay steps through.")).color(t.text_dim));
+    let names = [
+        (O::Thirds, "Rule of Thirds"),
+        (O::Grid, "Grid"),
+        (O::Golden, "Golden Ratio"),
+        (O::Diagonal, "Diagonal"),
+        (O::Triangle, "Triangle"),
+        (O::Spiral, "Golden Spiral"),
+        (O::None, "None (hide the guides)"),
+    ];
+    for (o, name) in names {
+        let mut on = picked.contains(&o);
+        let only = on && picked.len() == 1;
+        let r = ui.add_enabled_ui(!only, |ui| crate::dialog_frame::checkbox(ui, &mut on, crate::i18n::tr(name))).inner;
+        crate::widgets::register(ui.ctx(), format!("check:cropOverlay-{o:?}"), r.rect);
+        if on && !picked.contains(&o) {
+            picked.push(o);
+        } else if !on && picked.len() > 1 {
+            picked.retain(|x| *x != o);
+        }
+    }
+}
+
+/// Book Preferences…: what a new book starts with.
+fn book_prefs_body(ui: &mut egui::Ui, prefs: &mut crate::book::BookPrefs) {
+    choices(ui, "Photo zoom", "bookPrefsZoom", &[(true, "Fill cell"), (false, "Fit photo")], &mut prefs.zoom_to_fill);
+    let rows: [(&mut bool, &str, &str); 3] = [
+        (&mut prefs.autofill, "Auto-fill new books with the selected photos", "bookPrefsAutofill"),
+        (&mut prefs.filler_text, "Show filler text in empty text cells", "bookPrefsFiller"),
+        (&mut prefs.caption_safe_area, "Show the caption safe area", "bookPrefsSafe"),
+    ];
+    for (value, label, id) in rows {
+        let r = crate::dialog_frame::checkbox(ui, value, crate::i18n::tr(label));
+        crate::widgets::register(ui.ctx(), format!("check:{id}"), r.rect);
+    }
+}
+
 fn slideshow_export_body(app: &mut LccApp, ui: &mut egui::Ui, settings: &mut lcc_engine::slideshow_export::ExportSettings) {
     use lcc_engine::slideshow_export::{ExportSettings, Format};
     let t = Tokens::get(ui.ctx());
@@ -3845,7 +4006,15 @@ fn choices<V: PartialEq + Copy>(ui: &mut egui::Ui, label: &str, id: &str, option
 /// Dialogs that Return confirms with nothing focused (those with text fields confirm from the
 /// field: `dialog_field`).
 fn return_confirms(dlg: &Dialog) -> bool {
-    matches!(dlg, Dialog::CopySettings { .. } | Dialog::PasteSettings { .. } | Dialog::SyncSettings { .. } | Dialog::UpdatePreset { .. })
+    matches!(
+        dlg,
+        Dialog::CopySettings { .. }
+            | Dialog::PasteSettings { .. }
+            | Dialog::SyncSettings { .. }
+            | Dialog::SyncCopies { .. }
+            | Dialog::SyncSnapshots { .. }
+            | Dialog::UpdatePreset { .. }
+    )
 }
 
 struct PersonRenamePlan {
@@ -4057,7 +4226,9 @@ pub fn confirm_style(dlg: &Dialog) -> ConfirmStyle {
         | Dialog::DeleteEffects { .. }
         | Dialog::RemoveFolder { .. }
         | Dialog::DeleteRejected { .. }
-        | Dialog::StopWaiting { .. } => ConfirmStyle::Plain,
+        | Dialog::StopWaiting { .. }
+        | Dialog::VignettingCreateAnyway { .. }
+        | Dialog::VignettingReplace { .. } => ConfirmStyle::Plain,
         _ if only_shows(dlg) => ConfirmStyle::Plain,
         _ => ConfirmStyle::Primary,
     }
@@ -4073,6 +4244,7 @@ fn only_shows(dlg: &Dialog) -> bool {
             | Dialog::ViewOptions
             | Dialog::Settings { .. }
             | Dialog::SystemInfo { .. }
+            | Dialog::DngValidation { .. }
             | Dialog::AllMetadata { .. }
             | Dialog::WhatsNew
             | Dialog::ManageEffects { .. }
@@ -4146,8 +4318,12 @@ mod cull_dialog_tests {
             clamp_cull_burst(&mut g, &mut s);
             assert_eq!((g, s), want);
         }
-        assert_eq!(cull_params(0.0, true, 1800.0, 1.0), json!({"pickBest": true, "burstGap": 1800.0, "similarity": 1.0}));
-        assert_eq!(cull_params(20.0, false, 0.0, 0.7)["rejectBelow"], 20.0);
+        assert_eq!(
+            cull_params(0.0, true, true, false, 1800.0, 1.0),
+            json!({"pickBest": true, "applyRatings": true, "burstGap": 1800.0, "similarity": 1.0})
+        );
+        assert_eq!(cull_params(20.0, false, false, true, 0.0, 0.7)["rejectBelow"], 20.0);
+        assert_eq!(cull_params(20.0, false, false, true, 0.0, 0.7)["applyFlags"], true);
     }
 
     /// Click the value field right of a slider registered as `id`, type `text`, Enter.

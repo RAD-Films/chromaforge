@@ -26,6 +26,7 @@ pub mod bounded_read;
 pub(crate) mod camera_preview;
 pub mod camera_profiles;
 pub mod capture_one_catalog;
+pub mod capture_one_develop;
 pub mod change_report;
 pub mod chart_profiling;
 pub mod cmd;
@@ -42,11 +43,17 @@ pub(crate) mod decode_share;
 pub mod demo;
 pub mod denoise;
 pub mod desktop;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod device_sync;
 pub mod devices;
 pub mod disk_delete;
 pub mod display;
+pub mod dng_update;
+pub mod dng_validate;
 pub mod doc_path;
+pub mod duplicates;
 pub mod dust_map;
+pub mod email;
 pub mod enhance;
 mod errors;
 pub mod export;
@@ -83,6 +90,7 @@ mod lightroom_archive;
 pub mod lightroom_catalog;
 pub mod lightroom_folder;
 pub mod lightroom_job;
+mod lightroom_print;
 mod lightroom_smart;
 mod lightroom_sqlite;
 pub mod link;
@@ -99,12 +107,10 @@ mod model_download;
 pub mod open_path;
 pub mod originals;
 mod pdf;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod peer_exchange;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod peers;
 mod people_smart;
 pub mod people_store;
+pub mod phash;
+pub mod phash_store;
 pub mod placement;
 pub mod prep;
 pub mod preset_import;
@@ -124,6 +130,7 @@ pub mod proof;
 pub mod remote;
 pub mod rename;
 pub mod render_dng;
+pub mod scene_disk;
 pub mod segment;
 pub mod sensor_maps;
 pub mod sidecar;
@@ -148,6 +155,9 @@ pub mod update;
 pub mod upright_jobs;
 pub mod video;
 mod view;
+pub mod vignetting_calibration_io;
+pub mod vignetting_calibration_library;
+pub mod vignetting_calibration_placement;
 pub mod walk;
 pub mod xmp_look;
 
@@ -156,13 +166,31 @@ use std::sync::Arc;
 pub use cmd::plugin_filters::ROLL_KEY;
 pub use cmd::{CommandInfo, CommandSpec, canonical_id, command_specs, find_command};
 pub use errors::{AiModel, ErrorKind};
-pub use fonts::{CRAFT_FONTS, CraftFont};
+pub use fonts::{CraftFont, craft_fonts};
 use lcc_catalog::{Catalog, Filter, Op, PhotoId, Sort};
 use lcc_develop::DevelopSettings;
 pub use media::{RenderJob, SourceLevel};
 use serde_json::Value;
 pub use view::{Browse, FilterChip, LibrarySource, Selection, SelectionState, filter_chips};
 pub use {lcc_catalog as catalog, lcc_develop as develop, lcc_gpu as gpu, lcc_pipeline as pipeline};
+
+/// [`Session::before_step`]: the commit count and the length of the queue of ops not yet written to the library's log.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BeforeStep {
+    commits: u64,
+    log: usize,
+}
+
+/// One step a command has just committed ([`Session::committed_step`]), to take back if the command then fails.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommittedStep {
+    /// [`Session::commits`] with the step committed.
+    commits: u64,
+    /// The undo stack's length with the step on top.
+    undo_len: usize,
+    /// Where the step's op waits in the queue for the library's log, while it hasn't been written.
+    pending: Option<usize>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -312,6 +340,8 @@ pub struct Session {
     pub auto_applied: std::collections::HashMap<PhotoId, [f64; 8]>,
     pub catalog: Catalog,
     pub source: LibrarySource,
+    /// The sources `library.source` showed, for Go Back / Go Forward (`library.sourceBack`); not saved.
+    pub(crate) source_history: view::SourceHistory,
     pub filter: Filter,
     /// The filter `library.toggleFilters` put aside (Library > Enable Filters off); not persisted.
     pub(crate) shelved_filter: Option<Filter>,
@@ -424,9 +454,9 @@ pub struct Session {
     /// Remote services: SHA-1 back-fill and Immich jobs ([`remote`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub remote: remote::State,
-    /// Peer sync: the paired devices and the service that finds them ([`peers`]).
+    /// Sync with the app on other devices ([`device_sync`]).
     #[cfg(not(target_arch = "wasm32"))]
-    pub peers: peers::State,
+    pub device_sync: device_sync::State,
     /// Auto updates: the last check, the download in flight, and the settings ([`update`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub updater: update::Updater,
@@ -438,8 +468,17 @@ pub struct Session {
     pub(crate) focus_scan: focus_scan::FocusScan,
     /// Photo ▸ Enhance jobs on worker threads (`enhance.rawDetails`, `enhance.superResolution`, `enhance.pump`).
     pub(crate) enhance: enhance::EnhanceJobs,
-    /// Copied develop settings (partial JSON) for Paste.
+    /// Copied develop settings (partial JSON, portable: a flat-field map goes with them) for Paste.
     pub clipboard: Option<Value>,
+    /// Flat-field maps that came in with settings (a paste, a preset, an agent's partial) and wait for the edit that
+    /// uses them to store them ([`vignetting_calibration_io`]).
+    pub(crate) incoming_vignetting_maps: std::collections::BTreeMap<lcc_develop::VignettingMapId, lcc_develop::EmbeddedVignettingMap>,
+    /// Where each raw's picture sits on its sensor, read from its header for flat-field matching
+    /// ([`Session::photo_placement`]); in the app, by a worker thread ([`vignetting_calibration_placement`]).
+    pub vignetting_calibration_placements: vignetting_calibration_placement::Placements,
+    /// The flat-field library's folder when it isn't the usual one ([`vignetting_calibration_library::dir`]): `Some(None)` for
+    /// none (tests, tools).
+    pub vignetting_calibration_dir_override: Option<Option<std::path::PathBuf>>,
     /// The photo [`Session::clipboard`] was copied from: Paste links its masks with the pasted
     /// copies.
     pub clipboard_from: Option<PhotoId>,
@@ -646,6 +685,9 @@ pub struct Session {
     pub genfill: genfill::GenfillState,
     /// The last (or running) Build Previews.
     pub preview_build: Option<std::sync::Arc<cmd::previews::PreviewBuild>>,
+    /// Builds asked for while one was already running, waiting for their turn
+    /// ([`cmd::previews::drain_queue`] starts the next one when the running build ends).
+    pub preview_queue: std::collections::VecDeque<cmd::previews::QueuedPreview>,
     /// Preparing photos in the background: settings (app-wide and this library's) and the build
     /// it runs ([`prep`]).
     pub prep: prep::PrepState,
@@ -726,6 +768,16 @@ impl Default for Session {
 }
 
 impl Session {
+    /// What the next Auto Import listing looks at (`None`: no active watched folder).
+    pub fn auto_import_scope(&self) -> Option<cmd::library::AutoImportScope> {
+        let folder = self.import_defaults.auto_active_folder()?.clone();
+        Some(cmd::library::AutoImportScope {
+            folder,
+            subfolders: self.import_defaults.auto_options.subfolders,
+            skip: self.library.as_ref().map(|l| l.dir.clone()),
+        })
+    }
+
     pub fn library_generation(&self) -> u64 {
         self.library_generation
     }
@@ -752,6 +804,7 @@ impl Session {
             auto_applied: Default::default(),
             catalog: Catalog::new(),
             source: LibrarySource::All,
+            source_history: Default::default(),
             filter: Filter::default(),
             shelved_filter: None,
             sort: Sort::default(),
@@ -810,7 +863,7 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
             remote: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
-            peers: Default::default(),
+            device_sync: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             updater: Default::default(),
             desktop: desktop::default_desktop(),
@@ -818,6 +871,9 @@ impl Session {
             focus_scan: Default::default(),
             enhance: Default::default(),
             clipboard: None,
+            incoming_vignetting_maps: Default::default(),
+            vignetting_calibration_placements: Default::default(),
+            vignetting_calibration_dir_override: None,
             clipboard_from: None,
             meta_clipboard: None,
             browse: None,
@@ -904,6 +960,7 @@ impl Session {
             genfill: Default::default(),
             upright_jobs: Default::default(),
             preview_build: None,
+            preview_queue: Default::default(),
             prep: Default::default(),
             loupe_edge: 0,
             finishing: None,
@@ -1126,7 +1183,8 @@ impl Session {
     /// itself is refused here, whichever command, task or caller asked ([`Catalog::apply_new`]);
     /// undo, redo and opening a library bring back what was and are not held to that.
     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
-        let mut op = op;
+        // the flat-field maps the edit's settings came with go in first (`vignetting_calibration_io`)
+        let mut op = self.with_vignetting_maps(op);
         self.mark_batch(&mut op);
         let fwd = op.clone();
         let inv = self.apply_through(op, Catalog::apply_new)?;
@@ -1155,6 +1213,7 @@ impl Session {
         self.upright_after(&upright);
         // photos whose Smooth Skin now wants the skin found get it
         self.skin_after(&upright);
+        self.vignetting_after(&upright);
         Ok(())
     }
 
@@ -1232,6 +1291,50 @@ impl Session {
         }
         let _ = id;
         rect
+    }
+
+    /// Where things stand before a command commits a step it may have to take back if it then fails
+    /// ([`Session::committed_step`]).
+    pub(crate) fn before_step(&self) -> BeforeStep {
+        BeforeStep { commits: self.commits, log: self.pending_log.len() }
+    }
+
+    /// The one step committed since `before`, for [`Session::take_back`]; `None` when no step, or more than one, was
+    /// committed since.
+    pub(crate) fn committed_step(&self, before: BeforeStep) -> Option<CommittedStep> {
+        (self.commits == before.commits.wrapping_add(1) && !self.undo.is_empty()).then(|| CommittedStep {
+            commits: self.commits,
+            undo_len: self.undo.len(),
+            pending: (self.pending_log.len() == before.log.saturating_add(1)).then_some(before.log),
+        })
+    }
+
+    /// Take back `step`, the step a command committed before it failed, as an undo would, with nothing left to redo.
+    /// Only that step: when anything was committed, undone or merged ([`Session::merge_undo`]) since it, the top of the
+    /// undo stack may be a step that isn't the command's, and this refuses instead. When the step isn't written to the
+    /// library's log yet, it leaves the queue, so neither it nor its reversal reaches the disk; otherwise the reversal
+    /// is logged like an undo. A step that can't be taken back stays on the undo stack, and the error says why.
+    pub(crate) fn take_back(&mut self, step: CommittedStep) -> Result<()> {
+        // A later commit changes the count; an undo, a redo or a merge changes the stack's length (at the cap a commit
+        // leaves the length as it was, but changes the count).
+        if self.commits != step.commits || self.undo.len() != step.undo_len {
+            return Err(EngineError::Other("the step to take back is no longer the last one".into()));
+        }
+        let mut e = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to take back".into()))?;
+        if let Err(err) = self.apply_with_files(&mut e, &rename::RealFs) {
+            self.undo.push(e);
+            return Err(err);
+        }
+        self.drop_gone_from_selection();
+        self.reconcile_view();
+        self.vignetting_after(&e.op);
+        // Dropping the queued step, rather than logging its reversal after it, keeps a write cut short (a crash, a full
+        // disk) from saving the step without its reversal: each op is its own record in the log.
+        match step.pending.filter(|at| at.saturating_add(1) == self.pending_log.len()) {
+            Some(at) => self.pending_log.truncate(at),
+            None => self.pending_log.push(e.op),
+        }
+        Ok(())
     }
 
     /// Apply an op that is the app's own bookkeeping rather than something the user did (faces found by the background
@@ -1406,6 +1509,7 @@ impl Session {
         });
         // a step that brings back Smooth Skin without its skin gets it again (kept for the session: no model runs)
         self.skin_after(&applied);
+        self.vignetting_after(&applied);
         Ok(e.label)
     }
 
@@ -1454,6 +1558,7 @@ impl Session {
         });
         // a step that brings back Smooth Skin without its skin gets it again (kept for the session: no model runs)
         self.skin_after(&applied);
+        self.vignetting_after(&applied);
         Ok(e.label)
     }
 
@@ -2242,6 +2347,22 @@ impl Session {
         self.catalog.tally(&self.view_filter(self.source, &self.filter.without_quick()))
     }
 
+    /// What the People view counts faces among (issue #1131): the view's source (a folder, a collection,
+    /// Missing Photos…) and the filter bar, without its own person picks. Missing Photos, which a filter
+    /// can't say, becomes the list of photos found missing.
+    pub fn people_filter(&self) -> Filter {
+        let base = Filter { person: None, people: Vec::new(), ..self.filter.clone() };
+        let mut f = self.view_filter(self.source, &base);
+        if self.source == LibrarySource::Missing {
+            let (cat, avail) = (&self.catalog, &self.media.availability);
+            let mut ids = cat.query(&f, &lcc_catalog::Sort::default());
+            ids.retain(|id| cmd::missing::is_missing(cat, avail, *id));
+            f.only_none = ids.is_empty();
+            f.only = ids;
+        }
+        f
+    }
+
     pub(crate) fn view_filter(&self, source: LibrarySource, base: &Filter) -> Filter {
         let mut f = source.to_filter(base, &self.catalog);
         if source == LibrarySource::Folder {
@@ -2576,6 +2697,8 @@ mod tests_albums_local;
 #[cfg(test)]
 mod tests_app_store;
 #[cfg(test)]
+mod tests_auto_import;
+#[cfg(test)]
 mod tests_auto_mask_range;
 #[cfg(test)]
 mod tests_autosync;
@@ -2618,10 +2741,17 @@ mod tests_crop_aspects;
 #[cfg(test)]
 mod tests_crop_same;
 #[cfg(test)]
+mod tests_cull_suggest;
+#[cfg(test)]
 mod tests_denoise;
 #[cfg(test)]
 #[cfg(feature = "denoise")]
 mod tests_denoise_own;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_dng_update;
+#[cfg(test)]
+mod tests_dng_validate;
 #[cfg(test)]
 mod tests_edit_in;
 #[cfg(test)]
@@ -2690,6 +2820,8 @@ mod tests_keyword_list;
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_lens_db;
 #[cfg(test)]
+mod tests_levels;
+#[cfg(test)]
 mod tests_libops;
 #[cfg(test)]
 mod tests_library;
@@ -2721,6 +2853,8 @@ mod tests_organize;
 mod tests_people_corpus;
 #[cfg(test)]
 mod tests_people_masks;
+#[cfg(test)]
+mod tests_people_scope;
 #[cfg(test)]
 mod tests_persist;
 #[cfg(test)]
@@ -2760,6 +2894,8 @@ mod tests_retouch;
 #[cfg(test)]
 mod tests_segment;
 #[cfg(test)]
+mod tests_select_menu;
+#[cfg(test)]
 mod tests_sensor;
 #[cfg(test)]
 mod tests_settings_files;
@@ -2774,6 +2910,8 @@ mod tests_spots;
 #[cfg(test)]
 mod tests_sync;
 #[cfg(test)]
+mod tests_sync_copies;
+#[cfg(test)]
 mod tests_target_params;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -2783,6 +2921,12 @@ mod tests_upright_jobs;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_video_posters;
+#[cfg(test)]
+mod tests_vignetting_calibration_commands;
+#[cfg(test)]
+mod tests_vignetting_calibration_portable;
+#[cfg(test)]
+mod tests_vignetting_calibration_render;
 /// The turn or flip that takes orientation `from` to `to` (`None` when they are the same): what the
 /// masks, on the oriented photo, must follow ([`lcc_pipeline::mask_space::turn`]).
 pub(crate) fn orientation_change(from: lcc_geom::Orientation, to: lcc_geom::Orientation) -> Option<lcc_geom::Orientation> {
@@ -2802,6 +2946,8 @@ pub(crate) fn orientation_change(from: lcc_geom::Orientation, to: lcc_geom::Orie
     })
 }
 
+#[cfg(test)]
+mod tests_view_filter;
 #[cfg(test)]
 mod tests_view_follow;
 #[cfg(test)]

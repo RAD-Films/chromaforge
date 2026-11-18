@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod advanced_search;
 pub mod dates;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod db;
@@ -44,6 +45,7 @@ pub mod tally;
 pub mod transfer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod upgrade_backup;
+pub mod vignetting_maps;
 pub mod xmp_state;
 
 use std::collections::BTreeMap;
@@ -65,6 +67,7 @@ pub use remote::{PreviewEntry, RemoteIdentity, RemoteKey, RemoteTable, SyncState
 pub use rules::{Match, Rule, RuleSet};
 use serde::{Deserialize, Serialize};
 pub use store::{FsStore, MemStore, Store};
+pub use vignetting_maps::{ReferenceState, VignettingMapRecord, reference_photo};
 pub use xmp_state::{SidecarStat, XmpStamp, XmpStatus};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -160,6 +163,13 @@ pub enum Op {
         id: PhotoId,
         #[serde(default)]
         before: Option<Arc<DevelopSettings>>,
+    },
+    /// When the photo was last exported (see [`Photo::exported`]; `None`: never, or reset). Format
+    /// version 17.
+    SetExported {
+        id: PhotoId,
+        #[serde(default)]
+        exported: Option<String>,
     },
     /// Move the History cursor (see [`Photo::history_cursor`]) without changing the steps.
     SetHistoryCursor {
@@ -357,6 +367,20 @@ pub enum Op {
     Batch {
         ops: Vec<Op>,
     },
+    /// Store a vignetting map under its id ([`vignetting_maps`]): kept as it is when the id is already there; refused
+    /// when the map isn't valid or isn't the id's. The table only grows: the inverse is an empty batch, so undo never
+    /// takes a map away from a photo. Format version 18.
+    AddVignettingMap {
+        id: lcc_develop::VignettingMapId,
+        record: Box<VignettingMapRecord>,
+    },
+    /// Withdraw a vignetting map as a reference, or put it in use again ([`vignetting_maps`]): Apply doesn't pick a
+    /// withdrawn one; the photos that use it keep it. The inverse restores the state before; on a map the catalog
+    /// doesn't hold it does nothing. Format version 18.
+    SetVignettingMapState {
+        id: lcc_develop::VignettingMapId,
+        withdrawn: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -390,6 +414,9 @@ pub struct Catalog {
     /// The Map module's saved locations, by lower-case name (format version 6).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     saved_locations: BTreeMap<String, lcc_geo::SavedLocation>,
+    /// Flat-field maps by id, each once ([`vignetting_maps`]; format version 18). Append-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "vignetting_maps::de_table")]
+    vignetting_maps: BTreeMap<lcc_develop::VignettingMapId, Arc<VignettingMapRecord>>,
     /// Increments on every applied op, and when a batch fails and its rollback cannot undo it whole (the catalog
     /// changed, so what is keyed by the revision is out of date).
     #[serde(skip)]
@@ -517,6 +544,16 @@ impl Catalog {
     pub fn photo(&self, id: PhotoId) -> Option<&Arc<Photo>> {
         self.photos.get(&id)
     }
+    /// The vignetting map stored under `id`.
+    pub fn vignetting_map(&self, id: &lcc_develop::VignettingMapId) -> Option<&Arc<VignettingMapRecord>> {
+        self.vignetting_maps.get(id)
+    }
+
+    /// Every vignetting map in the catalog, by id.
+    pub fn vignetting_maps(&self) -> impl Iterator<Item = (&lcc_develop::VignettingMapId, &Arc<VignettingMapRecord>)> {
+        self.vignetting_maps.iter()
+    }
+
     pub fn photos(&self) -> impl Iterator<Item = &Arc<Photo>> {
         self.photos.values()
     }
@@ -919,7 +956,7 @@ impl Catalog {
             Op::SetLabel { .. } => self.changes.now = Aspects::LABEL,
             Op::SetMeta { .. } | Op::SetXmpStamp { .. } => self.changes.now = Aspects::META,
             Op::SetCaptured { .. } => self.changes.now = Aspects::CAPTURED,
-            Op::SetFile { .. } | Op::Relink { .. } | Op::SetSha1 { .. } => self.changes.now = Aspects::FILE,
+            Op::SetFile { .. } | Op::Relink { .. } | Op::SetSha1 { .. } | Op::SetExported { .. } => self.changes.now = Aspects::FILE,
             Op::SetAnalysis { .. } => self.changes.now = Aspects::ANALYSIS,
             Op::SetDevelop { .. }
             | Op::SetVersions { .. }
@@ -959,6 +996,20 @@ impl Catalog {
             | Op::SetSavedLocation { .. } => self.changes.broad = self.revision.saturating_add(1),
             // (no photo matches, counts or sorts by it: only lists of keywords change)
             Op::SetKeyword { .. } => self.changes.keyword_list = self.revision.saturating_add(1),
+            // (its reference photo matches the library filter and the smart-collection rule by it; the photos that
+            // use the map say so with their settings)
+            Op::AddVignettingMap { record, .. } => {
+                if let Some(p) = vignetting_maps::reference_of_record(self, record) {
+                    self.changes.now = Aspects::DEVELOP;
+                    self.touch(p);
+                }
+            }
+            Op::SetVignettingMapState { id, .. } => {
+                if let Some(p) = reference_photo(self, id) {
+                    self.changes.now = Aspects::DEVELOP;
+                    self.touch(p);
+                }
+            }
         }
         match &op {
             // (a file name breaks every key's ties)
@@ -1073,6 +1124,10 @@ impl Catalog {
             Op::SetBefore { id, before } => {
                 let p = self.photo_mut(id)?;
                 Op::SetBefore { id, before: std::mem::replace(&mut p.before, before) }
+            }
+            Op::SetExported { id, exported } => {
+                let p = self.photo_mut(id)?;
+                Op::SetExported { id, exported: std::mem::replace(&mut p.exported, exported) }
             }
             Op::SetHistoryCursor { id, cursor } => {
                 let p = self.photo_mut(id)?;
@@ -1413,6 +1468,28 @@ impl Catalog {
                 };
                 Op::SetSavedLocation { name, location: old }
             }
+            Op::AddVignettingMap { id, mut record } => {
+                if !record.fits(&id) {
+                    return Err(CatalogError::Invalid(format!("vignetting map {} isn't a valid map with that id", id.short())));
+                }
+                if !self.vignetting_maps.contains_key(&id) {
+                    // (a link to a photo that isn't here is no link)
+                    record.photo = record.photo.filter(|p| self.photos.contains_key(p));
+                    self.vignetting_maps.insert(id, Arc::new(*record));
+                }
+                // the table only grows: undo never takes a map away from the photos that use it
+                Op::Batch { ops: Vec::new() }
+            }
+            Op::SetVignettingMapState { id, withdrawn } => match self.vignetting_maps.get_mut(&id) {
+                Some(r) => {
+                    let old = r.withdrawn;
+                    if old != withdrawn {
+                        Arc::make_mut(r).withdrawn = withdrawn;
+                    }
+                    Op::SetVignettingMapState { id, withdrawn: old }
+                }
+                None => Op::Batch { ops: Vec::new() },
+            },
             Op::Batch { ops } => {
                 let mut inverses = Vec::with_capacity(ops.len());
                 for op in ops {
@@ -1672,6 +1749,7 @@ fn changes_what_albums_test(op: &Op) -> bool {
         | Op::PushHistory { .. }
         | Op::SetHistoryCursor { .. }
         | Op::SetBefore { .. }
+        | Op::SetExported { .. }
         | Op::RenameAlbum { .. }
         | Op::MoveAlbum { .. }
         | Op::SetAlbumOrder { .. }
@@ -1694,7 +1772,9 @@ fn changes_what_albums_test(op: &Op) -> bool {
         | Op::SetVideoPoster { .. }
         | Op::SetVideoTrim { .. }
         | Op::SetXmpStamp { .. }
-        | Op::SetSha1 { .. } => false,
+        | Op::SetSha1 { .. }
+        | Op::AddVignettingMap { .. }
+        | Op::SetVignettingMapState { .. } => false,
     }
 }
 

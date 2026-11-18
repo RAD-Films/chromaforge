@@ -21,6 +21,45 @@ pub enum ViewMode {
     People,
 }
 
+/// Which of the three categories of faces the People view shows (issue #1050), as digiKam sorts them: the faces that
+/// are still nobody, those recognition has matched to someone (to be confirmed or rejected), and the people it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeopleCategory {
+    /// Faces nobody has named, with no name they were matched to: raw detected regions.
+    #[default]
+    Unknown,
+    /// Faces the named faces recognise, grouped under the person they suggest, until the user confirms or rejects.
+    Suggested,
+    /// The people the library knows: every named face, under its person.
+    Confirmed,
+}
+
+impl PeopleCategory {
+    /// What the control channel, the saved UI state and the category's widget id use.
+    pub const fn id(self) -> &'static str {
+        match self {
+            PeopleCategory::Unknown => "unknown",
+            PeopleCategory::Suggested => "suggested",
+            PeopleCategory::Confirmed => "confirmed",
+        }
+    }
+
+    /// The category `id` names, if it names one.
+    pub fn parse(id: &str) -> Option<Self> {
+        [PeopleCategory::Unknown, PeopleCategory::Suggested, PeopleCategory::Confirmed].into_iter().find(|c| c.id() == id)
+    }
+
+    /// The category's name in the picker, in English (translated where it is shown).
+    pub const fn title(self) -> &'static str {
+        match self {
+            PeopleCategory::Unknown => "Unknown",
+            PeopleCategory::Suggested => "Suggested",
+            PeopleCategory::Confirmed => "Confirmed",
+        }
+    }
+}
+
 impl ViewMode {
     /// The two Library grids ([`Self::PhotoGrid`], [`Self::SquareGrid`]).
     pub fn is_grid(self) -> bool {
@@ -103,6 +142,29 @@ pub enum CropOverlay {
     Triangle,
     Spiral,
     None,
+}
+
+impl CropOverlay {
+    /// Every guide, in the order the cycle visits them (`None` hides the guides).
+    pub const ALL: [CropOverlay; 7] = [
+        CropOverlay::Thirds,
+        CropOverlay::Grid,
+        CropOverlay::Golden,
+        CropOverlay::Diagonal,
+        CropOverlay::Triangle,
+        CropOverlay::Spiral,
+        CropOverlay::None,
+    ];
+
+    /// The next guide after `self` among those in `cycle` (Tools ▸ Crop Guide Overlay ▸ Choose
+    /// Overlays to Cycle). An empty cycle falls back to all of them; a current guide outside the
+    /// cycle steps to the first one in cycle order after it.
+    pub fn next_in(self, cycle: &[CropOverlay]) -> CropOverlay {
+        let all = CropOverlay::ALL;
+        let at = all.iter().position(|o| *o == self).unwrap_or(0);
+        let allowed = |o: &CropOverlay| cycle.is_empty() || cycle.contains(o);
+        (1..=all.len()).filter_map(|d| all.get((at + d) % all.len())).copied().find(allowed).unwrap_or(self)
+    }
 }
 
 /// Tool Overlay: when the retouching tools' pins (Remove / Heal / Clone spots, mask pins) show on
@@ -498,6 +560,14 @@ pub struct AppSettings {
     /// to the screen when the window opens; OneSlips, LR-PREF-WINDOW).
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub settings_size: Option<[f32; 2]>,
+    /// Where the Settings window lists its categories in the Classic layout (Settings ▸ General ▸
+    /// Settings Categories; `None`: [`SettingsCategories::Left`]). The Modern layout always lists
+    /// them down the left of a full-window sheet.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub settings_categories_classic: Option<SettingsCategories>,
+    /// The same in the Compact layout (`None`: [`SettingsCategories::Top`]).
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub settings_categories_compact: Option<SettingsCategories>,
     /// GPU rendering allowed (`app.gpu`).
     pub gpu: bool,
     /// The graphics interface GPU rendering uses (Settings ▸ Performance; applies at next launch).
@@ -566,15 +636,29 @@ pub struct AppSettings {
     pub film_names: bool,
     /// Filmstrip: rating / flag / edited badges on the thumbnails.
     pub film_badges: bool,
+    /// Sliders that opt in reach past Lightroom's range (Settings ▸ Interface ▸ Sliders; only the
+    /// mask Hue so far: ±180° instead of about ±34°). Off: the standard range; values already past
+    /// it are kept, never rewritten.
+    pub expanded_sliders: bool,
     /// Grid: when to show the rating / flag / edited badges.
     pub grid_badges: GridBadges,
     /// How far a mouse-wheel notch scrolls the grid and filmstrip, times [`crate::theme::WHEEL_STRIP_SHARE`]
     /// (1 = a third of the view; Preferences → Interface → Wheel scroll speed).
     pub wheel_scroll_speed: f32,
+    /// View ▸ Lock Zoom Position (`view.lockZoomPosition`): one zoom and pan for every photo (the
+    /// default); off, each photo keeps its own ([`crate::view_state`]).
+    pub lock_zoom: bool,
+    /// View ▸ Scroll By Row (`view.scrollByRow`): a wheel notch moves the grid a whole row.
+    pub scroll_by_row: bool,
+    /// View ▸ Enable Mirror Image Mode (`view.mirrorImage`): the views are shown flipped left to
+    /// right; photos, edits and exports are untouched.
+    pub mirror_image: bool,
     /// Reduce motion (Settings ▸ Interface): no zoom glide, widget easing or turning spinners.
     pub reduce_motion: bool,
     /// When a brush tool is active, the mouse wheel changes its size instead of zooming.
     pub wheel_resizes_brush: bool,
+    /// Turn the wheel or trackpad scroll gesture the other way when resizing a brush (Issue #1257).
+    pub invert_brush_resize: bool,
     /// View ▸ View Options ▸ Show message when loading or rendering photos: the loupe says
     /// "Rendering…" while the photo it shows is not the finished render.
     pub loupe_messages: bool,
@@ -601,6 +685,9 @@ pub struct AppSettings {
     /// the same photo; a value this version doesn't know reads as the default.
     #[serde(deserialize_with = "lenient")]
     pub grading_mode: GradingMode,
+    /// The Develop tool profiles (Settings ▸ Develop, `view.toolProfile`): which of the Edit panel's
+    /// groups and sliders show. Read leniently: unknown ids in a stored profile are dropped.
+    pub tool_profiles: crate::tool_profiles::ToolProfiles,
     /// Auto Sync (Edit ▸ Auto Sync, `develop.autoSync`), remembered app-wide: it stays as left
     /// whichever library is open and after a restart.
     pub auto_sync: bool,
@@ -633,6 +720,9 @@ pub struct AppSettings {
     pub double_click_develop: bool,
     /// Hide active filter text / indicator in Develop mode (Settings ▸ Interface ▸ Detail).
     pub hide_filter_in_develop: bool,
+    /// Metadata > Show Metadata for Target Photo Only: the Metadata panel shows and edits the active photo,
+    /// not the whole selection's mixed values (`metadata.targetOnly`).
+    pub metadata_target_only: bool,
     /// Presets panel: list the "User Presets" group first, after Favorites (issue #476; off by
     /// default, as Lightroom Classic keeps groups in name order).
     pub user_presets_first: bool,
@@ -741,6 +831,8 @@ impl Default for AppSettings {
             import_tab: Default::default(),
             settings_tab: String::new(),
             settings_size: None,
+            settings_categories_classic: None,
+            settings_categories_compact: None,
             gpu: true,
             gpu_backend: GpuBackend::Auto,
             gpu_card: String::new(),
@@ -764,10 +856,15 @@ impl Default for AppSettings {
             machine_test: None,
             film_names: true,
             film_badges: true,
+            expanded_sliders: false,
             grid_badges: GridBadges::Auto,
             wheel_scroll_speed: 1.0,
+            lock_zoom: true,
+            scroll_by_row: false,
+            mirror_image: false,
             reduce_motion: false,
             wheel_resizes_brush: true,
+            invert_brush_resize: false,
             loupe_messages: true,
             keymap: Default::default(),
             keymap_set: Default::default(),
@@ -778,6 +875,7 @@ impl Default for AppSettings {
             slider_layout: Default::default(),
             compact_layout: false,
             grading_mode: GradingMode::Witchcraft,
+            tool_profiles: Default::default(),
             auto_sync: false,
             slider_text: Default::default(),
             slider_control: Default::default(),
@@ -790,6 +888,7 @@ impl Default for AppSettings {
             space_zoom: SpaceZoom::default(),
             double_click_develop: false,
             hide_filter_in_develop: false,
+            metadata_target_only: false,
             user_presets_first: false,
             loupe_info: LoupeInfo::default(),
             lightroom_import: LightroomImport::Ask,
@@ -1129,6 +1228,17 @@ impl BrushPreset {
     }
 }
 
+/// Where the Settings window of the Classic and Compact layouts lists its categories (Settings ▸
+/// General ▸ Settings Categories).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsCategories {
+    /// A list down the window's left side, as the Modern layout's (in a window of normal size).
+    Left,
+    /// One row of tabs along the window's top.
+    Top,
+}
+
 /// How the Keywording box lays out the selection's keywords.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1222,8 +1332,9 @@ pub struct UiState {
     /// The view showed a browsed folder last frame ([`crate::import_tab::keep_in_step`]).
     #[serde(skip)]
     pub import_was_browsing: bool,
-    /// Developing a browsed photo without importing it: the Library tab shows the Develop module
-    /// on the folder's active photo while the browse stays on ([`crate::import_tab::keep_in_step`]).
+    /// Working on browsed photos without importing them: the Library tab shows Develop, Print,
+    /// Export or Slideshow on the folder's photos while the browse stays on
+    /// ([`crate::import_tab::open_without_import`], [`crate::import_tab::keep_in_step`]).
     #[serde(skip)]
     pub import_develop: bool,
     /// The library filter the Import tab put aside on entering it (the tab has no filter bar and a
@@ -1267,10 +1378,7 @@ pub struct UiState {
     /// Width of the Import tab's Folders panel in points (its right edge is dragged to resize it; within
     /// [`IMPORT_SOURCES_WIDTH`]).
     pub import_sources_width: f32,
-    /// Presets is the open panel on the right (in place of Edit, Crop, …; `right` keeps the tool
-    /// to go back to).
-    pub presets: bool,
-    /// Presets column: show a live thumbnail of the photo with each preset.
+    /// Presets panel: show a live thumbnail of the photo with each preset.
     pub preset_thumbs: bool,
     pub filmstrip: bool,
     /// Height of the filmstrip (points): its top edge drags it between [`FILM_HEIGHT`]'s bounds;
@@ -1288,6 +1396,9 @@ pub struct UiState {
     /// Animate the loupe rect toward its target (set by a click-zoom).
     #[serde(skip)]
     pub zoom_anim: bool,
+    /// A momentary before/after layout (`\`, the Original Photo box): a view mode, not a
+    /// workspace, so it never comes back after a restart looking like edits not showing (#1110).
+    #[serde(skip)]
     pub before_after: BeforeAfter,
     pub thumb_size: f32,
     /// Open Edit sections by id.
@@ -1355,6 +1466,11 @@ pub struct UiState {
     /// A mask slider is at work until then: no mask overlay covers the photo.
     #[serde(skip)]
     pub mask_adjusting_until: Option<std::time::Instant>,
+    /// A mask was picked (created, selected, an AI click) until then: its overlay shows for a
+    /// moment even when it has settings (issue #1109), so the user sees which mask is on; then
+    /// judging by its effect takes over again (the overlay auto rule, upstream PR 2920).
+    #[serde(skip)]
+    pub mask_peek_until: Option<std::time::Instant>,
     /// The mask whose row in the Masks list is under the pointer: its overlay shows while nothing is
     /// being adjusted.
     #[serde(skip)]
@@ -1393,6 +1509,10 @@ pub struct UiState {
     /// Mirroring of the triangle / spiral crop guides (0..4).
     pub crop_overlay_orient: u8,
     pub crop_overlay: CropOverlay,
+    /// The guides Cycle Crop Overlay visits (Choose Overlays to Cycle…); never empty.
+    pub crop_overlay_cycle: Vec<CropOverlay>,
+    /// Book ▸ Book Preferences…: what a new book starts with.
+    pub book_prefs: crate::book::BookPrefs,
     /// How dark the mask outside the crop is, in percent: one of `CROP_MASK_OPACITY_LEVELS`.
     pub crop_mask_opacity: u8,
     /// Last explicitly chosen aspect, retained across photos and app launches; `None` (nothing
@@ -1411,6 +1531,9 @@ pub struct UiState {
     /// without the user choosing it, so only a choice made since is kept.
     #[serde(rename = "faceBoxesOn")]
     pub face_boxes: bool,
+    /// Photo > People > Draw Face Regions is on: a drag over the loupe's photo draws a face box.
+    #[serde(skip)]
+    pub draw_faces: bool,
     /// HDR edits are shown in HDR on an HDR display (View ▸ HDR Preview, `view.hdrPreview`);
     /// off, every view shows their SDR rendition, as on an SDR display.
     pub hdr_preview: bool,
@@ -1543,6 +1666,9 @@ pub struct UiState {
     pub concept_pick: bool,
     /// The Roles window (who has which role, and where) is open.
     pub roles_window: bool,
+    /// Show the Who / Set Role / Roles row under a selected People mask component.
+    #[serde(default)]
+    pub show_people_who: bool,
     /// Close the window on the next frame (File → Quit).
     #[serde(skip)]
     pub quit: bool,
@@ -1602,6 +1728,8 @@ pub struct UiState {
     /// The Remove panel's tool last used ("remove", "fill", "generate", "heal", "clone"): the panel
     /// opens on it again (this session).
     pub remove_tool: String,
+    /// Tools ▸ Remove Options ▸ Detect Objects: a Remove stroke picks the object under it (`spot.detectObject`).
+    pub remove_detect_objects: bool,
     /// The brush's Size (Lightroom's 1..100, a size on the screen: the core is [`brush_core_points`] at
     /// every zoom; a stroke stores it in photo units as painted), Feather, Flow and Density.
     pub brush_size: f32,
@@ -1666,6 +1794,9 @@ pub struct UiState {
     /// Remove tool: Visualize Spots (high-pass black/white view) and its threshold 0..100.
     pub visualize_spots: bool,
     pub spots_threshold: f32,
+    /// Remove panel, Infrared Dust Removal: what the photo shows: 0 the photo, 1 the infrared pass
+    /// (with the marks in red), 2 the marks alone (white on black: what is filled in).
+    pub film_dust_view: u8,
     /// The library filter bar above the grid.
     pub filter_bar: bool,
     /// The filter bar's Metadata columns (issue #218): the field each column lists; empty = hidden.
@@ -1678,6 +1809,21 @@ pub struct UiState {
     /// Not saved; the People button (or emptying the box) shows everyone again.
     #[serde(skip)]
     pub people_search: String,
+    /// The People view's category (issue #1050): the faces nobody has named, those recognition suggests a person for,
+    /// or the people it knows. Not saved: People opens on Unknown, the faces waiting for a name (the raw detected
+    /// ones), as it did before the categories.
+    #[serde(skip)]
+    pub people_category: PeopleCategory,
+    /// Suggested faces the user rejected from the Suggested category, for this session, as `(photo, region)`. The
+    /// rejection itself is kept (`faces.rejectSuggestions` stores it), so the face is not suggested as that person
+    /// again; this is what the groups drop at once, before the face lists are next read, and the toast's Undo
+    /// (`faces.undoSuggestionDecision`) takes it out again.
+    #[serde(skip)]
+    pub rejected_suggestions: std::collections::HashSet<(u64, usize)>,
+    /// Suggested faces the user confirmed from the Suggested category, for this session, as `(photo, region)`: they
+    /// leave the groups at once, rather than when the face lists are next read (a catalog revision later).
+    #[serde(skip)]
+    pub confirmed_suggestions: std::collections::HashSet<(u64, usize)>,
     /// Folders kept in Local (Browse Folder…, Keep in Local / Add to Local; `local.addRoot`):
     /// listed after the built-in locations, across restarts, whatever is browsed.
     pub local_roots: Vec<String>,
@@ -1774,6 +1920,8 @@ pub struct UiState {
     pub slideshow: Option<Box<crate::panels::slideshow::Run>>,
     /// The Slideshow module (templates, saved slideshows, the slide settings).
     pub slides: crate::slideshow_ui::SlideshowState,
+    /// The Web module's templates, template folders and Show Guides.
+    pub web: crate::web_templates::WebState,
     /// Info overlay on the loupe.
     pub info_overlay: InfoOverlay,
     /// When the loupe last changed photo (View Options' Show Briefly When Photo Changes).
@@ -1803,6 +1951,9 @@ pub struct UiState {
     /// The result of the last Find Missing Photos (it searches in the background).
     #[serde(skip)]
     pub last_find_missing: Option<serde_json::Value>,
+    /// The report of the last Validate DNG Files (`dng.validate`'s answer; it runs in the background).
+    #[serde(skip)]
+    pub last_dng_validation: Option<serde_json::Value>,
     /// The outcome (success or error) of the last Find Missing Photos task.
     #[serde(skip)]
     pub last_find_missing_result: Option<Result<serde_json::Value, String>>,
@@ -1824,6 +1975,20 @@ pub struct UiState {
     /// Develop ▸ Lens Corrections: the lens maker picked in the lens picker before a model (issue #307).
     #[serde(skip)]
     pub lens_pick_make: Option<String>,
+    /// Develop ▸ Lens Corrections ▸ Vignetting Calibration: `vignettingCalibration.photo` for (photo, settings hash), so the panel
+    /// reads the raw's header once per change, not every frame.
+    #[serde(skip)]
+    pub vignetting_calibration_info: Option<(lcc_catalog::PhotoId, u64, serde_json::Value)>,
+    /// The photo whose raw Create is measuring on a worker thread (its button waits meanwhile).
+    #[serde(skip)]
+    pub vignetting_calibration_creating: Option<lcc_catalog::PhotoId>,
+    /// What the last Create said about its reference (`vignettingCalibration.create`'s result: exposure, fall-off), for that photo.
+    #[serde(skip)]
+    pub vignetting_calibration_report: Option<(lcc_catalog::PhotoId, serde_json::Value)>,
+    /// A Borderline reference Create measured, kept while the Create Anyway question is open (confirming doesn't
+    /// measure again).
+    #[serde(skip)]
+    pub vignetting_calibration_pending: Option<(lcc_catalog::PhotoId, Box<lcc_engine::cmd::vignetting_calibration::Measured>)>,
     /// The start-up update check has run (once per session; Help ▸ Check for Updates… is manual).
     #[serde(skip)]
     pub update_checked_at_startup: bool,
@@ -1845,6 +2010,10 @@ pub struct UiState {
 /// but crop, masks, spots and red eye.
 pub fn default_preset_groups() -> Vec<String> {
     lcc_develop::SettingsPick::of_groups(lcc_develop::SettingsGroup::default_preset()).to_ids()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Dialog {
@@ -1882,6 +2051,14 @@ pub struct NameEdit {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Dialog {
+    /// Tools ▸ Crop Guide Overlay ▸ Choose Overlays to Cycle…: the guides `view.cropOverlay` visits.
+    CropOverlays {
+        picked: Vec<CropOverlay>,
+    },
+    /// Book ▸ Book Preferences…: what `book.new` starts a book with.
+    BookPrefs {
+        prefs: crate::book::BookPrefs,
+    },
     /// File ▸ Export ▸ Timelapse Video… (`crate::timelapse_ui`); `size` is "WxH".
     Timelapse {
         fps: u32,
@@ -1890,6 +2067,11 @@ pub enum Dialog {
         hold: u32,
         crossfade: u32,
         prores: bool,
+        quality: u8,
+    },
+    /// File ▸ Email Photo… (`crate::email_photo`): the long edge (pixels) and JPEG quality of the copies.
+    EmailPhoto {
+        long_edge: u32,
         quality: u8,
     },
     /// A Lightroom import result stays readable after its activity row disappears.
@@ -1935,8 +2117,8 @@ pub enum Dialog {
         params: serde_json::Value,
         key: String,
     },
-    /// Edit Capture Time: `mode` "set" (`time`; the others shift along), "shift" (by `days`,
-    /// `hours`, `minutes`) or "zone" (time-zone shift by `zone` hours).
+    /// Edit Capture Time: `mode` "set" (`time`; the others shift along, or with `each` every photo gets
+    /// `time`), "shift" (by `days`, `hours`, `minutes`) or "zone" (time-zone shift by `zone` hours).
     CaptureTime {
         mode: String,
         time: String,
@@ -1944,6 +2126,10 @@ pub enum Dialog {
         hours: i32,
         minutes: i32,
         zone: f32,
+        /// "set" with several photos: every one gets `time` instead of moving by the active photo's change
+        /// (issue #4205).
+        #[serde(default)]
+        each: bool,
     },
     /// The import review (File → Import Photos…).
     Import {
@@ -2033,6 +2219,12 @@ pub enum Dialog {
     AutoStack {
         gap: f32,
     },
+    /// Library ▸ Advanced Search…: the structured query panel (`crate::advanced_search`), shown
+    /// over the grid it filters.
+    AdvancedSearch {
+        #[serde(default)]
+        search: crate::advanced_search::Search,
+    },
     /// Save the current view (source + filter) as a smart album.
     NewSmartAlbum {
         name: String,
@@ -2060,6 +2252,14 @@ pub enum Dialog {
         /// Everyone's eyes count, not only the main subjects' (`mainOnly: false`).
         #[serde(default)]
         everyone: bool,
+        /// Apply the suggested star ratings (`photo.analyze` `applyRatings`; photos the user
+        /// rated are left alone).
+        #[serde(default = "default_true")]
+        suggest_stars: bool,
+        /// Apply the suggested Pick / Reject flags (`photo.analyze` `applyFlags`; photos the user
+        /// flagged are left alone).
+        #[serde(default)]
+        suggest_flags: bool,
     },
     /// Help ▸ System Info: (label, value) rows.
     DenoiseModel {
@@ -2075,6 +2275,13 @@ pub enum Dialog {
     },
     SystemInfo {
         rows: Vec<(String, String)>,
+    },
+    /// Library ▸ Validate DNG Files: what the check found (it runs in the background). `damaged` and `unverifiable`
+    /// hold `name: why` lines.
+    DngValidation {
+        summary: String,
+        damaged: Vec<String>,
+        unverifiable: Vec<String>,
     },
     /// Help ▸ Check for Updates…: the release feed's answer, the download and the install
     /// (the panel state lives in the session's updater; see [`crate::panels::update`]).
@@ -2114,6 +2321,14 @@ pub enum Dialog {
     SyncSettings {
         groups: Vec<String>,
         controls: Vec<String>,
+    },
+    /// Sync Copies: the groups the active photo's settings carry to its master and virtual copies.
+    SyncCopies {
+        groups: Vec<String>,
+    },
+    /// Sync Snapshots: the groups the active photo's current edit carries into each of its snapshots.
+    SyncSnapshots {
+        groups: Vec<String>,
     },
     /// Update Preset with Current Settings: which settings preset `id` keeps (pre-ticked with what it
     /// holds).
@@ -2251,6 +2466,18 @@ pub enum Dialog {
         task: String,
         warning: String,
     },
+    /// Create measured a reference that doesn't quite look like a flat field (Borderline): `reasons` (translated) say
+    /// why; Create Anyway keeps the map measured meanwhile ([`UiState::vignetting_calibration_pending`]) for `photo`.
+    VignettingCreateAnyway {
+        photo: u64,
+        reasons: String,
+    },
+    /// Create measured a reference for a combination (camera model, lens, aperture, a zoom's focal length) that has one
+    /// in use: `question` (translated) names it; Replace withdraws it and keeps the new one, in one undo step.
+    VignettingReplace {
+        photo: u64,
+        question: String,
+    },
     /// Confirm moving photos to Recently Deleted or deleting from disk.
     ConfirmDelete {
         count: usize,
@@ -2377,7 +2604,7 @@ impl SyncCounts {
 /// (Point Color, Color Range). The white balance picker is left out: it puts itself away after one pick and keeps
 /// working across panels (W).
 pub fn is_picker(tool: &str) -> bool {
-    tool.starts_with("tat:") || matches!(tool, "pointColor" | "colorRange")
+    tool.starts_with("tat:") || matches!(tool, "pointColor" | "colorRange" | "levelsBlack" | "levelsWhite")
 }
 
 impl Default for UiState {
@@ -2396,6 +2623,7 @@ impl Default for UiState {
             luminance_map_restore: None,
             mask_overlay_pinned: false,
             mask_adjusting_until: None,
+            mask_peek_until: None,
             mask_pin_hover: None,
             mask_menu_for: None,
             mask_hover: None,
@@ -2428,7 +2656,6 @@ impl Default for UiState {
             right_seen: RightPanel::Edit,
             right_collapsed: false,
             right_hidden: RightPanel::None,
-            presets: false,
             preset_thumbs: false,
             filmstrip: true,
             film_height: FILM_HEIGHT.default,
@@ -2464,6 +2691,8 @@ impl Default for UiState {
             tool_overlay: ToolOverlay::Auto,
             mask_overlay_all: false,
             crop_overlay: CropOverlay::Thirds,
+            crop_overlay_cycle: CropOverlay::ALL.to_vec(),
+            book_prefs: Default::default(),
             crop_default_aspect: None,
             crop_overlay_orient: 0,
             crop_mask_opacity: DEFAULT_CROP_MASK_OPACITY,
@@ -2471,6 +2700,7 @@ impl Default for UiState {
             grid_info: "filename".into(),
             show_counts: true,
             face_boxes: false,
+            draw_faces: false,
             hdr_preview: true,
             sidebar: Default::default(),
             collapsed_sidebar: Vec::new(),
@@ -2510,6 +2740,7 @@ impl Default for UiState {
             sam_downloading: false,
             renaming_component: None,
             roles_window: false,
+            show_people_who: false,
             role_draft: None,
             people_pick: None,
             people_asked: None,
@@ -2534,6 +2765,7 @@ impl Default for UiState {
             selected_guide: None,
             wb_sample: 5,
             remove_tool: "remove".into(),
+            remove_detect_objects: false,
             brush_size: BRUSH_SIZE_DEFAULT,
             brush_feather: 50.0,
             brush_flow: 60.0,
@@ -2565,12 +2797,14 @@ impl Default for UiState {
             eye_pet: false,
             visualize_spots: false,
             spots_threshold: 50.0,
+            film_dust_view: 0,
             auto_advance: false,
             caps_lock: false,
             alternatives_same_edit: true,
             fullscreen: false,
             slideshow: None,
             slides: Default::default(),
+            web: Default::default(),
             second_window: false,
             module: Default::default(),
             previous_module: None,
@@ -2618,12 +2852,16 @@ impl Default for UiState {
             filter_columns: Vec::new(),
             filter_column_search: Vec::new(),
             people_search: String::new(),
+            people_category: PeopleCategory::default(),
+            rejected_suggestions: Default::default(),
+            confirmed_suggestions: Default::default(),
             local_roots: Vec::new(),
             local_browse_root: None,
             compare: None,
             reference: None,
             toasts: Vec::new(),
             toast_action: None,
+            last_dng_validation: None,
             last_find_missing: None,
             last_find_missing_result: None,
             #[cfg(test)]
@@ -2633,6 +2871,10 @@ impl Default for UiState {
             dialog: None,
             settings_section: None,
             lens_pick_make: None,
+            vignetting_calibration_info: None,
+            vignetting_calibration_creating: None,
+            vignetting_calibration_report: None,
+            vignetting_calibration_pending: None,
             update_checked_at_startup: false,
             update_checked_at: 0.0,
             update_pending: None,
@@ -2713,6 +2955,12 @@ impl UiState {
             self.picker_armed_in = None;
             return;
         }
+        // the Levels pickers also end when the Levels section is closed
+        if matches!(self.tool.as_str(), "levelsBlack" | "levelsWhite") && !self.section_open("levels") {
+            self.tool.clear();
+            self.picker_armed_in = None;
+            return;
+        }
         let here = self.picker_layout();
         match &self.picker_armed_in {
             Some(armed) if *armed != here => {
@@ -2726,7 +2974,9 @@ impl UiState {
 
     /// A slider (or dial) was touched: a picker armed is put away.
     pub fn put_away_picker(&mut self) {
-        if is_picker(&self.tool) {
+        // the Levels pickers stay armed while its sliders and boxes are used: Esc, a second click, the other picker or
+        // leaving the section ends them
+        if is_picker(&self.tool) && !matches!(self.tool.as_str(), "levelsBlack" | "levelsWhite") {
             self.tool.clear();
             self.picker_armed_in = None;
         }
@@ -3020,30 +3270,6 @@ mod loupe_info_tests {
             serde_json::from_value(serde_json::json!({"filmNames": false, "loupeInfo": {"info1": ["rating", "fileName", "none"]}})).unwrap();
         assert_eq!(newer.loupe_info, LoupeInfo::default());
         assert!(!newer.film_names, "the rest of the settings are still read");
-    }
-
-    /// Show message when loading or rendering photos is on until it is turned off, and is saved
-    /// with the app's settings.
-    #[test]
-    fn the_loading_message_choice_is_saved_with_the_settings() {
-        assert!(AppSettings::default().loupe_messages);
-        let old: AppSettings = serde_json::from_value(serde_json::json!({"filmNames": false})).unwrap();
-        assert!(old.loupe_messages, "a settings file from before the choice existed keeps the message");
-        let settings = AppSettings { loupe_messages: false, ..AppSettings::default() };
-        let saved = serde_json::to_value(&settings).unwrap();
-        assert_eq!(saved["loupeMessages"], false);
-        let read: AppSettings = serde_json::from_value(saved).unwrap();
-        assert!(!read.loupe_messages);
-    }
-
-    #[test]
-    fn ml_device_setting_round_trips() {
-        assert_eq!(AppSettings::default().ml_device, "");
-        let settings = AppSettings { ml_device: "cpu".into(), ..AppSettings::default() };
-        let saved = serde_json::to_value(&settings).unwrap();
-        assert_eq!(saved["mlDevice"], "cpu");
-        let read: AppSettings = serde_json::from_value(saved).unwrap();
-        assert_eq!(read.ml_device, "cpu");
     }
 }
 

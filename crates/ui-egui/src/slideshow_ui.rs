@@ -315,6 +315,11 @@ fn run_inner(app: &mut LccApp, id: &str, p: &Value) -> Result<Value, String> {
             app.ui.slides.settings = app.ui.slides.settings.patched(&patch)?;
             Ok(state_json(app))
         }
+        "slideshow.toggleGuides" => {
+            let on = !app.ui.slides.settings.layout.show_guides;
+            app.ui.slides.settings = app.ui.slides.settings.patched(&json!({"layout": {"showGuides": on}}))?;
+            Ok(state_json(app))
+        }
         "slideshow.reset" => {
             app.ui.slides.settings = Settings::default();
             app.ui.slides.template = "Default".into();
@@ -1414,6 +1419,7 @@ mod tests {
 
     #[test]
     fn the_module_previews_plays_and_saves() {
+        let dir = lcc_testkit::TempDir::new("lcc-slideshow-ui");
         let mut h = demo();
         ok(&mut h, "module.slideshow", json!({}));
         // (wait for what is checked, not a fixed settle: a loaded machine renders slowly)
@@ -1470,7 +1476,6 @@ mod tests {
         assert_eq!(exec(&mut h, "slideshow.addMusic", json!({"path": "/no/such/song.mp3"}))["ok"], false);
         assert!(h.app.ui.slides.settings.music.tracks.is_empty());
         // JPEG sequence
-        let dir = std::env::temp_dir().join(format!("lcc-slideshow-ui-{}", std::process::id()));
         ok(&mut h, "slideshow.closeSaved", json!({}));
         ok(&mut h, "slideshow.set", json!({"usePhotos": "selected"}));
         let first = h.app.session.visible_cloned()[0].0;

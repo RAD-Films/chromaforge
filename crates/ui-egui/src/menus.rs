@@ -83,6 +83,13 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("view.squareGrid", "Square Grid", None, "View>Grid View Style"),
     // G: Photo Grid ↔ Square Grid (from other views: the photo grid)
     ("view.gridToggle", "Grid", Some("G"), ""),
+    // View ▸ Toggle Loupe View: the large view of the active photo <-> the grid style chosen last
+    ("view.loupeToggle", "Toggle Loupe View", None, "View"),
+    // Library ▸ New Folder… / Synchronize Folder…: act on the folder chosen in the Folders panel
+    ("dialog.newDiskFolder", "New Folder…", None, "Library"),
+    ("dialog.synchronizeFolder", "Synchronize Folder…", None, "Library"),
+    // File ▸ Page Setup…: the Print module with its paper choice open
+    ("dialog.pageSetup", "Page Setup…", None, "File"),
     ("library.selectOnlyActive", "Select Only Active Photo", Some("Cmd+Shift+D"), "Edit"),
     ("tool.guidedUpright", "Guided Upright", Some("Shift+G"), "Window>Tools"),
     ("view.detail", "Detail View", Some("D"), "View"),
@@ -91,6 +98,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("view.eyeFocus", "Eye Focus Strip", None, "View>Loupe Info"),
     ("view.people", "People", None, "View"),
     ("view.person", "Show Person", None, ""),
+    ("people.category", "Face Category", None, ""),
     ("view.faceBoxes", "Face Boxes", None, "View>Loupe Info"),
     ("view.focusPoint", "Show Focus Point", Some("Alt+F"), "View>Loupe Info"),
     ("view.zoomToFocus", "Zoom to Focus Point", None, "View>Loupe Info"),
@@ -101,7 +109,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("compare.set", "Show in Compare", None, ""),
     ("compare.makeSelect", "Make Candidate the Select", None, "View"),
     ("view.autoAdvance", "Auto Advance", None, "Photo"),
-    ("view.filmstrip", "Filmstrip", Some("/"), "Window>Panels"),
+    // F6 (Classic's key, `shortcuts::ALIASES`); `/` is Deselect Active Photo
+    ("view.filmstrip", "Filmstrip", None, "Window>Panels"),
     ("view.leftPanel", "My Photos Panel", Some("Cmd+Shift+L"), "Window>Panels"),
     ("view.rightPanel", "Right Panel", None, "Window>Panels"),
     ("view.beforeAfter", "Compare Before and After", Some("Y"), "View>Before/After"),
@@ -157,6 +166,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("crop.lockAspect", "Lock Aspect Ratio", Some("A"), ""),
     ("view.cropOverlay", "Cycle Crop Overlay", Some("Shift+O"), "View>Tool Overlay"),
     ("view.cropOverlayOrientation", "Cycle Crop Overlay Orientation", None, "View>Tool Overlay"),
+    ("dialog.cropOverlays", "Choose Overlays to Cycle…", None, ""),
+    ("dialog.bookPreferences", "Book Preferences…", None, ""),
+    // {overlays: [guide names]}: which crop guides Cycle Crop Overlay visits (at least one)
+    ("view.cropOverlays", "Set Crop Overlays to Cycle", None, ""),
     ("view.cropMaskOpacity", "Crop Mask Opacity", None, ""),
     ("photo.rate0", "Clear Rating", Some("0"), ""),
     ("photo.rate1", "Rate ★", Some("1"), ""),
@@ -175,9 +188,14 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("local.hide", "Remove from Favorites", None, ""),
     ("local.restoreHidden", "Show Hidden Favorites", None, ""),
     ("view.fullScreenPreview", "Full Screen Preview", Some("F"), "Window>Screen Mode"),
-    ("view.enterFullScreen", "Enter Full Screen", Some("Cmd+Shift+F"), "Window>Screen Mode"),
+    // Cmd+Shift+F is the Advanced Search (issue #846); full screen is F11, or Cmd+Ctrl+F as the
+    // macOS system key (the aliases below)
+    ("view.enterFullScreen", "Enter Full Screen", None, "Window>Screen Mode"),
     ("view.infoOverlay", "Cycle Info Overlay", Some("Cmd+I"), "View>Loupe Info"),
     ("view.shotInfo", "Shot Info", Some("Shift+I"), "View>Loupe Info"),
+    ("view.lockZoomPosition", "Lock Zoom Position", Some("Cmd+Shift+="), "View>Zoom"),
+    ("view.scrollByRow", "Scroll By Row", None, "View>Grid View Style"),
+    ("view.mirrorImage", "Enable Mirror Image Mode", None, "View"),
     ("view.viewOptions", "View Options…", None, "View>Loupe Info"),
     ("view.chooseLayoutImage", "Choose Layout Image…", None, "View"),
     ("view.layoutImage", "Layout Image", Some("Cmd+Alt+O"), "View"),
@@ -220,16 +238,22 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("tool.radial", "Radial Gradient", Some("R"), "Window>Tools"),
     ("tool.wbPicker", "White Balance Selector", Some("W"), "Window>Tools"),
     ("tool.object", "Object Selection", None, "Window>Tools"),
-    // Tools ▸ Create New Mask in Develop: what the Masking panel's tiles do (Classic keys: Shift+J; Shift+Q stays
-    // `spot.cycleMode`'s module key). People opens its picker, Color Range waits for a click on the photo.
+    // Tools > Fringe Color Selector: arms the eyedropper; a click points Defringe at the colour under it
+    ("tool.fringe", "Fringe Color Selector", None, ""),
+    // Tools ▸ Create New Mask in Develop: what the Masking panel's tiles do (Classic keys: Shift+J; Shift+Q is Luminance Range;
+    // `spot.cycleMode` is Alt+Shift+Q). People opens its picker, Color Range waits for a click on the photo.
     ("tool.people", "Select People", None, ""),
     ("tool.colorRange", "Color Range", None, ""),
     ("tool.luminanceRange", "Luminance Range", None, ""),
+    // a Depth Range mask (needs the Depth Anything model: without it Settings ▸ AI Models opens)
+    ("tool.depthRange", "Depth Range", None, ""),
     // Color Mixer ▸ Point Color with its picker armed
     ("tool.pointColor", "Point Color Selector", None, ""),
     // Remove Options ▸ Use Generative AI: the Remove tool's Generative mode on / off ({on?}; no params toggles); with no
     // service set up it opens Settings ▸ Generative Fill instead
     ("remove.useGenerative", "Use Generative AI", None, ""),
+    // Remove Options ▸ Detect Objects: a Remove stroke picks the object under it ({on?}; no params toggles)
+    ("remove.detectObjects", "Detect Objects", None, ""),
     ("tool.none", "No Tool", None, ""),
     ("tool.tat", "Targeted Adjustment", None, ""),
     ("mask.startComponent", "Combine Mask with", None, ""),
@@ -312,7 +336,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("dialog.updatePreset", "Update Preset with Current Settings…", None, ""),
     ("dialog.pasteSettings", "Paste Selected Settings…", Some("Cmd+Shift+V"), "Photo>Develop Settings"),
     ("dialog.syncSettings", "Sync Settings…", Some("Cmd+Shift+S"), "Photo>Develop Settings"),
+    ("dialog.syncCopies", "Sync Copies…", None, ""),
+    ("dialog.syncSnapshots", "Sync Snapshots…", None, ""),
     ("view.focusSearch", "Find…", Some("Cmd+F"), "Library"),
+    ("dialog.advancedSearch", "Advanced Search…", Some("Cmd+Shift+F"), "Library"),
     ("dialog.import", "Import…", Some("Cmd+Shift+I"), "File"),
     ("file.export", "Export…", None, "File"),
     ("dialog.export", "Export Dialog…", None, ""),
@@ -360,6 +387,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     // Android: the photos in DCIM/Camera, through the media store (Settings ▸ Folders)
     ("file.addCameraRoll", "Import Camera Roll…", None, ""),
     ("file.findMissing", "Find Missing Photos…", None, "Library"),
+    ("library.validateDng", "Validate DNG Files", None, ""),
     ("file.backupLibrary", "Back Up Catalog…", None, "File>Libraries"),
     ("file.restoreLibrary", "Restore Catalog from Backup…", None, "File>Libraries"),
     ("photo.locate", "Locate Missing File…", None, ""),
@@ -386,8 +414,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("file.exportCurvePresets", "Export Point Curve Presets…", None, ""),
     ("dialog.watermark", "Edit Watermarks…", None, "Edit"),
     ("app.settings", "Settings…", Some("Cmd+,"), "Edit"),
+    ("app.autoImportToggle", "Enable Auto Import", None, "File>Auto Import"),
     ("app.newLibrary", "New Catalog…", None, "File>Libraries"),
     ("app.openLibrary", "Open Catalog…", Some("Cmd+O"), "File>Libraries"),
+    ("app.renameLibrary", "Rename Catalog…", None, "File>Libraries"),
     // libraries (crate::catalog_ui; the ids keep their older catalog name)
     ("catalog.new", "New Catalog…", None, ""),
     ("catalog.open", "Open Catalog…", None, ""),
@@ -437,6 +467,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("dialog.rename", "Rename Photos…", Some("F2"), "Library"),
     ("dialog.labelNames", "Edit Color Label Names…", None, ""),
     ("dialog.captureTime", "Edit Capture Time…", None, "Metadata"),
+    ("metadata.targetOnly", "Show Metadata for Target Photo Only", None, "Metadata"),
     ("photo.tagFromTracklog", "Auto-Tag from Tracklog…", None, "Metadata"),
     ("app.exportPrevious", "Export with Previous", Some("Cmd+Alt+Shift+E"), "File"),
     // control surfaces (`surface`): what their keys run, and their settings for agents
@@ -490,8 +521,7 @@ fn panel(app: &mut LccApp, ctx: &egui::Context, p: RightPanel, name: &str) {
         app.ui.toggle_return = Some((p, before));
         app.ui.right = p;
         app.ui.note_right();
-        // one panel at a time on the right: a tool takes Presets' place, and unfolds the side
-        app.ui.presets = false;
+        // opening a panel unfolds the side
         app.ui.right_collapsed = false;
         // opening a panel brings its edge back (F8 / Tab hid it)
         app.ui.right_edge = true;
@@ -501,11 +531,11 @@ fn panel(app: &mut LccApp, ctx: &egui::Context, p: RightPanel, name: &str) {
             app.ui.view = ViewMode::Detail;
         }
     }
-    if p != RightPanel::Masking && app.ui.tool != "wbPicker" {
+    if p != RightPanel::Masking && !matches!(app.ui.tool.as_str(), "wbPicker" | "fringe") {
         app.ui.tool.clear();
     }
     // an Edit panel picker doesn't follow into Masking, where it would claim the photo's clicks
-    if app.ui.right == RightPanel::Masking && (app.ui.tool.starts_with("tat:") || app.ui.tool == "pointColor") {
+    if app.ui.right == RightPanel::Masking && (app.ui.tool.starts_with("tat:") || matches!(app.ui.tool.as_str(), "pointColor" | "fringe")) {
         app.ui.tool.clear();
     }
     app.end_midi_interaction();
@@ -801,11 +831,13 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(json!({"on": on, "where": if app.importing() { "import" } else { "library" }}))
         }
         "view.photoGrid" => {
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::PhotoGrid;
             app.ui.grid_style = ViewMode::PhotoGrid;
             Ok(Value::Null)
         }
         "view.squareGrid" => {
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::SquareGrid;
             app.ui.grid_style = ViewMode::SquareGrid;
             Ok(Value::Null)
@@ -898,22 +930,83 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             let Some(active) = app.session.active() else { return Some(Err("no active photo".into())) };
             app.run("library.select", json!({"ids": [active.0], "active": active.0}))
         }
+        "view.loupeToggle" => {
+            app.leave_fullscreen_preview();
+            if app.ui.module == crate::module::ModuleId::Library && app.ui.view == ViewMode::Detail {
+                app.ui.view = if app.ui.grid_style.is_grid() { app.ui.grid_style } else { ViewMode::PhotoGrid };
+                Ok(Value::Null)
+            } else {
+                app.run("view.loupe", json!({}))
+            }
+        }
+        "dialog.newDiskFolder" => {
+            let path = match chosen_library_folder(app) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            app.ui.dialog = Some(Dialog::TextPrompt {
+                title: crate::i18n::tr_format!("New Folder in “{name}”", name = lcc_catalog::folders::folder_label(&path)),
+                hint: "Folder name (created on disk)".into(),
+                value: String::new(),
+                command: "folder.create".into(),
+                params: json!({"parent": path}),
+                key: "name".into(),
+            });
+            Ok(Value::Null)
+        }
+        "dialog.synchronizeFolder" => {
+            let path = match chosen_library_folder(app) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            let tree = app.caches.folder_tree(&app.session.catalog);
+            match crate::panels::left::library_node_for(&tree, &path) {
+                // a disk, or a folder holding disks, is synchronized as such
+                Some((n, name)) => crate::sync::open(app, &n.path, &name, n.volume || !n.selectable).map(|()| Value::Null),
+                None => Err("No photo in this folder is in the catalog yet".into()),
+            }
+        }
+        "dialog.pageSetup" => {
+            if app.ui.module != crate::module::ModuleId::Print
+                && let Err(e) = app.run("module.print", json!({}))
+            {
+                return Some(Err(e));
+            }
+            app.ui.right_collapsed = false;
+            app.ui.right_edge = true;
+            // the paper choice opens on the next frame
+            app.print.open_paper = true;
+            Ok(Value::Null)
+        }
         "view.gridToggle" => {
             // G between the two grids; from a photo view it comes back to the grid style the user
             // chose last (#794), not always to Photo Grid
-            app.ui.view = if app.ui.view.is_grid() {
-                if app.ui.view == ViewMode::PhotoGrid { ViewMode::SquareGrid } else { ViewMode::PhotoGrid }
+            if app.ui.fullscreen {
+                // the full-screen preview sits over a view that is usually a grid already: G asks
+                // for the grid the user chose, not a flip between the two grid styles
+                app.leave_fullscreen_preview();
+                app.ui.view = app.ui.grid_style;
             } else {
-                app.ui.grid_style
-            };
-            app.ui.grid_style = app.ui.view;
+                app.ui.view = if app.ui.view.is_grid() {
+                    if app.ui.view == ViewMode::PhotoGrid { ViewMode::SquareGrid } else { ViewMode::PhotoGrid }
+                } else {
+                    app.ui.grid_style
+                };
+                app.ui.grid_style = app.ui.view;
+            }
             Ok(Value::Null)
         }
         "view.detail" => {
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::Detail;
             Ok(Value::Null)
         }
         "view.compare" => crate::panels::compare::enter_compare(app),
+        "metadata.targetOnly" => {
+            // {on?}; no params toggles. The Metadata panel shows and edits the active photo alone.
+            app.ui.settings.metadata_target_only = p.get("on").and_then(Value::as_bool).unwrap_or(!app.ui.settings.metadata_target_only);
+            Ok(json!({"on": app.ui.settings.metadata_target_only}))
+        }
         "view.focusPoint" => {
             // {on?}; no params toggles. The camera's focus point (Sony, from the file) over the photo.
             app.ui.settings.focus_point = p.get("on").and_then(Value::as_bool).unwrap_or(!app.ui.settings.focus_point);
@@ -945,6 +1038,7 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         }
         "view.people" => {
             // Everyone; the page just left stays one click away (the chip next to the title)
+            app.leave_fullscreen_preview();
             if let Some(name) = app.ui.person_page.take() {
                 app.ui.last_person = Some(name);
             }
@@ -954,17 +1048,30 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             app.ui.people_search.clear();
             Ok(json!({"people": app.session.catalog.people().len()}))
         }
+        "people.category" => {
+            // {category}: which of the People view's three categories is on screen (issue #1050), for a control surface
+            // or a script (a person's page is left: a category shows everyone)
+            let Some(category) = p.get("category").and_then(Value::as_str).and_then(crate::state::PeopleCategory::parse) else {
+                return Some(Err("people.category: `category` must be unknown, suggested or confirmed".into()));
+            };
+            app.ui.view = ViewMode::People;
+            app.ui.person_page = None;
+            app.ui.people_category = category;
+            Ok(json!({"category": category.id()}))
+        }
         "view.person" => {
             // {name}: one person's page in the People view: their faces, and the faces that look like them
             let Some(name) = p.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()) else {
                 return Some(Err("view.person: missing `name`".into()));
             };
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::People;
             app.ui.person_from = None;
             app.ui.person_page = Some(name.to_string());
             Ok(json!({"person": name}))
         }
         "view.survey" => {
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::Survey;
             Ok(json!({"photos": crate::panels::compare::survey_photos(app).len()}))
         }
@@ -987,6 +1094,7 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             {
                 let _ = app.session.execute("library.select", &json!({"ids": [next.0]}));
             }
+            app.leave_fullscreen_preview();
             app.ui.view = ViewMode::Reference;
             Ok(json!({"reference": r, "active": app.session.active().map(|a| a.0)}))
         }
@@ -1238,10 +1346,12 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                     }
                 },
             };
-            // without a tab, the section shown last (else General)
+            // without a tab, the section shown last (else General); `page` names the category as
+            // `tab` does, whichever way Settings lists its categories (left, top, the sheet's rail)
             let last = app.ui.settings.settings_tab.clone();
             let last = if crate::settings_screen::known(&last) { last.as_str() } else { "general" };
-            let tab = section_tab.or_else(|| p.get("tab").and_then(Value::as_str)).unwrap_or(last);
+            let asked = p.get("tab").or_else(|| p.get("page")).and_then(Value::as_str);
+            let tab = section_tab.or(asked).unwrap_or(last);
             if !crate::panels::settings::TABS.iter().any(|(id, _)| *id == tab) && !crate::settings_screen::known(tab) {
                 let tabs: Vec<&str> = crate::panels::settings::TABS.iter().map(|(id, _)| *id).collect();
                 return Some(Err(format!("unknown settings tab `{tab}` ({})", tabs.join("|"))));
@@ -1250,8 +1360,17 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             app.ui.settings_section = section.map(str::to_string);
             Ok(json!({"tab": tab, "section": section}))
         }
+        "app.autoImportToggle" => {
+            // {on?}: switch watching the folder on or off (kept when off); with no folder yet, Settings opens at it
+            let on = p.get("on").and_then(Value::as_bool).unwrap_or(app.session.import_defaults.auto_active_folder().is_none());
+            if on && app.session.import_defaults.auto_folder.is_none() {
+                return run_ui_command(app, "app.settings", &json!({"section": "autoImport"}));
+            }
+            app.session.execute("library.autoImport", &json!({"enabled": on})).map_err(|e| e.to_string())
+        }
         "app.openLibrary" => crate::panels::settings::open_library(app, p),
         "app.newLibrary" => crate::panels::settings::new_library(app, p),
+        "app.renameLibrary" => crate::panels::settings::rename_library(app, p),
         "app.recentLibraries" => crate::panels::settings::recent_libraries(app, p),
         "app.clearRecentLibraries" => crate::panels::settings::recent_libraries(app, &json!({"clear": true})),
         "app.displayProfile" => crate::panels::settings::display_profile(app, p),
@@ -1269,6 +1388,16 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         "view.filmstrip" => {
             app.ui.filmstrip = !app.ui.filmstrip;
             Ok(Value::Null)
+        }
+        "view.lockZoomPosition" | "view.scrollByRow" | "view.mirrorImage" => {
+            // {on?: bool} (toggles when omitted) → {on}: view-only switches (`crate::view_state`)
+            let flag = match id {
+                "view.lockZoomPosition" => &mut app.ui.settings.lock_zoom,
+                "view.scrollByRow" => &mut app.ui.settings.scroll_by_row,
+                _ => &mut app.ui.settings.mirror_image,
+            };
+            *flag = p.get("on").and_then(Value::as_bool).unwrap_or(!*flag);
+            Ok(json!({"on": *flag}))
         }
         "view.shotInfo" => {
             // {on?: bool} (toggles when omitted): the line of shot info under the loupe's photo
@@ -1289,15 +1418,16 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             // (`right_collapsed`; the panel that was open comes back). Develop with no panel open
             // opens Edit. In Library, `right == None` is its Classic column, not a hidden panel.
             let develop = app.ui.module == crate::module::ModuleId::Develop;
-            if develop && app.ui.right == RightPanel::None && !app.ui.presets {
+            if develop && app.ui.right == RightPanel::None {
                 app.ui.right_collapsed = false;
+                app.ui.right_edge = true;
                 app.ui.right = RightPanel::Edit;
                 if !matches!(app.ui.view, ViewMode::Detail) {
                     app.ui.view = ViewMode::Detail;
                 }
             } else {
-                app.ui.right_collapsed = !app.ui.right_collapsed;
-                if app.ui.right_collapsed && app.ui.right.is_edit_tool() && app.ui.tool != "wbPicker" {
+                crate::module::toggle_right(app);
+                if app.ui.right_collapsed && app.ui.right.is_edit_tool() && !matches!(app.ui.tool.as_str(), "wbPicker" | "fringe") {
                     // hiding a tool ends it, as closing its panel does
                     app.ui.tool.clear();
                     let _ = app.session.end_interaction();
@@ -1555,12 +1685,17 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         "view.maskOverlay" => {
             if let Some(auto) = p.get("auto").and_then(Value::as_bool) {
                 app.ui.mask_overlay_auto = auto;
+                if !auto {
+                    app.ui.mask_peek_until = None;
+                }
             }
             // O always turns off whatever overlay shows, All Mask Overlays included: one key to know
             let toggle = p.get("auto").is_none().then_some(!(app.ui.mask_overlay || app.ui.mask_overlay_all));
             if let Some(show) = p.get("show").and_then(Value::as_bool).or(toggle) {
                 app.ui.mask_overlay = show;
                 app.ui.mask_overlay_pinned = show;
+                // an explicit O / checkbox overrides a picked mask's peek (issue #1109)
+                app.ui.mask_peek_until = None;
                 if !show {
                     app.ui.mask_overlay_all = false;
                 }
@@ -1687,17 +1822,38 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         // A under the Crop panel: the aspect lock (the panel's button runs the same toggle)
         "crop.lockAspect" => app.run("crop.aspect", json!({"aspect": "toggle"})),
         "view.cropOverlay" => {
-            use crate::state::CropOverlay::*;
-            app.ui.crop_overlay = match app.ui.crop_overlay {
-                Thirds => Grid,
-                Grid => Golden,
-                Golden => Diagonal,
-                Diagonal => Triangle,
-                Triangle => Spiral,
-                Spiral => None,
-                None => Thirds,
-            };
+            app.ui.crop_overlay = app.ui.crop_overlay.next_in(&app.ui.crop_overlay_cycle);
             Ok(json!({"overlay": app.ui.crop_overlay}))
+        }
+        "dialog.bookPreferences" => {
+            app.ui.dialog = Some(Dialog::BookPrefs { prefs: app.ui.book_prefs });
+            Ok(Value::Null)
+        }
+        "dialog.cropOverlays" => {
+            app.ui.dialog = Some(Dialog::CropOverlays { picked: app.ui.crop_overlay_cycle.clone() });
+            Ok(Value::Null)
+        }
+        // {overlays: ["thirds", "grid", "golden", "diagonal", "triangle", "spiral", "none"]}: the guides
+        // Cycle Crop Overlay visits; at least one must stay
+        "view.cropOverlays" => {
+            use crate::state::CropOverlay;
+            let Some(names) = p.get("overlays").and_then(Value::as_array) else {
+                return Some(Err("view.cropOverlays: missing overlays (a list of guide names)".into()));
+            };
+            let mut picked: Vec<CropOverlay> = Vec::new();
+            for n in names {
+                let Ok(o) = serde_json::from_value::<CropOverlay>(n.clone()) else {
+                    return Some(Err(format!("view.cropOverlays: unknown overlay {n}")));
+                };
+                if !picked.contains(&o) {
+                    picked.push(o);
+                }
+            }
+            if picked.is_empty() {
+                return Some(Err("view.cropOverlays: at least one overlay must stay ticked".into()));
+            }
+            app.ui.crop_overlay_cycle = CropOverlay::ALL.into_iter().filter(|o| picked.contains(o)).collect();
+            Ok(json!({"overlays": app.ui.crop_overlay_cycle}))
         }
         "view.cropMaskOpacity" => {
             let level = p
@@ -1845,15 +2001,14 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(Value::Null)
         }
         "panel.presets" => {
-            app.ui.presets = !app.ui.presets || !crate::docking::exposed(app, crate::docking::Panel::Presets) || app.ui.right_collapsed;
-            if app.ui.presets {
-                app.ui.right_collapsed = false;
-                app.ui.right_edge = true;
+            // the presets are a panel of Develop's left column, never a column of their own beside
+            // (or in place of) the Edit panels: the command shows that panel, or folds it
+            if crate::panels::presets::shown(app) {
+                crate::panels::presets::set_shown(app, false);
+                Ok(Value::Null)
+            } else {
+                crate::panels::presets::reveal(app).map(|()| Value::Null)
             }
-            if app.ui.presets && app.ui.view != ViewMode::Detail {
-                app.ui.view = ViewMode::Detail;
-            }
-            Ok(Value::Null)
         }
         "mask.editComponent" => crate::panels::masking::edit_component(app, p),
         "tool.done" => {
@@ -1874,11 +2029,10 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         "view.colorMixer" => color_mixer_layout(app, p),
         "panel.close" => {
             app.ui.right = RightPanel::None;
-            app.ui.presets = false;
             Ok(Value::Null)
         }
         "panel.collapseRight" => {
-            app.ui.right_collapsed = !app.ui.right_collapsed;
+            crate::module::toggle_right(app);
             Ok(Value::Null)
         }
         s if s.starts_with("section.") => bool_param(s, p, "solo").and_then(|solo| {
@@ -2000,7 +2154,13 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                         app.ui.wb_sample = crate::panels::detail::wb_sample_step(n);
                     }
                 }
-                "people" | "colorRange" | "luminanceRange" => {
+                "fringe" if app.ui.tool == "fringe" => app.ui.tool.clear(),
+                "fringe" => {
+                    app.ui.right = RightPanel::Edit;
+                    app.ui.view = ViewMode::Detail;
+                    app.ui.tool = "fringe".into();
+                }
+                "people" | "colorRange" | "luminanceRange" | "depthRange" => {
                     if app.session.active().is_none() {
                         return Some(Err(format!("tool.{tool}: no photo")));
                     }
@@ -2037,6 +2197,7 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(Value::Null)
         }
         "remove.useGenerative" => crate::panels::genfill::use_generative(app, p),
+        "remove.detectObjects" => crate::panels::genfill::detect_objects(app, p),
         "dialog.cameraProfile" => crate::chart_profile::open(app),
         "cameraProfile.second" => crate::chart_profile::choose_second(app, p),
         "cameraProfile.removeSecond" => crate::chart_profile::remove_second(app),
@@ -2123,8 +2284,15 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                 .map(|d| d.replace('T', " "))
                 .unwrap_or_default();
             let mode = p.get("mode").and_then(Value::as_str).unwrap_or("set").to_string();
-            app.ui.dialog =
-                Some(Dialog::CaptureTime { mode, time: time.get(..19).unwrap_or(&time).to_string(), days: 0, hours: 0, minutes: 0, zone: 0.0 });
+            app.ui.dialog = Some(Dialog::CaptureTime {
+                mode,
+                time: time.get(..19).unwrap_or(&time).to_string(),
+                days: 0,
+                hours: 0,
+                minutes: 0,
+                zone: 0.0,
+                each: false,
+            });
             Ok(Value::Null)
         }
         "dialog.keywordSet" => {
@@ -2211,10 +2379,22 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             app.ui.focus_search = true;
             Ok(Value::Null)
         }
+        "dialog.advancedSearch" => {
+            app.ui.dialog = Some(Dialog::AdvancedSearch { search: Default::default() });
+            Ok(Value::Null)
+        }
         "dialog.syncSettings" => {
             let groups = app.session.dialogs.copy.to_ids();
             let _ = groups;
             app.ui.dialog = Some(Dialog::SyncSettings { groups: app.session.dialogs.sync.to_ids(), controls: Vec::new() });
+            Ok(Value::Null)
+        }
+        "dialog.syncCopies" => {
+            app.ui.dialog = Some(Dialog::SyncCopies { groups: app.session.dialogs.sync.to_ids() });
+            Ok(Value::Null)
+        }
+        "dialog.syncSnapshots" => {
+            app.ui.dialog = Some(Dialog::SyncSnapshots { groups: app.session.dialogs.sync.to_ids() });
             Ok(Value::Null)
         }
         "dialog.copySettings" => {
@@ -2398,6 +2578,8 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             app.ui.dialog = Some(Dialog::Cull {
                 reject_below: 0.0,
                 pick_best: true,
+                suggest_stars: true,
+                suggest_flags: false,
                 burst_gap,
                 similarity,
                 closed_eyes: false,
@@ -2671,6 +2853,58 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                 };
             }
             Ok(json!({"background": true}))
+        }
+        "library.validateDng" => {
+            // Library ▸ Validate DNG Files: the selection's DNGs have their raw-image digest recomputed on a worker
+            // thread (cancel from the activity row); the answer is a dialog listing the damaged and unverifiable files
+            const LABEL: &str = "Validate DNG Files";
+            let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            if app.tasks.is_running(LABEL) {
+                return Some(Err("Validate DNG Files is already running".into()));
+            }
+            let ids = match app.session.targets(p) {
+                Ok(ids) => ids,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            let targets = lcc_engine::dng_validate::dng_targets(&app.session, &ids);
+            if targets.is_empty() {
+                return Some(Err("Validate DNG Files: no DNG files in the selection".into()));
+            }
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
+            let total = targets.len() as u64;
+            let work = move |task: lcc_engine::activity::TaskHandle| {
+                task.progress(0, total);
+                lcc_engine::dng_validate::validate(&targets, &worker_cancel, &|done| task.progress(done as u64, total))
+            };
+            let done = |app: &mut LccApp, _ctx: &egui::Context, r: lcc_engine::dng_validate::DngReport| {
+                let summary = crate::i18n::tr_format!(
+                    "Checked {checked} of {total} DNG files: {intact} intact, {damaged} damaged, {unverifiable} could not be verified",
+                    checked = r.checked,
+                    total = r.total,
+                    intact = r.intact,
+                    damaged = r.damaged.len(),
+                    unverifiable = r.unverifiable.len()
+                );
+                let lines = |v: &[(String, String)]| v.iter().map(|(name, why)| format!("{name}: {why}")).collect::<Vec<_>>();
+                app.ui.last_dng_validation = Some(r.to_json());
+                app.ui.dialog = Some(Dialog::DngValidation { summary, damaged: lines(&r.damaged), unverifiable: lines(&r.unverifiable) });
+            };
+            app.ui.last_dng_validation = None;
+            if let Err(e) = crate::tasks::spawn_tracked(app, LABEL, "validateDng", cancel, work, done) {
+                return Some(Err(e));
+            }
+            if wait {
+                let ctx = app.tasks.repaint.clone().unwrap_or_default();
+                if !crate::tasks::wait_for(app, &ctx, LABEL, std::time::Duration::from_secs(600)) {
+                    return Some(Err("Validate DNG Files: still running (it continues in the background)".into()));
+                }
+                return match app.ui.last_dng_validation.clone() {
+                    Some(v) => Some(Ok(v)),
+                    None => Some(Err("Validate DNG Files: worker terminated unexpectedly".into())),
+                };
+            }
+            Ok(json!({"background": true, "total": total}))
         }
         "photo.tagFromTracklog" => {
             // a GPX file → GPS for the selected photos by capture time (one undo step)
@@ -2961,13 +3195,13 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                     }
                     parts.push(msg);
                 }
-                // Show the new presets: Develop's left column already lists them when it is shown,
-                // so they stay there, unfolded (issue #469); otherwise the presets column opens.
-                let in_left_column = app.ui.module == crate::module::ModuleId::Develop && crate::module::edge_visible(app, crate::module::Edge::Left);
-                if n > 0 && in_left_column {
-                    crate::panels::classic::set_open_with_key(app, crate::module::PanelId::Presets, crate::panels::presets::IN_COLUMN_KEY, true);
-                } else if n > 0 {
-                    app.ui.presets = true;
+                // Show the new presets where they live, in Develop's left column, unfolded (issue
+                // #469). Outside Develop the screen is left as it is: the panel is unfolded where
+                // it lives for Develop's next visit, and the toast says what came in (issue #875).
+                if n > 0 && app.ui.module == crate::module::ModuleId::Develop {
+                    let _ = crate::panels::presets::reveal(app);
+                } else if n > 0 && !crate::panels::presets::shown(app) {
+                    crate::panels::presets::set_shown(app, true);
                 }
             }
             let mut msg = parts.join(" · ");
@@ -3299,6 +3533,7 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         }
         "app.export" => crate::control::export_active(app, p),
         "photo.renderToDng" => return crate::render_dng_task::start(app, p),
+        "photo.updateDngPreview" => return crate::dng_update_task::start(app, p),
         "app.showInFinder" => show_in_finder(app),
         "app.showInFolders" => show_in_folders(app, p.get("id").and_then(Value::as_u64).map(lcc_catalog::PhotoId)),
         "app.openLogFolder" => open_log_folder(app),
@@ -3315,6 +3550,14 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
     Some(r)
 }
 
+/// The library folder the grid shows (chosen in the Folders panel), for the Library menu's folder items.
+fn chosen_library_folder(app: &LccApp) -> Result<String, String> {
+    match (&app.session.source, &app.session.library_folder) {
+        (lcc_engine::LibrarySource::LibraryFolder, Some(p)) if !p.trim().is_empty() => Ok(p.clone()),
+        _ => Err("Choose a folder in the Folders panel first".into()),
+    }
+}
+
 /// Views whose bottom bar has the thumbnail-size slider and that draw tiles of that size.
 fn thumb_size_view(app: &LccApp) -> bool {
     matches!(app.ui.view, ViewMode::PhotoGrid | ViewMode::SquareGrid | ViewMode::People)
@@ -3329,6 +3572,8 @@ pub fn ui_enabled(app: &LccApp, id: &str) -> bool {
     }
     match id {
         "library.selectOnlyActive" => app.session.active().is_some(),
+        "view.loupeToggle" => app.session.active().is_some() || app.ui.view == ViewMode::Detail,
+        "dialog.newDiskFolder" | "dialog.synchronizeFolder" => chosen_library_folder(app).is_ok(),
         "view.thumbSizeUp" | "view.thumbSizeDown" => thumb_size_view(app),
         "dialog.contactSheet" | "app.contactSheet" | "dialog.print" | "app.print" => {
             !cfg!(target_arch = "wasm32") && app.session.active().is_some() && app.export.is_none()
@@ -3336,7 +3581,12 @@ pub fn ui_enabled(app: &LccApp, id: &str) -> bool {
         "dialog.slideshowExport" | "app.slideshowExport" => {
             !cfg!(target_arch = "wasm32") && !app.session.slideshow_export.as_ref().is_some_and(|r| r.running())
         }
-        s if s.starts_with("panel.") || s.starts_with("tool.") || s == "remove.useGenerative" || s.starts_with("section.") => {
+        s if s.starts_with("panel.")
+            || s.starts_with("tool.")
+            || s == "remove.useGenerative"
+            || s == "remove.detectObjects"
+            || s.starts_with("section.") =>
+        {
             app.session.active().is_some() || s == "panel.close"
         }
         "app.export" | "dialog.export" | "file.export" | "dialog.createPreset" | "dialog.rename" | "dialog.captureTime" | "dialog.copySettings" => {
@@ -3354,6 +3604,11 @@ pub fn ui_enabled(app: &LccApp, id: &str) -> bool {
         "dialog.updatePreset" => app.session.active().is_some(),
         "mask.startComponent" => app.session.active().is_some() && app.session.active_mask.is_some(),
         "dialog.syncSettings" => app.session.active().is_some() && app.session.selection.ids.len() > 1,
+        "dialog.syncCopies" => app.session.active().is_some_and(|id| {
+            let master = app.session.catalog.photo(id).map(|p| p.copy_of.unwrap_or(p.id));
+            master.is_some_and(|m| app.session.catalog.photos().any(|p| !p.deleted && p.id != id && (p.id == m || p.copy_of == Some(m))))
+        }),
+        "dialog.syncSnapshots" => app.session.active().and_then(|id| app.session.catalog.photo(id)).is_some_and(|p| !p.versions.is_empty()),
         "photo.openOriginalInExternal" => {
             // only a file type the app reads can be handed over (#2135); the extension alone
             // decides, so no disk or share is touched while a menu is drawn
@@ -3394,6 +3649,7 @@ pub fn ui_enabled(app: &LccApp, id: &str) -> bool {
         "view.compare" => app.session.catalog.len() > 1,
         "view.fullScreenPreview" | "view.infoOverlay" | "view.navigator" => app.session.active().is_some() || app.ui.fullscreen,
         "app.openLibrary" | "app.newLibrary" => app.services.pick_folder.is_some() && crate::panels::settings::can_switch_library(app).is_ok(),
+        "app.renameLibrary" => app.session.library.as_ref().is_some_and(|l| l.on_disk) && crate::panels::settings::can_switch_library(app).is_ok(),
         "dialog.import" => !crate::lightroom_import::is_running(app),
         "file.addFolder" => (app.services.pick_folder.is_some() || app.services.picker.is_some()) && !crate::lightroom_import::is_running(app),
         "file.backupLibrary" => app.services.backup_library.is_some(),
