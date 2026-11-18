@@ -6,4 +6,5 @@ mod hl_clipped_sky;
 mod preview_save;
 mod process_v1_v8_golden;
 mod process_v8_golden;
+mod process_v9_golden;
 mod tone_lift_process;
