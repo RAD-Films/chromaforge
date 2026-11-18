@@ -39,6 +39,62 @@ fn import_from_lists_the_drives_as_folder_trees() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Issue #1234, deeper in the tree: the arrows of folders inside a drive (a shoot, its day) only open
+/// and close their subfolder lists. None of them changes the source or starts reading a folder; the
+/// folder's name then loads its photos.
+#[test]
+fn import_subfolder_arrows_only_expand_and_start_no_scan() {
+    let _drive = DRIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = LccApp::new(lcc_engine::Session::new().with_fs(), crate::Services { png: None, ..Default::default() });
+    app.ui.view = ViewMode::PhotoGrid;
+    let mut h = Headless::new(app, [1400.0, 900.0], 1.0);
+    h.settle(T);
+    let r = h.request("engine.execute", json!({"command": "dialog.import", "params": {}}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    let root = crate::import_tab::test_drive();
+    let (shoot, day) = (root.join("Shoot"), root.join("Shoot").join("Day 1"));
+    std::fs::create_dir_all(day.join("Card")).unwrap();
+    let o = lcc_engine::export::ExportOptions { format: lcc_engine::export::ExportFormat::Png, ..Default::default() };
+    let img = lcc_raster::Rgba8::from_fn(24, 16, |x, y| [(x * 9) as u8, (y * 12) as u8, 77, 255]);
+    std::fs::write(day.join("p.png"), lcc_engine::export::encode_image(&img, &o).unwrap()).unwrap();
+    let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+    let rect = |h: &Headless, id: &str| h.app.widgets.iter().find(|(w, _)| w == id).map(|(_, r)| *r);
+    let source_before = h.app.session.source;
+    let untouched = |h: &Headless, what: &str| {
+        assert_eq!(h.app.session.browse, None, "{what} must not load a folder");
+        assert!(h.app.scan.is_none() && h.app.import.is_none(), "{what} must not start reading a folder");
+        assert_eq!(h.app.session.source, source_before, "{what} must not change the source");
+    };
+    // the drive's arrow, then the shoot's, then the day's: each lists the next level down
+    for (arrow, next) in [(path(&root), path(&shoot)), (path(&shoot), path(&day)), (path(&day), path(&day.join("Card")))] {
+        let arrow = format!("folderToggle:{arrow}");
+        h.step_until(Duration::from_secs(10), |h| rect(h, &arrow).is_some());
+        let Some(at) = rect(&h, &arrow) else { panic!("{arrow}") };
+        press_release_at(&mut h, at.center());
+        let next = format!("source:local:{next}");
+        h.step_until(Duration::from_secs(10), |h| rect(h, &next).is_some());
+        assert!(rect(&h, &next).is_some(), "{arrow} lists {next}");
+        untouched(&h, &arrow);
+    }
+    // the day's arrow closes it again, still loading nothing
+    let card = format!("source:local:{}", path(&day.join("Card")));
+    let Some(at) = rect(&h, &format!("folderToggle:{}", path(&day))) else { panic!("the day's arrow") };
+    press_release_at(&mut h, at.center());
+    h.step_until(Duration::from_secs(10), |h| rect(h, &card).is_none());
+    assert!(rect(&h, &card).is_none(), "the day's arrow closes it");
+    untouched(&h, "closing the day's arrow");
+    // the day's name loads it: its photo is listed
+    let Some(name) = rect(&h, &format!("source:local:{}", path(&day))) else { panic!("the day's row") };
+    press_release_at(&mut h, name.center());
+    h.step_until(Duration::from_secs(10), |h| h.app.session.browse.is_some() && h.app.scan.is_none() && h.app.import.is_none());
+    h.settle(T);
+    let browsed = h.app.session.browse.as_ref().map(|b| std::path::PathBuf::from(&b.path));
+    assert_eq!(browsed.as_deref(), Some(day.as_path()), "the name browses the folder");
+    assert_eq!(h.app.session.source, lcc_engine::LibrarySource::Folder);
+    assert_eq!(h.app.session.visible_cloned().len(), 1, "its photo is listed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Press, a frame, release at `at` with the pointer moved there first: how a mouse (or a finger) comes in.
 fn press_release_at(h: &mut Headless, at: egui::Pos2) {
     let primary = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
