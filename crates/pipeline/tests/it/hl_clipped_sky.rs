@@ -1,4 +1,4 @@
-//! Process V9's raw Highlights − keeps the detail inside bright areas, as Lightroom Classic's does: clouds in a
+//! Process V10's raw Highlights − keeps the detail inside bright areas, as Lightroom Classic's does: clouds in a
 //! bright sky stay well above the sky between them, and a smooth bright gradient keeps rising, with no flat band
 //! and no line where the pull grows steep (`lcc_pipeline::hl_edge`). Lightroom's −100 keeps clouds 11–14 L* above
 //! the sky on our own raws; reading the pull at each pixel's own tone left them 5–7 L* above it on a dark frame,
@@ -35,7 +35,7 @@ fn scene() -> Rgb32f {
 }
 
 fn render_at(highlights: f64) -> Vec<f32> {
-    let s = DevelopSettings { process: Process::V9.version(), light: Light { highlights, ..Light::default() }, ..DevelopSettings::default() };
+    let s = DevelopSettings { process: Process::V10.version(), light: Light { highlights, ..Light::default() }, ..DevelopSettings::default() };
     let info = SourceInfo { raw: true, ..SourceInfo::default() };
     let out = render(&scene(), &info, &s, &RenderRequest::fit(W, H)).image;
     assert_eq!((out.width, out.height), (W, H));

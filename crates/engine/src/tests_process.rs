@@ -113,6 +113,27 @@ fn update_to_current_process_is_one_undo_step_and_only_when_needed() {
     assert_eq!(s.execute("develop.updateProcess", &json!({})).unwrap()["changed"], 1);
 }
 
+/// Photos saved as process 9 (main's released V9, and the daily builds whose Lightroom tone is now V10) move to 10
+/// together: one Update to Current Process over the whole selection, keeping every slider.
+#[test]
+fn update_to_current_process_moves_a_selection_from_9_to_10() {
+    assert_eq!(ProcessVersion::LATEST, lcc_develop::Process::V10.version());
+    let mut s = Session::with_demo();
+    let ids: Vec<PhotoId> = s.visible_cloned().into_iter().take(3).collect();
+    let nine = lcc_develop::Process::V9.version();
+    for (k, id) in ids.iter().enumerate() {
+        put(&mut s, *id, nine, 0.1 * k as f64);
+    }
+    select(&mut s, &ids);
+    assert!(update_info(&s).enabled);
+    let r = s.execute("develop.updateProcess", &json!({})).unwrap();
+    assert_eq!(r, json!({"changed": 3, "process": 10}));
+    for (k, id) in ids.iter().enumerate() {
+        let d = s.develop_of(*id).unwrap();
+        assert_eq!((d.process, d.light.exposure), (ProcessVersion(10), 0.1 * k as f64));
+    }
+}
+
 #[test]
 fn virtual_copies_inherit_the_process() {
     let mut s = Session::with_demo();

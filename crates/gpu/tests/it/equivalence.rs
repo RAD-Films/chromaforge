@@ -65,7 +65,7 @@ fn camera_tone_and_relative_wb() {
     check("camera chroma curve edited", &src, &info, &s, &RenderRequest::fit(320, 240));
 }
 
-/// Process V9 tones a raw under a profile without a tone curve with Lightroom Classic's base curve on each linear
+/// Process V10 tones a raw under a profile without a tone curve with Lightroom Classic's base curve on each linear
 /// ProPhoto channel (`FinishParams::tone_per_channel`), the middle channel kept in its place between the other two and
 /// each channel clipped at the output: the kernel must follow it (exposure +1.5 takes bright colours past the range).
 #[test]
@@ -82,7 +82,7 @@ fn v9_lrc_base_tone_per_channel() {
     .under_default_curve();
     let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() };
     let mut s = DevelopSettings::default();
-    assert_eq!(s.process.process(), Process::V9);
+    assert_eq!(s.process.process(), Process::V10);
     check("V9 base tone per channel", &src, &info, &s, &RenderRequest::fit(320, 240));
     for (ev, contrast) in [(-1.0, 0.0), (-3.0, 25.0), (1.5, -20.0)] {
         s.light.exposure = ev;
@@ -92,7 +92,7 @@ fn v9_lrc_base_tone_per_channel() {
     }
 }
 
-/// Process V9's per-channel tone pulls a colour toward its own brightest channel near white (`finish::near_white`),
+/// Process V10's per-channel tone pulls a colour toward its own brightest channel near white (`finish::near_white`),
 /// warm hues only (magenta and blue-led ones, and those with blue well over green, are gated out): a sweep of every
 /// hue at every brightness up to past white, so the pull, its start, its fade and both gates all show in the comparison.
 #[test]
@@ -316,7 +316,7 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.mixer.orange.hue = 30.0;
             s.mixer.green.lum = 40.0;
         }),
-        // V1–V8's band mixer (V9 measures Lightroom Classic's: the case above)
+        // V1–V9's band mixer (V10 measures Lightroom Classic's: the case above)
         ("colour mixer (V8)", |s| {
             s.process = Process::V8.version();
             s.mixer.blue.sat = -60.0;
@@ -380,14 +380,14 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.hsl_curves.lum = vec![Point::new(0.65, 0.5)];
         }),
         ("colour grading (V9 split, Blending 75 and 100)", |s| {
-            s.process = lcc_develop::Process::V9.version();
+            s.process = lcc_develop::Process::V10.version();
             s.grading.shadows = Wheel { hue: 18.0, sat: 30.0, lum: 0.0 };
             s.grading.highlights = Wheel { hue: 200.0, sat: 25.0, lum: 0.0 };
             s.grading.blending = 75.0;
             s.grading.balance = 21.0;
         }),
         ("colour grading (V9 split, Blending 100)", |s| {
-            s.process = lcc_develop::Process::V9.version();
+            s.process = lcc_develop::Process::V10.version();
             s.grading.shadows = Wheel { hue: 18.0, sat: 12.0, lum: 0.0 };
             s.grading.highlights = Wheel { hue: 42.0, sat: 9.0, lum: 0.0 };
             s.grading.blending = 100.0;
@@ -396,7 +396,7 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.curve.master = vec![Point::new(0.0, 0.0), Point::new(0.3, 0.15), Point::new(0.6, 0.75), Point::new(1.0, 1.0)];
         }),
         ("highlights/shadows ±100 (V9 curve)", |s| {
-            s.process = lcc_develop::Process::V9.version();
+            s.process = lcc_develop::Process::V10.version();
             s.light.shadows = 100.0;
             s.light.highlights = -100.0;
         }),
@@ -1022,7 +1022,7 @@ fn rgb_contrast_mode_renders_on_the_gpu() {
         let edit = cases().into_iter().find(|(n, _)| *n == name).map(|c| c.1).unwrap();
         edit(&mut s);
         check(name, &src, &raw, &s, &req);
-        // process V9 toned per ProPhoto channel (a camera tone kept under a profile without a curve): the per-channel
+        // process V10 toned per ProPhoto channel (a camera tone kept under a profile without a curve): the per-channel
         // Contrast/Blacks runs after that tone on the GPU too
         let kept = lcc_pipeline::tone::CameraTone::new(std::array::from_fn(|i| {
             let x = 0.004 * 1.18f32.powi(i as i32);
@@ -1116,6 +1116,28 @@ fn gpu_matches_cpu() {
     eprintln!("worst: mean {:.4} LSB, max {} LSB", worst.0, worst.1);
 }
 
+/// Process V9 as released (main's: V8's tone with Calibration Saturation in linear light, #1031) on the GPU: every
+/// case on a raw and on a display-referred source, so both processes the app writes today are covered.
+#[test]
+fn gpu_matches_cpu_at_process_v9() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(0, 960, 640);
+    let req = RenderRequest::fit(720, 720);
+    for (kind, info) in [("raw", SourceInfo { raw: true, ..Default::default() }), ("display", SourceInfo::default())] {
+        for (name, edit) in cases() {
+            let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+            edit(&mut s);
+            if s.process.process() != Process::V9 {
+                // (a case that sets its own process)
+                continue;
+            }
+            check(&format!("V9 {kind}, {name}"), &src, &info, &s, &req);
+        }
+    }
+}
+
 /// Issue #523: a raw's clipped highlights rebuilt as the raw decode does it (fully clipped ones to the neutral of
 /// the colour model applied after them, here a look whose rows don't sum to one) stay neutral when darkened, on
 /// the GPU as on the CPU, and the two renders agree.
@@ -1169,7 +1191,7 @@ fn clipped_highlights_stay_neutral_on_both() {
     }
 }
 
-/// Process V9's extra Highlights pull next to clipped areas (`lcc_pipeline::hl_edge`): the GPU reads the same plane
+/// Process V10's extra Highlights pull next to clipped areas (`lcc_pipeline::hl_edge`): the GPU reads the same plane
 /// as the CPU, on the whole frame and on a zoomed window of it, at Highlights −100 and −50.
 #[test]
 fn v9_highlights_pull_next_to_clipped_areas_matches() {
@@ -1190,7 +1212,7 @@ fn v9_highlights_pull_next_to_clipped_areas_matches() {
     let info = SourceInfo { raw: true, ..Default::default() };
     let win = lcc_pipeline::PixelWindow { x: 300, y: 80, w: 320, h: 240 };
     for hl in [-100.0, -50.0] {
-        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let mut s = DevelopSettings { process: Process::V10.version(), ..DevelopSettings::default() };
         s.light.highlights = hl;
         let req = RenderRequest::fit(w, h);
         let plan = lcc_pipeline::plan(&src, &info, &s, &req);
@@ -1200,7 +1222,7 @@ fn v9_highlights_pull_next_to_clipped_areas_matches() {
     }
 }
 
-/// Process V9's Highlights pull across a soft step (`hl_edge::EdgePull::across_step`): a dark beam over a clipped sky,
+/// Process V10's Highlights pull across a soft step (`hl_edge::EdgePull::across_step`): a dark beam over a clipped sky,
 /// slanted, with a few pixels of tones between them, so the edge pixels grade their pull on both renderers.
 #[test]
 fn v9_highlights_pull_grades_across_a_soft_edge() {
@@ -1216,7 +1238,7 @@ fn v9_highlights_pull_grades_across_a_soft_edge() {
     }));
     let info = SourceInfo { raw: true, ..Default::default() };
     let win = lcc_pipeline::PixelWindow { x: 200, y: 260, w: 320, h: 160 };
-    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    let mut s = DevelopSettings { process: Process::V10.version(), ..DevelopSettings::default() };
     s.light.highlights = -100.0;
     let req = RenderRequest::fit(w, h);
     assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
@@ -1224,7 +1246,7 @@ fn v9_highlights_pull_grades_across_a_soft_edge() {
     check("V9 pull across a soft edge, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
 }
 
-/// Process V9's Highlights pull inside a clipped lamp on a dim ceiling, with a glow around it: each grid cell reads
+/// Process V10's Highlights pull inside a clipped lamp on a dim ceiling, with a glow around it: each grid cell reads
 /// its own neighbourhood by tone and the reads blend bilinearly (`hl_edge::EdgePull::at`), on both renderers.
 #[test]
 fn v9_highlights_pull_reads_a_clipped_lamp_by_cell() {
@@ -1240,7 +1262,7 @@ fn v9_highlights_pull_reads_a_clipped_lamp_by_cell() {
     }));
     let info = SourceInfo { raw: true, ..Default::default() };
     let win = lcc_pipeline::PixelWindow { x: 330, y: 200, w: 280, h: 200 };
-    let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+    let mut s = DevelopSettings { process: Process::V10.version(), ..DevelopSettings::default() };
     s.light.highlights = -100.0;
     let req = RenderRequest::fit(w, h);
     assert!(lcc_pipeline::plan(&src, &info, &s, &req).edge_pull.is_some(), "the pull is on");
@@ -1248,7 +1270,7 @@ fn v9_highlights_pull_reads_a_clipped_lamp_by_cell() {
     check("V9 pull in a clipped lamp, window", &src, &info, &s, &RenderRequest { window: Some(win), ..req });
 }
 
-/// Process V9's highlight lift under a negative Exposure (`lcc_pipeline::negev_lift`): the GPU lifts the same pixels
+/// Process V10's highlight lift under a negative Exposure (`lcc_pipeline::negev_lift`): the GPU lifts the same pixels
 /// by the same table as the CPU, at −0.5, −1, −2 and −3 EV, at Highlights 0 and −50, on the whole frame, a window and
 /// under a mask's Exposure.
 #[test]
@@ -1269,7 +1291,7 @@ fn v9_negative_exposure_highlight_lift_matches() {
     let info = SourceInfo { raw: true, ..Default::default() };
     let win = lcc_pipeline::PixelWindow { x: 200, y: 60, w: 240, h: 180 };
     for (ev, hl) in [(-0.5, 0.0), (-1.0, 0.0), (-2.0, 0.0), (-3.0, 0.0), (-1.0, -50.0), (-3.0, -50.0)] {
-        let mut s = DevelopSettings { process: Process::V9.version(), ..DevelopSettings::default() };
+        let mut s = DevelopSettings { process: Process::V10.version(), ..DevelopSettings::default() };
         s.light.exposure = ev;
         s.light.highlights = hl;
         let tone = lcc_pipeline::finish::base_tone(&s, &info, 1.0);
@@ -2070,7 +2092,7 @@ fn overrange_colours_match_on_every_process() {
     }
     // a saturated ramp through the shoulder and the lightness it may not take
     let ramp = Arc::new(Rgb32f::from_fn(640, 64, |x, _| [1.0, 0.125, 0.015].map(|t| t * (0.3 + x as f32 / 640.0 * 3.0))));
-    for p in [Process::V8, Process::V9] {
+    for p in [Process::V8, Process::V10] {
         check(&format!("{p:?} saturated ramp"), &ramp, &raw, &DevelopSettings { process: p.version(), ..DevelopSettings::default() }, &req);
     }
 }
@@ -2438,7 +2460,7 @@ fn dithered_gradients_match_in_phase() {
     }
 }
 
-/// A raw source of process V9 whose camera-profile tables wait for the white balance: a hue/saturation map that
+/// A raw source of process V10 whose camera-profile tables wait for the white balance: a hue/saturation map that
 /// shifts and saturates by hue, and a value-indexed, sRGB-coded look table (the shapes real profiles use).
 fn deferred_tables_source(gain: f32) -> SourceInfo {
     use lcc_raw::profile::HsvTable;
@@ -2477,7 +2499,7 @@ fn deferred_tables_source(gain: f32) -> SourceInfo {
     SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, camera_color: Some(Arc::new(cc)), ..Default::default() }
 }
 
-/// Process V9 toned per ProPhoto channel: the white-balance stage clips the scene colour at ProPhoto's edge, not
+/// Process V10 toned per ProPhoto channel: the white-balance stage clips the scene colour at ProPhoto's edge, not
 /// Rec.2020's (`local::prophoto_floor`), so a magenta light beyond ProPhoto keeps a green of exactly 0. Saturated
 /// magentas and purples with a negative Rec.2020 green, through `wb_k` and (with a profile's tables) `wb_tables_k`.
 #[test]

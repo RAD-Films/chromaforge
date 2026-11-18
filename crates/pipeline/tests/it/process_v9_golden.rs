@@ -1,8 +1,7 @@
-//! Process V9 (Lightroom Classic's tone: the Highlights pull and clipped-highlight recovery, Shadows / Whites /
-//! Blacks, the tone-curve space, near-white colour) is pinned: merges and refactors must leave a V9 render as it
-//! is. Hashes of the 8-bit CPU renders of procedural pictures, recorded on `fix/hl-gradient` e93ccbd5f by running
-//! this test with `V9_GOLDEN_RECORD=1` (it prints the table instead of checking it). A change that means to move
-//! V9 records the table again and says so in its commit.
+//! Process V9 as released (main's: V8's tone with Calibration Saturation in linear light, #1031) renders exactly as
+//! on main: the same procedural pictures as `process_v10_golden`, at process V9, against hashes recorded on
+//! `origin/main` b3e884609 (18 Nov 2026, Windows x86_64). A camera tone kept under a profile without a curve is
+//! V10's mark only: under V9 it renders as the plain camera tone, as on main (which has no such mark).
 
 use lcc_develop::{DevelopSettings, Light, Process, ToneCurve};
 use lcc_geom::Point;
@@ -119,76 +118,76 @@ fn renders() -> Vec<(String, u64)> {
     out
 }
 
-/// Recorded on fix/hl-gradient e93ccbd5f (Windows x86_64; run twice, the same both times).
+/// Recorded on origin/main b3e884609 (the kept-tone rows: main's plain camera-tone hashes).
 const GOLDEN: &[(&str, u64)] = &[
     ("display|zero", 0x72fd572a912efd4b),
-    ("display|hl-100", 0x75e9905a6e56a76f),
-    ("display|hl-50", 0x3eadf84688da0495),
-    ("display|hl+50", 0xe000054baaa7b688),
-    ("display|sh+60", 0xf64d69e7bc9a1995),
-    ("display|whites+50", 0x85cb260e866d09a7),
-    ("display|whites-50", 0xe6c0c10bc8230a63),
-    ("display|blacks-40", 0x9eb02e32fd3b04ac),
-    ("display|blacks+40", 0x258c12b52c088024),
+    ("display|hl-100", 0x3cb7b778fc41d53f),
+    ("display|hl-50", 0x6a4d4894406627d9),
+    ("display|hl+50", 0xfaa63997bdda3a8c),
+    ("display|sh+60", 0x592710d31f5a8a5c),
+    ("display|whites+50", 0xe1827db7e4b6acbf),
+    ("display|whites-50", 0xebdceb763f2acc12),
+    ("display|blacks-40", 0x455cfeb79b161ca0),
+    ("display|blacks+40", 0x9e7bc0962dfb086e),
     ("display|exposure-1.5", 0x24c72dc51bb342f8),
-    ("display|exposure-1.5-hl-100", 0xf78e0ca9280cb72a),
-    ("display|contrast+40", 0x6ea604460630ec27),
-    ("display|master-curve", 0x24bc4a5feff04d1f),
-    ("display|red-curve", 0xa499c8ff3f61b261),
-    ("display|regions", 0x84b168648d264942),
-    ("display|busy", 0xf34b2dccd6792919),
-    ("raw|zero", 0x187783a0e17fedf9),
-    ("raw|hl-100", 0x6df532d35fa3ebdb),
-    ("raw|hl-50", 0x54a03d28c150a32b),
-    ("raw|hl+50", 0x20319482e3524b11),
-    ("raw|sh+60", 0xfe0afa471e660a0c),
-    ("raw|whites+50", 0x959fad671acd6f15),
-    ("raw|whites-50", 0x2510afcc8979edd4),
-    ("raw|blacks-40", 0x00309cac03f752ec),
-    ("raw|blacks+40", 0xe85aa7bd64ccf42a),
-    ("raw|exposure-1.5", 0x662e00d4c314cf25),
-    ("raw|exposure-1.5-hl-100", 0x5bcffdd337ed102a),
-    ("raw|contrast+40", 0x8c7b5ab54815a88f),
-    ("raw|master-curve", 0x22b1322da6efdd40),
-    ("raw|red-curve", 0xc47f5f36c8baa554),
-    ("raw|regions", 0xb154eee342a9f055),
-    ("raw|busy", 0xe863f569ee1ab4e0),
-    ("raw-camera|zero", 0x5cd90d991f9383b8),
-    ("raw-camera|hl-100", 0xbb4c578503974750),
-    ("raw-camera|hl-50", 0x2cadf88e9154a3b4),
-    ("raw-camera|hl+50", 0x7a565b23ac1637fe),
-    ("raw-camera|sh+60", 0xc92be2f382798a26),
-    ("raw-camera|whites+50", 0xd031f6cc1cbfc0f2),
-    ("raw-camera|whites-50", 0xdc60f14fa10354aa),
-    ("raw-camera|blacks-40", 0x7e1e7a99e6f0d038),
-    ("raw-camera|blacks+40", 0xa9521cb09a2abff9),
-    ("raw-camera|exposure-1.5", 0x2ee862d2acf88683),
-    ("raw-camera|exposure-1.5-hl-100", 0xcc2ebe346279ee3b),
-    ("raw-camera|contrast+40", 0x84be68b5c27f5c44),
-    ("raw-camera|master-curve", 0x140e349a4c2d392b),
-    ("raw-camera|red-curve", 0x9f1c9f6504f9ba3b),
-    ("raw-camera|regions", 0xe56e641814f32c26),
-    ("raw-camera|busy", 0x1933cd34873032d8),
-    ("raw-camera-kept|zero", 0xa71d48310f3b7a51),
-    ("raw-camera-kept|hl-100", 0x7a3c76cbe060ec53),
-    ("raw-camera-kept|hl-50", 0x094e345cbf834873),
-    ("raw-camera-kept|hl+50", 0x09eea3eec53a638e),
-    ("raw-camera-kept|sh+60", 0x505aceeab83c7f70),
-    ("raw-camera-kept|whites+50", 0x9febd7ba6e9ac49f),
-    ("raw-camera-kept|whites-50", 0x02f85db70aafbd66),
-    ("raw-camera-kept|blacks-40", 0x46ea0213a56e939b),
-    ("raw-camera-kept|blacks+40", 0x77f96d3f1a8a3d16),
-    ("raw-camera-kept|exposure-1.5", 0x360ea0c3456f8c17),
-    ("raw-camera-kept|exposure-1.5-hl-100", 0x4f36379c47edd01f),
-    ("raw-camera-kept|contrast+40", 0xebfe8938647e3e67),
-    ("raw-camera-kept|master-curve", 0x278aeab1d4283cdb),
-    ("raw-camera-kept|red-curve", 0x7b65f353af9d6f0b),
-    ("raw-camera-kept|regions", 0x40de072fcd95ddae),
-    ("raw-camera-kept|busy", 0x46168742c23718c8),
+    ("display|exposure-1.5-hl-100", 0x3a2343d1fc391bd4),
+    ("display|contrast+40", 0x82677cb1d6734c5e),
+    ("display|master-curve", 0x6ab200572856f343),
+    ("display|red-curve", 0x93acedd45bc62c20),
+    ("display|regions", 0xb8c4d2c8c1d94f08),
+    ("display|busy", 0x35e7469a8d6783c1),
+    ("raw|zero", 0x6c02a36f9778b26f),
+    ("raw|hl-100", 0x01bc9f709c082617),
+    ("raw|hl-50", 0xc921721eadaedce7),
+    ("raw|hl+50", 0xd5b4de957306bfc0),
+    ("raw|sh+60", 0x2380cc3e9d6004ad),
+    ("raw|whites+50", 0xba505361a410f6fd),
+    ("raw|whites-50", 0x68ecfb8101f77bc1),
+    ("raw|blacks-40", 0x4bad2b1533ed2ff2),
+    ("raw|blacks+40", 0xc6c7a403bc412b58),
+    ("raw|exposure-1.5", 0xe26bb9e7acb3a5d8),
+    ("raw|exposure-1.5-hl-100", 0xd702d3fae370e8b6),
+    ("raw|contrast+40", 0xf4132262ba66ac81),
+    ("raw|master-curve", 0x9e7616bec5f5d3ef),
+    ("raw|red-curve", 0x5d28c7a72a37455b),
+    ("raw|regions", 0xc2ffd2020519680a),
+    ("raw|busy", 0xd8888f746a5cef58),
+    ("raw-camera|zero", 0x22ac1df73ced1115),
+    ("raw-camera|hl-100", 0x6539598f5d3dd527),
+    ("raw-camera|hl-50", 0x5d29bfd88405578a),
+    ("raw-camera|hl+50", 0x4fab41f8cd4cca2c),
+    ("raw-camera|sh+60", 0xca7aa91de9e85f15),
+    ("raw-camera|whites+50", 0x949ac3231aec49a1),
+    ("raw-camera|whites-50", 0x4bd9fa3ef81a1ded),
+    ("raw-camera|blacks-40", 0x2fe07cbe4d6e175f),
+    ("raw-camera|blacks+40", 0x215c31b1567b7ea5),
+    ("raw-camera|exposure-1.5", 0x1c0080d34f63feea),
+    ("raw-camera|exposure-1.5-hl-100", 0x59e35cfcf8dc7bcb),
+    ("raw-camera|contrast+40", 0x7ec22ea9e013081d),
+    ("raw-camera|master-curve", 0xbc8c40ee12022b56),
+    ("raw-camera|red-curve", 0xcb125520e35e2c3a),
+    ("raw-camera|regions", 0x471ba40e6fb4a231),
+    ("raw-camera|busy", 0x6bf3c485871f7a82),
+    ("raw-camera-kept|zero", 0x22ac1df73ced1115),
+    ("raw-camera-kept|hl-100", 0x6539598f5d3dd527),
+    ("raw-camera-kept|hl-50", 0x5d29bfd88405578a),
+    ("raw-camera-kept|hl+50", 0x4fab41f8cd4cca2c),
+    ("raw-camera-kept|sh+60", 0xca7aa91de9e85f15),
+    ("raw-camera-kept|whites+50", 0x949ac3231aec49a1),
+    ("raw-camera-kept|whites-50", 0x4bd9fa3ef81a1ded),
+    ("raw-camera-kept|blacks-40", 0x2fe07cbe4d6e175f),
+    ("raw-camera-kept|blacks+40", 0x215c31b1567b7ea5),
+    ("raw-camera-kept|exposure-1.5", 0x1c0080d34f63feea),
+    ("raw-camera-kept|exposure-1.5-hl-100", 0x59e35cfcf8dc7bcb),
+    ("raw-camera-kept|contrast+40", 0x7ec22ea9e013081d),
+    ("raw-camera-kept|master-curve", 0xbc8c40ee12022b56),
+    ("raw-camera-kept|red-curve", 0xcb125520e35e2c3a),
+    ("raw-camera-kept|regions", 0x471ba40e6fb4a231),
+    ("raw-camera-kept|busy", 0x6bf3c485871f7a82),
 ];
 
 #[test]
-fn v9_renders_as_pinned() {
+fn v9_renders_as_on_main() {
     let got = renders();
     if std::env::var_os("V9_GOLDEN_RECORD").is_some() {
         for (k, h) in &got {
@@ -203,5 +202,5 @@ fn v9_renders_as_pinned() {
     }
     assert_eq!(got.len(), GOLDEN.len());
     let wrong: Vec<_> = got.iter().zip(GOLDEN).filter(|((k, h), (gk, gh))| k != gk || h != gh).map(|((k, _), _)| k.as_str()).collect();
-    assert!(wrong.is_empty(), "V9 renders changed from the pinned ones: {wrong:?}");
+    assert!(wrong.is_empty(), "V9 renders differ from main's: {wrong:?}");
 }

@@ -1,5 +1,5 @@
 //! Process V8 (dither, raw tone roll-off, joint colour NR) is released: a photo kept on V8 renders exactly as it
-//! did on main before process V9 (Lightroom Classic's Highlights / Shadows, region curve and display tone) was
+//! did on main before process V10 (Lightroom Classic's Highlights / Shadows, region curve and display tone) was
 //! added. Hashes of the 8-bit CPU renders of procedural pictures, recorded on main 7b2ee8bd9 by running this test
 //! there with `V8_GOLDEN_RECORD=1` (it prints the table instead of checking it).
 
@@ -131,7 +131,7 @@ fn v8_renders_exactly_as_mains_v8() {
     assert!(wrong.is_empty(), "V8 renders changed from main's: {wrong:?}");
 }
 
-/// The camera-JPEG tone mark ([`CameraTone::under_default_curve`]) is V9's; a V8 photo ignores it.
+/// The camera-JPEG tone mark ([`CameraTone::under_default_curve`]) is V10's; a V8 photo ignores it.
 #[test]
 fn v8_ignores_the_kept_camera_jpeg_tone_mark() {
     let src = scene();

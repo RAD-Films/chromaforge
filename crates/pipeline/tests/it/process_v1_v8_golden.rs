@@ -1,5 +1,5 @@
-//! Processes V1–V8 are released: a photo kept on any of them renders exactly as it did on main before process V9
-//! was added. Hashes of 8-bit CPU renders of a procedural picture for every V1–V8 process, three kinds of source
+//! Processes V1–V9 are released: a photo kept on any of them renders exactly as it did on main before process V10
+//! was added. Hashes of 8-bit CPU renders of a procedural picture for every V1–V9 process, three kinds of source
 //! and edits covering every tone and colour panel (Basic, region and point curves, HSL, colour grading, calibration,
 //! presence), recorded on main 7b2ee8bd9 by running this test there with `V1_V8_GOLDEN_RECORD=1`.
 
