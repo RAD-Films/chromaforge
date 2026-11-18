@@ -235,7 +235,7 @@ walks the drive.
   passes, three each way = the CPU's Gaussian: horizontal ones sum each pixel's window, so adjacent
   threads read adjacent pixels; vertical ones slide running sums down chunks of a column), `map`
   (log luminance, dark channel, guided-filter steps, white balance with a camera profile's
-  hue/saturation map and look table after it (process V9), luminance / colour NR, airlight
+  hue/saturation map and look table after it (process V10), luminance / colour NR, airlight
   sampling), `mask` (linear / radial / luminance / colour range / brush shapes, combine, finalize),
   `finish` (the whole per-pixel stage), `fit` / `fit_pack` (the loupe's display fit: the 8-bit
   output unpacked for `resize`'s Lanczos taps and packed back with the CPU's rounding) — each

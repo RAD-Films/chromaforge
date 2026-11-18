@@ -3,4 +3,4 @@
   strokes instead of grain, often orange and blue under warm light. The demosaic chose between a horizontal and a
   vertical guess at each pixel, and in a flat area the noise alone decided which. Where neither guess is clearly
   better it now blends the two, so the noise looks like grain. Edges are as sharp as before. This is part of process
-  version 9: photos on an older process look as they did until you update them.
+  version 10: photos on an older process look as they did until you update them.
