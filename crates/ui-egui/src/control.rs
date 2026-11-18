@@ -87,6 +87,12 @@ fn wrap(r: Result<Value, String>) -> Outcome {
     }
 }
 
+/// Labels are source keys with `{app}` / `{upstream}` placeholders (the UI translates them by key); a listing for
+/// an agent reports them as the user sees them.
+fn brand_filled(listing: Value) -> Value {
+    serde_json::from_str(&lcc_brand::fill(&listing.to_string())).unwrap_or(listing)
+}
+
 pub fn all_commands(app: &LccApp) -> Value {
     let keymap = &app.ui.settings.keymap;
     let mut v: Vec<Value> = app
@@ -114,6 +120,8 @@ fn rect_json(r: egui::Rect) -> Value {
 
 pub fn inspect(app: &LccApp, ctx: &egui::Context) -> Value {
     let r = ctx.content_rect();
+    // (its own object: one more level of fields in the reply below passes `json!`'s recursion limit)
+    let frame_gaps = json!({"hostFrameMs": app.perf.host_frame_ms, "gapMs": app.perf.gap_ms, "maxGapMs": app.perf.max_gap_ms, "maxGapHostMs": app.perf.max_gap_host_ms});
     json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
         "window": [r.width(), r.height()],
@@ -125,7 +133,7 @@ pub fn inspect(app: &LccApp, ctx: &egui::Context) -> Value {
         "selection": app.session.selection.ids.iter().map(|p| p.0).collect::<Vec<_>>(),
         "activeMask": app.session.active_mask,
         "widgetCount": app.widgets.len(),
-        "perf": {"loupeRenders": app.renderer.loupe_log.iter().collect::<Vec<_>>(), "nowMs": crate::now_ms(), "refineAfterS": crate::region::StillRefine::refine_after(app.renderer.last_full_main_ms), "viewFollowed": app.session.view_followed, "viewWorkedOut": app.session.view_worked_out, "frameMs": app.perf.frame_ms, "logicMs": app.perf.logic_ms, "updateMs": app.perf.update_ms, "maxUpdateMs": app.perf.max_update_ms, "slowestFrame": app.slowest_frame, "fps": app.perf.fps, "lastRenderMs": app.renderer.last_main_ms, "adjustQuality": app.hq_drag.quality(app.session.interaction.as_ref().filter(|_| app.ui.settings.high_quality_adjustment_previews).map(|i| (i.photo, i.label.as_str()))).name(), "renderQueue": app.renderer.queued(), "rendersInFlight": app.renderer.in_flight(), "pendingSlots": app.renderer.pending_slots(), "mergeRunning": app.merge.busy(), "lastMerge": app.merge.last_result, "rendersDone": app.renderer.completed, "thumbTextures": app.renderer.thumb_textures(), "variantTextures": app.renderer.variant_textures(), "hdrWindowsKept": app.renderer.hdr_windows_kept(), "gpu": (lcc_engine::gpu::ready() && lcc_engine::gpu::available()).then(lcc_engine::gpu::adapter_name).flatten(), "gpuReason": lcc_engine::gpu::unavailable_reason(), "gpuFallback": lcc_engine::gpu::last_fallback(), "gpuWindowDevice": lcc_engine::gpu::on_window_device(), "screenTextures": app.renderer.has_screen_textures(), "mainOnGpu": app.renderer.textures.get(&crate::render::Slot::Main).is_some_and(|t| t.native.is_some()), "loupeSteps": app.loupe_timing.to_json()},
+        "perf": {"loupeRenders": app.renderer.loupe_log.iter().collect::<Vec<_>>(), "nowMs": crate::now_ms(), "refineAfterS": crate::region::StillRefine::refine_after(app.renderer.last_full_main_ms), "viewFollowed": app.session.view_followed, "viewWorkedOut": app.session.view_worked_out, "frameMs": app.perf.frame_ms, "logicMs": app.perf.logic_ms, "updateMs": app.perf.update_ms, "maxUpdateMs": app.perf.max_update_ms, "frameGaps": frame_gaps, "slowestFrame": app.slowest_frame, "fps": app.perf.fps, "lastRenderMs": app.renderer.last_main_ms, "adjustQuality": app.hq_drag.quality(app.session.interaction.as_ref().filter(|_| app.ui.settings.high_quality_adjustment_previews).map(|i| (i.photo, i.label.as_str()))).name(), "renderQueue": app.renderer.queued(), "rendersInFlight": app.renderer.in_flight(), "pendingSlots": app.renderer.pending_slots(), "mergeRunning": app.merge.busy(), "lastMerge": app.merge.last_result, "rendersDone": app.renderer.completed, "thumbTextures": app.renderer.thumb_textures(), "variantTextures": app.renderer.variant_textures(), "hdrWindowsKept": app.renderer.hdr_windows_kept(), "gpu": (lcc_engine::gpu::ready() && lcc_engine::gpu::available()).then(lcc_engine::gpu::adapter_name).flatten(), "gpuReason": lcc_engine::gpu::unavailable_reason(), "gpuFallback": lcc_engine::gpu::last_fallback(), "gpuWindowDevice": lcc_engine::gpu::on_window_device(), "screenTextures": app.renderer.has_screen_textures(), "mainOnGpu": app.renderer.textures.get(&crate::render::Slot::Main).is_some_and(|t| t.native.is_some()), "loupeSteps": app.loupe_timing.to_json()},
         "loupe": app.loupe_shown.map(|(p, src)| json!({
             "photo": p.0,
             "source": src,
@@ -147,7 +155,7 @@ pub fn inspect(app: &LccApp, ctx: &egui::Context) -> Value {
         "unsaved": app.session.unsaved().map(|(n, e)| json!({"ops": n, "error": e})),
         "libraryProblem": app.library_problem.as_ref().map(crate::panels::library_problem::LibraryProblem::to_json),
         "scan": app.scan.as_ref().map(crate::import::ScanTask::status),
-        "export": {"running": app.export.as_ref().map(crate::export_task::ExportTask::status), "last": app.last_export_result},
+        "export": {"running": app.export.as_ref().map(crate::export_task::ExportTask::status), "queued": app.export_queue.len(), "last": app.last_export_result},
         "import": app.import.as_ref().map(crate::import::ImportTask::status),
         "tasks": app.tasks.labels(),
         // every long-running task in flight, as the activity stack shows them (`activity.list`)
@@ -167,6 +175,21 @@ pub fn memory(app: &LccApp) -> Value {
         o.extend(r);
     }
     v
+}
+
+/// `ui.pointer` events: each an object whose `kind`, when present, is down, drag, move or up (upstream #4291).
+fn pointer_batch_ok(events: &[Value]) -> Result<(), String> {
+    for event in events {
+        let event = event.as_object().ok_or("ui.pointer: every event must be an object")?;
+        let kind = match event.get("kind") {
+            None => "move",
+            Some(kind) => kind.as_str().ok_or("ui.pointer: `kind` must be a string")?,
+        };
+        if !matches!(kind, "down" | "drag" | "move" | "up") {
+            return Err(format!("ui.pointer: unknown event kind `{kind}` (down, drag, move or up)"));
+        }
+    }
+    Ok(())
 }
 
 fn modifiers(p: &Value) -> egui::Modifiers {
@@ -278,13 +301,12 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             ctx.request_repaint();
             wrap(r)
         }
-        "engine.commands" => ok(all_commands(app)),
-        "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default()),
+        "engine.commands" => ok(brand_filled(all_commands(app))),
+        "ui.menu.list" => ok(brand_filled(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default())),
         "ui.menu.tree" => {
             let tree =
                 Value::Array(crate::menubar::menu_bar(app).into_iter().map(|(title, items)| json!({"label": title, "children": items})).collect());
-            // labels are source keys with `{app}` placeholders; report them as the user sees them
-            ok(serde_json::from_str(&lcc_brand::fill(&tree.to_string())).unwrap_or(tree))
+            ok(brand_filled(tree))
         }
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.widgets" => {
@@ -361,6 +383,10 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             // events in normalized image coordinates of the displayed photo frame
             let Some(img) = app.image_rect else { return err("no image on screen (switch to Detail view)") };
             let Some(events) = p.get("events").and_then(Value::as_array) else { return err("missing `events`") };
+            // Check the whole batch first: a mistyped release must not leave a press queued (upstream #4291).
+            if let Err(e) = pointer_batch_ok(events) {
+                return err(e);
+            }
             let m = modifiers(p);
             for e in events {
                 let x = e.get("x").and_then(Value::as_f64).unwrap_or(0.5) as f32;
@@ -430,9 +456,11 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             match s("action") {
                 Some("cut") => app.synthetic.push(egui::Event::Cut),
                 Some("copy") => app.synthetic.push(egui::Event::Copy),
-                Some("paste") => match s("text") {
-                    Some(text) => app.synthetic.push(egui::Event::Paste(text.to_string())),
+                // a present but non-string `text` is an error, never a paste from the host clipboard (upstream #4295)
+                Some("paste") => match p.get("text") {
+                    Some(Value::String(text)) => app.synthetic.push(egui::Event::Paste(text.clone())),
                     None => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+                    Some(_) => return err("ui.clipboard: `text` must be a string"),
                 },
                 _ => return err("ui.clipboard: `action` is cut, copy or paste"),
             }
@@ -522,7 +550,10 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
         "ui.dialog.cancel" => {
             app.ui.dialog = None;
             #[cfg(not(target_arch = "wasm32"))]
-            if matches!(app.catalog_ui.dialog, Some(crate::catalog_ui::CatalogDialog::XmpConflict { .. })) {
+            if matches!(
+                app.catalog_ui.dialog,
+                Some(crate::catalog_ui::CatalogDialog::XmpConflict { .. } | crate::catalog_ui::CatalogDialog::Refine { .. })
+            ) {
                 app.catalog_ui.dialog = None;
             }
             ok(Value::Null)
@@ -594,7 +625,9 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
                         ok(json!({"width": r.image.width, "height": r.image.height, "png": lcc_engine::base64::encode(&bytes)}))
                     }
                     (None, None) if inline => err("ui.render: this build has no PNG encoder for `inline`"),
-                    _ => ok(json!({"width": r.image.width, "height": r.image.height, "histogram": r.histogram})),
+                    // a `path` with no encoder must not report success without writing (upstream #4294)
+                    (Some(_), None) => err("no encoder"),
+                    (None, _) => ok(json!({"width": r.image.width, "height": r.image.height, "histogram": r.histogram})),
                 },
                 Err(e) => err(e),
             }
@@ -634,6 +667,7 @@ pub(crate) fn confirm_dialog(app: &mut LccApp) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         None => match app.catalog_ui.dialog.take() {
             Some(crate::catalog_ui::CatalogDialog::XmpConflict { command, ids, .. }) => app.run(&command, json!({"ids": ids, "confirmed": true})),
+            Some(crate::catalog_ui::CatalogDialog::Refine { .. }) => app.run("library.refine", json!({"confirmed": true})),
             other => {
                 app.catalog_ui.dialog = other;
                 Err("no dialog open".into())
@@ -728,19 +762,30 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
         return Err(NO_EXPORT_FOLDER.into());
     }
     let to = Destination { dir: dir.clone(), exact };
-    // Add to Apple Photos: refused here, before anything is written, when it can't be done
-    let after = app.session.after_export(&opts)?;
     let background = p.get("background").and_then(Value::as_bool).unwrap_or(false) && app.services.write_shared.is_some();
+    // Add to Apple Photos: refused here, before anything is written, when it can't be done. An export that
+    // waits behind a running one reserves Photos when it starts (the running one may hold it; issue #2965).
+    let after = if background && app.export.is_some() { None } else { Some(app.session.after_export(&opts)?) };
     let out = if background {
         let items = lcc_engine::export::prepare_batch(&mut app.session, &ids, &opts)?;
         let r = crate::export_task::start(app, items, opts, to, after)?;
-        if let Some(t) = app.export.as_mut() {
-            t.plugin_destination = p.get("pluginDestination").filter(|d| d.is_object()).cloned();
+        let destination = p.get("pluginDestination").filter(|d| d.is_object()).cloned();
+        if r.get("queued").is_some() {
+            if let Some(q) = app.export_queue.back_mut() {
+                q.plugin_destination = destination;
+            }
+        } else if let Some(t) = app.export.as_mut() {
+            t.plugin_destination = destination;
         }
         r
     } else {
+        let after = match after {
+            Some(after) => after,
+            None => app.session.after_export(&opts)?,
+        };
         let w = app.services.write.as_mut().ok_or("no writer")?;
         let files = export_batch(&mut app.session, &ids, &opts, &to, &mut |path, bytes| w(path, bytes), &|path| std::path::Path::new(path).exists())?;
+        lcc_engine::export::mark_exported(&mut app.session, &files);
         // plug-in export hooks and destination, as after a background export
         #[cfg(not(target_arch = "wasm32"))]
         let plugins = lcc_engine::cmd::plugins::after_export(&mut app.session, &files, p.get("pluginDestination"));
@@ -814,5 +859,59 @@ mod arg_bounds_tests {
         assert_eq!(bounded_arg(&json!({"steps": 20.0}), "steps", 10, DRAG_STEPS), Ok(20));
         assert_eq!(bounded_arg(&json!({"size": 16384}), "size", 1600, RENDER_SIZE), Ok(16384));
         assert!(bounded_arg(&json!({"count": 0}), "count", 1, CLICK_COUNT).is_err());
+    }
+}
+
+/// Upstream #4291 / #4294: a bad `ui.pointer` batch queues nothing; a `ui.render` `path` needs an encoder.
+#[cfg(test)]
+mod hostile_gesture_tests {
+    use super::*;
+
+    fn reply(app: &mut LccApp, method: &str, params: Value) -> Value {
+        let (req, _) = ControlRequest::new(method, params);
+        let Outcome::Done(reply) = handle(app, &egui::Context::default(), &req) else { panic!("{method} must reply synchronously") };
+        reply
+    }
+
+    fn app() -> LccApp {
+        let mut app = LccApp::new(lcc_engine::Session::with_demo(), crate::Services { png: None, ..Default::default() });
+        app.image_rect = Some(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)));
+        app
+    }
+
+    #[test]
+    fn invalid_pointer_events_reject_the_whole_batch() {
+        let mut app = app();
+        app.synthetic = vec![egui::Event::Text("pending".into())];
+        let bad_kinds = [json!("upp"), json!(null), json!(false), json!(0), json!([]), json!({})].map(|k| json!({"kind": k}));
+        let bad_events = [json!(null), json!(false), json!(0), json!("up"), json!([])];
+        for event in bad_kinds.into_iter().chain(bad_events) {
+            let r = reply(&mut app, "ui.pointer", json!({"events": [{"kind": "down"}, event]}));
+            assert_eq!(r["ok"], false, "{event}: {r}");
+            assert!(r["error"].as_str().is_some_and(|e| e.contains("ui.pointer")), "{r}");
+            assert_eq!(app.synthetic, vec![egui::Event::Text("pending".into())], "{event}: a press was queued");
+        }
+    }
+
+    #[test]
+    fn pointer_drag_move_and_default_kinds_keep_their_events() {
+        let mut app = app();
+        app.synthetic.clear();
+        let r = reply(&mut app, "ui.pointer", json!({"events": [{"kind": "down"}, {"kind": "drag"}, {"kind": "move"}, {}, {"kind": "up"}]}));
+        assert_eq!(r["ok"], true, "{r}");
+        let presses = app.synthetic.iter().filter(|e| matches!(e, egui::Event::PointerButton { .. })).count();
+        assert_eq!(presses, 2, "one press and one release");
+    }
+
+    #[test]
+    fn render_to_a_path_needs_a_png_encoder() {
+        let mut app = app();
+        let path = std::env::temp_dir().join(format!("render-no-encoder-{}.png", std::process::id()));
+        let r = reply(&mut app, "ui.render", json!({"size": 16, "path": path.to_string_lossy()}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(!path.exists(), "nothing written");
+        let r = reply(&mut app, "ui.render", json!({"size": 16}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r["result"]["width"].as_u64().is_some_and(|w| w > 0), "{r}");
     }
 }

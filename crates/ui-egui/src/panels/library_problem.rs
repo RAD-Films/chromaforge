@@ -104,6 +104,9 @@ pub struct LibraryProblem {
     /// Not a problem (yet): the library's catalog is being upgraded to the current format on a
     /// worker thread ([`start_upgrade`]); a progress window shows until it opens.
     pub upgrading: bool,
+    /// Not a problem (yet): the library's catalog is being opened on a worker thread
+    /// ([`start_open`]), a format upgrade on the way; a small window shows until it opens.
+    pub opening: bool,
     /// The window lists the recent libraries to choose from instead (issue #1290); `error` then
     /// says why the last one tried didn't open.
     pub chooser: Option<Chooser>,
@@ -180,7 +183,7 @@ impl ProblemKind {
             ProblemKind::Foreign => "This catalog belongs to another app",
             ProblemKind::Missing => "Your catalog can't be found",
             ProblemKind::Permission => "Your catalog can't be accessed",
-            ProblemKind::NoLocation | ProblemKind::Other => "Your library couldn't be opened",
+            ProblemKind::NoLocation | ProblemKind::Other => "Your catalog couldn't be opened",
         }
     }
 
@@ -193,12 +196,12 @@ impl ProblemKind {
             ProblemKind::InUse => "Close {app} or the other program that has it open, then try again.",
             ProblemKind::Newer => "It was saved by a newer version of {app}. Update {app} to open it; it was left unchanged.",
             ProblemKind::Foreign => {
-                "It was made by another app, whose catalog format {app} can't open. It was left unchanged. Create a new catalog, or open another one."
+                "It was made by another app, whose format {app} can't open. It was left unchanged. Create a new catalog, or open another one."
             }
             ProblemKind::Missing => "If it is on a drive that isn't connected, connect it and try again. Otherwise open or create another catalog.",
             ProblemKind::Permission => "{app} isn't allowed to read or write its folder. Check the folder's permissions, then try again.",
             ProblemKind::NoLocation | ProblemKind::Other => {
-                "Your photos and edits in it are untouched. You can try again (e.g. after closing another program that has it open or reconnecting its drive), open a different library or create a new one, or continue without a library — then nothing you do is saved."
+                "Your photos and edits in it are untouched. You can try again (e.g. after closing another program that has it open or reconnecting its drive), open a different catalog or create a new one, or continue without a catalog, though then nothing you do is saved."
             }
         }
     }
@@ -281,6 +284,7 @@ impl LibraryProblem {
             "temporarySession": self.dismissed,
             "pendingImport": self.pending_import.len(),
             "upgrading": self.upgrading,
+            "opening": self.opening,
             "kind": self.kind().id(),
             "upgrade": lcc_engine::library::migration_progress(),
             "chooser": chooser,
@@ -330,12 +334,12 @@ impl Unavailable {
     pub fn text(&self) -> String {
         match self {
             Unavailable::NotFound => crate::i18n::tr("Not found: moved, renamed or on a disconnected drive").to_string(),
-            Unavailable::NotAFolder => crate::i18n::tr("This is a file, not a library folder").to_string(),
+            Unavailable::NotAFolder => crate::i18n::tr("This is a file, not a catalog folder").to_string(),
             Unavailable::Unreadable(e) => format!("{} {e}", crate::i18n::tr("This folder can't be read:")),
-            Unavailable::NoLibrary => crate::i18n::tr("There is no {app} library in this folder any more").to_string(),
-            Unavailable::CatalogUnreadable(e) => format!("{} {e}", crate::i18n::tr("The library's catalog can't be read:")),
+            Unavailable::NoLibrary => crate::i18n::tr("There is no {app} catalog in this folder any more").to_string(),
+            Unavailable::CatalogUnreadable(e) => format!("{} {e}", crate::i18n::tr("The catalog can't be read:")),
             Unavailable::CheckFailed(e) => e.clone(),
-            Unavailable::LookupFailed(e) => format!("{} {e}", crate::i18n::tr("This library couldn't be checked:")),
+            Unavailable::LookupFailed(e) => format!("{} {e}", crate::i18n::tr("This catalog couldn't be checked:")),
         }
     }
 }
@@ -350,7 +354,7 @@ pub const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30
 pub const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The activity stack's row for a check (English: the stack translates it).
-const CHECK_LABEL: &str = "Checking recent libraries";
+const CHECK_LABEL: &str = "Checking recent catalogs";
 
 /// One path's answer and when it came.
 #[derive(Clone, Debug)]
@@ -509,7 +513,7 @@ fn reap_checks(app: &mut LccApp) {
     let dead: Vec<String> = app.recent_checks.pending.keys().cloned().collect();
     for path in dead {
         app.recent_checks.pending.remove(&path);
-        let why = Unavailable::CheckFailed(crate::i18n::tr("This library couldn't be checked").to_string());
+        let why = Unavailable::CheckFailed(crate::i18n::tr("This catalog couldn't be checked").to_string());
         app.recent_checks.known.insert(path, Answer { why: Some(why), at: web_time::Instant::now() });
     }
     apply_answers(app);
@@ -582,7 +586,7 @@ enum Choice {
     New,
     /// The launch list over a library already open: close the window and keep it.
     Keep,
-    /// The problem window: the New Catalog dialog.
+    /// The problem window: the New Library dialog.
     NewCatalog,
 }
 
@@ -617,15 +621,16 @@ pub fn hold_dropped(app: &mut LccApp, ctx: &egui::Context, photos: Vec<String>) 
     }
     let problem = app.library_problem.as_mut()?;
     problem.pending_import.extend(photos);
-    app.toast(ctx, crate::i18n::tr("The photos are imported once a library is open"));
+    app.toast(ctx, crate::i18n::tr("The photos are imported once a catalog is open"));
     None
 }
 
-/// Open `path` (`None`: ask for a folder) through `app.openLibrary`; on success the problem is
-/// over (and command-line files are imported), else it shows the new error.
-fn open(app: &mut LccApp, path: Option<String>) {
+/// Open `path` (`None`: ask for a folder) through `app.openLibrary`, seeding a library created
+/// by the open with the demo photos when `demo`; on success the problem is over (and
+/// command-line files are imported), else it shows the new error.
+fn open(app: &mut LccApp, path: Option<String>, demo: bool) {
     let params = match &path {
-        Some(p) => json!({"path": p}),
+        Some(p) => json!({"path": p, "demo": demo}),
         None => json!({}),
     };
     match app.run("app.openLibrary", params) {
@@ -676,6 +681,8 @@ pub fn logic(app: &mut LccApp, ctx: &egui::Context) {
         app.waiting_import.extend(files);
     }
     alt_at_launch(app, ctx);
+    #[cfg(not(target_arch = "wasm32"))]
+    reap_opening(app);
     reap_checks(app);
     // the launch list asks for fresh answers once
     let listed: Option<Vec<String>> =
@@ -730,29 +737,45 @@ pub fn logic(app: &mut LccApp, ctx: &egui::Context) {
 
 /// Alt/Option held during the first [`ALT_SECONDS`] after the window appears opens the launch list
 /// once, over the library that opened (opening another one closes it). Not while files from the
-/// command line are importing into that library.
+/// command line are importing into that library. The list waits for a catalog still opening (or
+/// being upgraded) on a worker — it comes over the library once it is there.
 fn alt_at_launch(app: &mut LccApp, ctx: &egui::Context) {
     if !app.alt_asks_for_library {
         return;
     }
     let (alt, time) = ctx.input(|i| (i.modifiers.alt, i.time));
-    if time > ALT_SECONDS || app.library_problem.is_some() {
+    let starting = app.library_problem.as_ref().is_some_and(|p| p.opening || p.upgrading);
+    if time > ALT_SECONDS || (app.library_problem.is_some() && !starting) {
         app.alt_asks_for_library = false;
         return;
     }
-    if !alt {
+    if starting || !alt {
         return;
     }
     app.alt_asks_for_library = false;
-    if crate::panels::settings::can_switch_library(app).is_err() {
-        return;
+    if offer_list(app).is_ok() {
+        ctx.request_repaint();
+    }
+}
+
+/// The launch list over the library open now (Alt/Option held at launch, `catalog.chooser`): Esc
+/// keeps that library. Refused while an import runs (as every switch is), while a library that
+/// couldn't be opened still waits for an answer, and over a temporary session (Continue Without
+/// Saving), which must keep saving nothing; nothing changes when the list is already up (a dialog
+/// it opened may be over it).
+pub fn offer_list(app: &mut LccApp) -> Result<(), String> {
+    crate::panels::settings::can_switch_library(app)?;
+    match &app.library_problem {
+        None => {}
+        Some(p) if p.chooser.is_some() => return Ok(()),
+        Some(_) => return Err("the catalog that couldn't be opened comes first: open or create a catalog from its window or the File menu".into()),
     }
     let mut p = LibraryProblem::choose_later(&app.ui.settings);
     if let Some(c) = p.chooser.as_mut() {
         c.over = app.session.library.as_ref().map(|_| app.session.library_generation());
     }
     app.library_problem = Some(p);
-    ctx.request_repaint();
+    Ok(())
 }
 
 /// The launch list on screen (no dialog over it, e.g. New Library's name).
@@ -799,6 +822,14 @@ fn select(app: &mut LccApp, at: usize) {
     }
 }
 
+/// The activity label of the catalog upgrade ([`start_upgrade`]); its worker is watched for one
+/// that stops without an answer ([`reap_opening`]).
+#[cfg(not(target_arch = "wasm32"))]
+const UPGRADE_LABEL: &str = "Upgrade catalog";
+/// The activity label of the catalog open ([`start_open`]).
+#[cfg(not(target_arch = "wasm32"))]
+const OPEN_LABEL: &str = "Open catalog";
+
 /// Upgrade the catalog of the library in `dir` (an older format, see
 /// [`lcc_engine::library::needs_migration`]) on a worker thread, then open it; the window shows
 /// the progress meanwhile (a library of hundreds of thousands of photos takes tens of seconds,
@@ -806,10 +837,11 @@ fn select(app: &mut LccApp, at: usize) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn start_upgrade(app: &mut LccApp, dir: std::path::PathBuf, files: Vec<String>) {
     let path = dir.to_string_lossy().to_string();
+    let empty_start = files.is_empty();
     app.library_problem = Some(LibraryProblem { upgrading: true, pending_import: files, ..LibraryProblem::new(path.clone(), "") });
     let started = crate::tasks::spawn(
         app,
-        "Upgrade catalog",
+        UPGRADE_LABEL,
         None,
         move || lcc_engine::library::migrate_library(&dir).map_err(|e| e.to_string()),
         move |app, _ctx, res: Result<bool, String>| {
@@ -817,7 +849,10 @@ pub fn start_upgrade(app: &mut LccApp, dir: std::path::PathBuf, files: Vec<Strin
                 p.upgrading = false;
             }
             match res {
-                Ok(_) => open(app, Some(path)),
+                Ok(_) => {
+                    open(app, Some(path), false);
+                    opened_start_view(app, empty_start);
+                }
                 Err(e) => {
                     if let Some(p) = app.library_problem.as_mut() {
                         p.error = e;
@@ -831,6 +866,88 @@ pub fn start_upgrade(app: &mut LccApp, dir: std::path::PathBuf, files: Vec<Strin
     {
         p.upgrading = false;
         p.error = e;
+    }
+}
+
+/// Open the catalog of the library in `dir` on a worker thread once the window is up, then open
+/// it in the session on the interface's thread: the open used to run before the first frame,
+/// where a store left in an older format by an update (its byte-verified backup copy), or simply
+/// a large one being read, kept the window silent. The worker does only what must not happen
+/// there — [`lcc_engine::library::prepare_library`] — so the window shows the opening meanwhile,
+/// with the phase and progress of an upgrade on the way
+/// ([`lcc_engine::library::migration_progress`]). `files` are imported once it is open; `demo`
+/// seeds a library the open creates with the procedural demo photos; `by_argument`: the library
+/// was named on the command line (its catalog file double-clicked), so the one the settings
+/// remembered goes into the recent list as the library is opened. A failure shows the usual
+/// problem window.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_open(app: &mut LccApp, dir: std::path::PathBuf, files: Vec<String>, demo: bool, by_argument: bool) {
+    let path = dir.to_string_lossy().to_string();
+    let empty_start = files.is_empty();
+    app.library_problem = Some(LibraryProblem { opening: true, pending_import: files, ..LibraryProblem::new(path.clone(), "") });
+    let started = crate::tasks::spawn(
+        app,
+        OPEN_LABEL,
+        None,
+        move || lcc_engine::library::prepare_library(&dir).map_err(|e| e.to_string()),
+        move |app, _ctx, res: Result<bool, String>| {
+            if let Some(p) = app.library_problem.as_mut() {
+                p.opening = false;
+            }
+            // a library opened from its catalog file is the one in use from now on, as Open
+            // Library makes it: the one the settings remembered is kept in the recent list first
+            // (the open below puts the new one at its top)
+            let previous = app.ui.settings.library_path.clone();
+            if by_argument && !previous.is_empty() && previous != path {
+                crate::panels::settings::remember_library(&mut app.ui.settings.recent_libraries, &previous);
+            }
+            match res {
+                Ok(_) => {
+                    open(app, Some(path), demo);
+                    opened_start_view(app, empty_start);
+                }
+                Err(e) => {
+                    if let Some(p) = app.library_problem.as_mut() {
+                        p.error = e;
+                    }
+                }
+            }
+        },
+    );
+    if let Err(e) = started
+        && let Some(p) = app.library_problem.as_mut()
+    {
+        p.opening = false;
+        p.error = e;
+    }
+}
+
+/// What an empty library opens on once it is open at launch (a grid with the sidebar, where the
+/// way in is) — after the open, so a library with photos keeps the view it was left in.
+fn opened_start_view(app: &mut LccApp, empty_start: bool) {
+    if empty_start && app.library_problem.is_none() {
+        crate::panels::empty_library::open_on_empty_library(app);
+    }
+}
+
+/// An opening or upgrade whose worker stopped without an answer (it panicked: `tasks::poll`
+/// already said so) ends as the usual problem, never a window without a way out.
+#[cfg(not(target_arch = "wasm32"))]
+fn reap_opening(app: &mut LccApp) {
+    let (opening, upgrading) = match app.library_problem.as_ref() {
+        Some(p) => (p.opening, p.upgrading),
+        None => return,
+    };
+    let label = match (opening, upgrading) {
+        (true, _) if !app.tasks.is_running(OPEN_LABEL) => OPEN_LABEL,
+        (_, true) if !app.tasks.is_running(UPGRADE_LABEL) => UPGRADE_LABEL,
+        _ => return,
+    };
+    log::error!("{label}: its worker stopped without an answer");
+    if let Some(p) = app.library_problem.as_mut() {
+        p.opening = false;
+        p.upgrading = false;
+        p.error = crate::i18n::tr("Opening the catalog stopped unexpectedly. Try again, or choose another one.").to_string();
     }
 }
 
@@ -850,7 +967,7 @@ fn upgrade_window(ctx: &egui::Context, path: &str) {
     dim(ctx);
     let progress = lcc_engine::library::migration_progress();
     let frame = crate::dialog_frame::card_frame(ctx);
-    egui::Window::new(crate::i18n::tr("Upgrading your library"))
+    egui::Window::new(crate::i18n::tr("Upgrading your catalog"))
         .id(egui::Id::new("library-upgrade"))
         .title_bar(false)
         .order(egui::Order::Foreground)
@@ -862,8 +979,8 @@ fn upgrade_window(ctx: &egui::Context, path: &str) {
         .show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 440.0));
             ui.spacing_mut().item_spacing.y = 8.0;
-            crate::dialog_frame::card_header(ui, crate::i18n::tr("Upgrading your library"), None);
-            ui.label(RichText::new(crate::i18n::tr("{app} is moving the library at")).color(t.text_label));
+            crate::dialog_frame::card_header(ui, crate::i18n::tr("Upgrading your catalog"), None);
+            ui.label(RichText::new(crate::i18n::tr("{app} is moving the catalog at")).color(t.text_label));
             ui.label(RichText::new(path).font(t.semibold(12.5)).color(t.text));
             ui.label(
                 RichText::new(crate::i18n::tr(
@@ -888,9 +1005,65 @@ fn upgrade_window(ctx: &egui::Context, path: &str) {
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }
 
+/// The window shown while the catalog opens on a worker thread ([`start_open`]): what would
+/// otherwise be a silent wait (a window that doesn't answer) while a format upgrade after an
+/// update makes its byte-verified copy, or a large store is read. An upgrade on the way moves
+/// the bar by its bytes copied; otherwise it sweeps until the library is there.
+fn opening_window(ctx: &egui::Context, path: &str) {
+    let t = Tokens::get(ctx);
+    dim(ctx);
+    let progress = lcc_engine::library::migration_progress();
+    let frame = crate::dialog_frame::card_frame(ctx);
+    egui::Window::new(crate::i18n::tr("Opening your catalog"))
+        .id(egui::Id::new("library-opening"))
+        .title_bar(false)
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .frame(frame)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(460.0)
+        .show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 440.0));
+            ui.spacing_mut().item_spacing.y = 8.0;
+            crate::dialog_frame::card_header(ui, crate::i18n::tr("Opening your catalog"), None);
+            ui.label(RichText::new(crate::i18n::tr("{app} is opening the catalog at")).color(t.text_label));
+            ui.label(RichText::new(path).font(t.semibold(12.5)).color(t.text));
+            ui.label(
+                RichText::new(crate::i18n::tr(
+                    "One moment. After an update, a copy of the catalog is kept and checked first; a large catalog takes a little \
+                     while.",
+                ))
+                .color(t.text_dim),
+            );
+            let (frac, text) = match &progress {
+                Some(p) => (p.fraction(), crate::i18n::tr(p.phase.label()).to_string()),
+                None => {
+                    // nothing to measure yet: the bar sweeps back and forth so it is alive (the
+                    // window repaints while it is up, below)
+                    let x = (ctx.input(|i| i.time as f32) * 0.4).fract();
+                    (if x < 0.5 { x * 2.0 } else { (1.0 - x) * 2.0 }, crate::i18n::tr("Starting…").to_string())
+                }
+            };
+            let text = match &progress {
+                Some(p) if p.phase == lcc_engine::catalog::progress::MigrationPhase::Writing => {
+                    format!("{text}… {} / {}", p.done, p.total)
+                }
+                _ => format!("{text}…"),
+            };
+            let r = ui.add(egui::ProgressBar::new(frac).desired_width(440.0).text(RichText::new(text).font(t.font(11.5))));
+            register(ui.ctx(), "progress:libraryOpening", r.rect);
+        });
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+}
+
 /// The blocking window (until a choice is made).
 pub fn show(app: &mut LccApp, ctx: &egui::Context) {
     let Some(problem) = app.library_problem.clone() else { return };
+    if problem.opening {
+        opening_window(ctx, &problem.path);
+        return;
+    }
     if problem.upgrading {
         upgrade_window(ctx, &problem.path);
         return;
@@ -936,9 +1109,9 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                 register(ui.ctx(), "dialog:title", h.rect);
                 ui.add_space(2.0);
                 if problem.path.is_empty() {
-                    ui.label(RichText::new(crate::i18n::tr("{app} couldn't find where to keep your library.")).color(t.text_label));
+                    ui.label(RichText::new(crate::i18n::tr("{app} couldn't find where to keep your catalog.")).color(t.text_label));
                 } else {
-                    ui.label(RichText::new(crate::i18n::tr("{app} couldn't open the library at")).color(t.text_label));
+                    ui.label(RichText::new(crate::i18n::tr("{app} couldn't open the catalog at")).color(t.text_label));
                     ui.add(egui::Label::new(RichText::new(&problem.path).font(t.semibold(13.0)).color(t.text)).wrap());
                 }
                 // what went wrong, in a soft caution box
@@ -959,7 +1132,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                 // the other ways on, wrapping on a narrow window
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-                    button(ui, "libraryChoose", "Choose Another Library…", app.services.pick_folder.is_some(), Kind::Secondary, Choice::Choose);
+                    button(ui, "libraryChoose", "Choose Another Catalog…", app.services.pick_folder.is_some(), Kind::Secondary, Choice::Choose);
                     button(ui, "libraryNew", "New Catalog…", true, Kind::Secondary, Choice::NewCatalog);
                     button(ui, "libraryTemporary", "Continue Without Saving", true, Kind::Secondary, Choice::Temporary);
                 });
@@ -988,9 +1161,9 @@ fn act(app: &mut LccApp, choice: Choice) {
             if problem.never_create && !lcc_engine::library::is_library(&at) {
                 return;
             }
-            open(app, Some(problem.path))
+            open(app, Some(problem.path), false)
         }
-        Choice::Choose => open(app, None),
+        Choice::Choose => open(app, None, false),
         Choice::Open => {
             let Some((library, over)) = chosen.filter(|(l, _)| l.unavailable.is_none()) else { return };
             // the library already open behind the list: nothing to switch
@@ -998,7 +1171,7 @@ fn act(app: &mut LccApp, choice: Choice) {
             if over.is_some() && open_now {
                 app.library_problem = None;
             } else {
-                open(app, Some(library.path));
+                open(app, Some(library.path), false);
             }
         }
         Choice::Remove => {
@@ -1022,7 +1195,7 @@ fn act(app: &mut LccApp, choice: Choice) {
             }
         }
         Choice::NewCatalog => {
-            // the New Catalog dialog (it opens the catalog it creates, which ends the problem)
+            // the New Library dialog (it opens the library it creates, which ends the problem)
             if let Some(p) = app.library_problem.as_mut() {
                 p.dismissed = true;
             }
@@ -1041,7 +1214,7 @@ fn act(app: &mut LccApp, choice: Choice) {
     }
 }
 
-/// New Catalog… from the problem window: the catalog dialog, under the Pictures folder by default.
+/// New Library… from the problem window: the New Library dialog, under the Pictures folder by default.
 fn new_catalog_dialog(app: &mut LccApp) {
     let parent = lcc_engine::library::default_dir().and_then(|d| d.parent().map(std::path::Path::to_path_buf));
     let params = json!({"parent": parent.map(|d| d.to_string_lossy().into_owned())});
@@ -1060,7 +1233,7 @@ fn show_chooser(app: &mut LccApp, ctx: &egui::Context, problem: &LibraryProblem,
     let can_pick = app.services.pick_folder.is_some();
     let open_now = app.session.library.as_ref().filter(|l| l.on_disk).map(|l| l.dir.clone());
     let frame = crate::dialog_frame::card_frame(ctx);
-    egui::Window::new(crate::i18n::tr("Open a Library"))
+    egui::Window::new(crate::i18n::tr("Open a Catalog"))
         .id(egui::Id::new("library-chooser"))
         .title_bar(false)
         .order(egui::Order::Foreground)
@@ -1073,10 +1246,10 @@ fn show_chooser(app: &mut LccApp, ctx: &egui::Context, problem: &LibraryProblem,
             // a fixed width (narrower on a phone): a wrapped label in an auto-sized, centred window would move it every frame
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 500.0));
             ui.spacing_mut().item_spacing.y = 8.0;
-            crate::dialog_frame::card_header(ui, crate::i18n::tr("Open a Library"), None);
-            ui.label(RichText::new(crate::i18n::tr("Choose the library to open.")).color(t.text_label));
+            crate::dialog_frame::card_header(ui, crate::i18n::tr("Open a Catalog"), None);
+            ui.label(RichText::new(crate::i18n::tr("Choose the catalog to open.")).color(t.text_label));
             if chooser.libraries.is_empty() {
-                let r = ui.label(RichText::new(crate::i18n::tr("No recent libraries. Open one from a folder, or make a new one.")).color(t.text_dim));
+                let r = ui.label(RichText::new(crate::i18n::tr("No recent catalogs. Open one from a folder, or make a new one.")).color(t.text_dim));
                 register(ui.ctx(), "indicator:noRecentLibraries", r.rect);
             }
             egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -1103,13 +1276,13 @@ fn show_chooser(app: &mut LccApp, ctx: &egui::Context, problem: &LibraryProblem,
             };
             ui.horizontal(|ui| {
                 button(ui, "libraryForget", "Remove from List", selected.is_some(), Choice::Remove);
-                ui.label(RichText::new(crate::i18n::tr("The library itself stays where it is.")).size(11.0).color(t.text_dim));
+                ui.label(RichText::new(crate::i18n::tr("The catalog itself stays where it is.")).size(11.0).color(t.text_dim));
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 button(ui, "libraryOpen", "Open", selected.is_some_and(|l| l.unavailable.is_none()), Choice::Open);
                 button(ui, "libraryOpenAnother", "Open Another…", can_pick, Choice::Choose);
-                button(ui, "libraryNew", "New Library…", can_pick, Choice::New);
+                button(ui, "libraryNew", "New Catalog…", can_pick, Choice::New);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     button(ui, "libraryQuit", "Quit", true, Choice::Quit);
                 });
@@ -1192,13 +1365,13 @@ pub fn banner(app: &mut LccApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 let r = ui.label(
-                    RichText::new(crate::i18n::tr("Temporary session — your library isn't open, and nothing you do here is saved."))
+                    RichText::new(crate::i18n::tr("Temporary session: your catalog isn't open, and nothing you do here is saved."))
                         .font(t.semibold(12.5))
                         .color(t.canvas),
                 );
                 register(ui.ctx(), "indicator:temporarySession", r.rect);
                 let b = ui.add(
-                    egui::Button::new(RichText::new(crate::i18n::tr("Open Library…")).color(t.canvas)).fill(egui::Color32::from_black_alpha(40)),
+                    egui::Button::new(RichText::new(crate::i18n::tr("Open Catalog…")).color(t.canvas)).fill(egui::Color32::from_black_alpha(40)),
                 );
                 register(ui.ctx(), "button:libraryReopen", b.rect);
                 reopen = b.clicked();

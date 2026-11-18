@@ -49,6 +49,7 @@ pub fn compare_pair(app: &mut LccApp) -> Option<(PhotoId, PhotoId)> {
 pub fn enter_compare(app: &mut LccApp) -> Result<Value, String> {
     app.ui.compare = None;
     let (a, b) = compare_pair(app).ok_or("Compare needs at least two photos")?;
+    app.leave_fullscreen_preview();
     app.ui.view = ViewMode::Compare;
     // the candidate is active: rating/flag keys judge it against the select
     select_pair(app, a, b, b);
@@ -173,6 +174,16 @@ pub fn advance(app: &mut LccApp, was: Option<PhotoId>) {
         _ if app.session.active() != was => Ok(Value::Null),
         _ => app.session.execute("library.next", &json!({})).map_err(|e| e.to_string()),
     };
+}
+
+/// A right-click on a selected photo of Compare or Survey (a tile or its filmstrip thumbnail) makes it the active
+/// one, so the rating, flag and label rows of its menu judge the photo that was clicked, as the keys judge the
+/// active photo. The selection stays (upstream #3716).
+pub fn activate_on_right_click(app: &mut LccApp, resp: &egui::Response, id: PhotoId) {
+    if resp.secondary_clicked() && culling(app) && app.session.active() != Some(id) && app.session.selection.contains(id) {
+        let ids: Vec<u64> = app.session.selection.ids.iter().map(|p| p.0).collect();
+        let _ = app.run("library.select", json!({"ids": ids, "active": id.0}));
+    }
 }
 
 /// In the culling views, point a photo command at the active photo only (not the whole selection).
@@ -406,6 +417,7 @@ pub fn show_compare(app: &mut LccApp, ui: &mut egui::Ui) {
         if resp.double_clicked() {
             app.ui.zoom = if app.ui.zoom == Zoom::Fit { Zoom::Percent(100.0) } else { Zoom::Fit };
         }
+        activate_on_right_click(app, &resp, id);
         crate::widgets::context_menu(&resp, |ui| {
             if ui.button(crate::i18n::tr("Swap")).clicked() {
                 let _ = swap(app);
@@ -475,6 +487,7 @@ pub fn show_survey(app: &mut LccApp, ui: &mut egui::Ui) {
                 let _ = app.run("library.select", json!({"ids": [id.0], "mode": "toggle"}));
             }
         }
+        activate_on_right_click(app, &resp, *id);
         crate::widgets::context_menu(&resp, |ui| super::grid::context_menu(app, ui, *id));
     }
     let n = photos.len();

@@ -68,7 +68,35 @@ struct MaskBufs {
     key: u64,
     chroma: Option<u32>,
     mattes: Option<Arc<lcc_pipeline::masks::Mattes>>,
-    alpha: Arc<Buf>,
+    alpha: Arc<MaskAlpha>,
+}
+
+/// The masks' alpha planes. Back to back in one buffer (then the blurred chromaticity) when that
+/// fits the device's storage-buffer limit; otherwise one buffer per mask, which the finish kernel
+/// reads band by band (a 45 MP export with 13 masks needs 2,220 MiB, over the 2,047 MiB limit,
+/// and went to the CPU at a sixth of the speed). Both are evaluated by the same kernels, so they
+/// hold the same values.
+enum MaskAlpha {
+    Joined(Buf),
+    Split { planes: Vec<Buf>, chroma: Option<Arc<Buf>> },
+}
+
+impl MaskAlpha {
+    /// 32-bit words held.
+    fn words(&self) -> usize {
+        match self {
+            MaskAlpha::Joined(b) => b.len,
+            MaskAlpha::Split { planes, .. } => planes.iter().map(|p| p.len).sum(),
+        }
+    }
+
+    /// A copy of mask `mi`'s plane of `n` pixels (recorded); `None` past the last mask.
+    fn plane(&self, cx: &mut Cx<'_>, mi: usize, n: usize) -> Option<Buf> {
+        match self {
+            MaskAlpha::Joined(b) => (mi.checked_add(1)?.checked_mul(n)? <= b.len).then(|| cx.slice(b, mi * n, n)),
+            MaskAlpha::Split { planes, .. } => planes.get(mi).map(|p| cx.slice(p, 0, n.min(p.len))),
+        }
+    }
 }
 
 impl MaskBufs {
@@ -77,7 +105,7 @@ impl MaskBufs {
             && self.chroma == chroma
             && match (&self.mattes, mattes) {
                 (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (Some(a), Some(b)) => lcc_pipeline::masks::Mattes::same(a, b),
                 _ => false,
             }
     }
@@ -138,6 +166,8 @@ impl GpuStages {
     /// Device bytes held (each buffer counted once).
     pub fn bytes(&self) -> usize {
         let mut seen: Vec<*const Buf> = Vec::new();
+        let mut seen_masks: Vec<*const MaskAlpha> = Vec::new();
+        let mut mask_bytes = 0;
         let mut total = 0;
         let mut add = |b: &Arc<Buf>| {
             let p = Arc::as_ptr(b);
@@ -159,12 +189,18 @@ impl GpuStages {
             p.sharpen.iter().for_each(|(_, b)| add(b));
             p.dark.iter().for_each(|(_, b, _)| add(b));
             p.chroma.iter().for_each(|(_, b)| add(b));
-            p.masks.iter().for_each(|m| add(&m.alpha));
+            if let Some(m) = &p.masks {
+                let a = Arc::as_ptr(&m.alpha);
+                if !seen_masks.contains(&a) {
+                    seen_masks.push(a);
+                    mask_bytes += m.alpha.words() * 4;
+                }
+            }
         }
         if let Some((_, b)) = &*self.source.lock().unwrap_or_else(|e| e.into_inner()) {
             add(b);
         }
-        total
+        total + mask_bytes
     }
 
     /// Drop everything (e.g. when memory is needed).
@@ -292,6 +328,20 @@ impl<'a> Cx<'a> {
         let enc = self.enc.get_or_insert_with(|| self.gpu.encoder());
         enc.copy_buffer_to_buffer(b.raw(), (offset * 4) as u64, out.raw(), 0, (len * 4) as u64);
         out
+    }
+
+    /// Copy `len` words of `src` from `from` into `dst` at `to` (recorded). A range past either
+    /// buffer fails the render over to the CPU instead of raising a validation error.
+    pub fn copy_range(&mut self, src: &Buf, from: usize, dst: &Buf, to: usize, len: usize) {
+        if from.checked_add(len).is_none_or(|e| e > src.len) || to.checked_add(len).is_none_or(|e| e > dst.len) {
+            fail(FailKind::Fatal, format!("copy of {len} values at {from} → {to} past a buffer of {} / {}", src.len, dst.len));
+            return;
+        }
+        if len == 0 {
+            return;
+        }
+        let enc = self.enc.get_or_insert_with(|| self.gpu.encoder());
+        enc.copy_buffer_to_buffer(src.raw(), (from * 4) as u64, dst.raw(), (to * 4) as u64, (len * 4) as u64);
     }
 
     /// Copy all of `src` into `dst` at `offset` (32-bit words; recorded).
@@ -585,7 +635,10 @@ fn warp_params(wp: &lcc_pipeline::optics::Warp, base: (usize, usize), out: (usiz
     p.extend([f(v.center.x), f(v.center.y), f(v.radius)]);
     p.push(wp.per_channel() as u32);
     p.push(wp.has_gain() as u32);
-    debug_assert_eq!(p.len(), 65);
+    // the flat-field gain (`Warp::field`): on?, amount, nodes per side; its EV grid is the `field` binding
+    let amount = wp.field_amount();
+    p.extend([(amount != 0.0) as u32, amount.to_bits(), lcc_pipeline::vignetting_calibration::FIELD_NODES as u32]);
+    debug_assert_eq!(p.len(), 68);
     p
 }
 
@@ -661,7 +714,7 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         let out = cx.gpu.buffer(sp.ow * sp.oh * 3);
         let mut p = vec![src.width as u32, src.height as u32, sp.ow as u32, sp.oh as u32];
         p.extend(orient_map(fr.orient, src.width, src.height).map(|v| v as u32));
-        cx.run("orient", &p, &[Some(&src_buf), Some(&out), None], groups2(sp.ow, sp.oh, [16, 16]));
+        cx.run("orient", &p, &[Some(&src_buf), Some(&out), None, None], groups2(sp.ow, sp.oh, [16, 16]));
         Arc::new(out)
     };
     let (base, (bw, bh)) = match sp.prefilter {
@@ -672,7 +725,7 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         let out = cx.gpu.buffer(w * h * 3);
         let mut p = vec![bw as u32, bh as u32, w as u32, h as u32];
         p.extend(affine_bits(xf));
-        cx.run("sample_affine", &p, &[Some(&base), Some(&out), None], groups2(w, h, [16, 16]));
+        cx.run("sample_affine", &p, &[Some(&base), Some(&out), None, None], groups2(w, h, [16, 16]));
         Arc::new(out)
     };
     match (&sp.mode, fr.warp.as_ref()) {
@@ -686,7 +739,9 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
             // f32 rounding can cross a source edge. Keep the reference f64
             // framing decision in a bit mask; color sampling stays on the GPU.
             let coverage = cx.gpu.upload(wp.coverage(o2t, w, h).words());
-            cx.run("sample_warp", &p, &[Some(&base), Some(&out), Some(&coverage)], groups2(w, h, [16, 16]));
+            // (64 × 64 values, uploaded with the render: a placeholder binding without a field)
+            let field = wp.field.as_ref().filter(|f| f.amount != 0.0).map(|f| cx.gpu.upload(f.ev.as_slice()));
+            cx.run("sample_warp", &p, &[Some(&base), Some(&out), Some(&coverage), field.as_ref()], groups2(w, h, [16, 16]));
             Arc::new(out)
         }
     }
@@ -883,7 +938,7 @@ pub fn render(
         cx.run("box_h", &[0; 5], &[Some(&aux), Some(&out)], [gpu.device.limits().max_compute_workgroups_per_dimension + 1, 1, 1]);
     }
     // in bands of rows: each dispatch (and submission) stays short on a slow GPU
-    let rows = (BAND_PIXELS / w.max(1) / 16 * 16).max(16); // whole workgroups: bands never overlap
+    let mut rows = (BAND_PIXELS / w.max(1) / 16 * 16).max(16); // whole workgroups: bands never overlap
     let y0_at = crate::params::index("Y0").unwrap_or(0);
     let mut p = p;
     if deep {
@@ -893,8 +948,41 @@ pub fn render(
             }
         }
     }
+    // masks too big for one buffer: each band's rows of every plane (then of the chromaticity)
+    // are copied into one band buffer, which the kernel reads at MASK_N / MASK_I0
+    let split = match masks.as_deref() {
+        Some(MaskAlpha::Split { planes, chroma }) => Some((planes, chroma.as_ref().filter(|_| present.chroma))),
+        _ => None,
+    };
+    let band = split.map(|(planes, chroma)| {
+        let per_pixel = (planes.len() + if chroma.is_some() { 3 } else { 0 }).max(1);
+        let fit = usize::try_from(gpu.limit() / 4).unwrap_or(usize::MAX) / per_pixel.saturating_mul(w).max(1) / 16 * 16;
+        rows = rows.min(fit.max(16));
+        cx.gpu.buffer(per_pixel * rows.min(h) * w)
+    });
+    let band_at = (crate::params::index("MASK_N"), crate::params::index("MASK_I0"));
     for y0 in (0..h).step_by(rows).filter(|_| fault != Some(crate::Fault::DropWork)) {
         p[y0_at] = y0 as u32;
+        if let (Some((planes, chroma)), Some(band), (Some(mn_at), Some(mi_at))) = (split, &band, band_at) {
+            let (nb, i0) = (rows.min(h - y0) * w, y0 * w);
+            for (m, plane) in planes.iter().enumerate() {
+                cx.copy_range(plane, i0, band, m * nb, nb);
+            }
+            if let Some(ch) = chroma {
+                cx.copy_range(ch, 3 * i0, band, planes.len() * nb, 3 * nb);
+            }
+            if let (Some(a), Some(b)) = (p.get_mut(mn_at), u32::try_from(nb).ok()) {
+                *a = b;
+            }
+            if let (Some(a), Some(b)) = (p.get_mut(mi_at), u32::try_from(i0).ok()) {
+                *a = b;
+            }
+        }
+        let mask_buf = match masks.as_deref() {
+            Some(MaskAlpha::Joined(b)) => Some(b),
+            Some(MaskAlpha::Split { .. }) => band.as_ref(),
+            None => None,
+        };
         cx.run(
             "main",
             &p,
@@ -905,7 +993,7 @@ pub fn render(
                 prep.clarity.as_deref(),
                 tex_buf.as_deref(),
                 prep.dark.as_deref(),
-                masks.as_deref(),
+                mask_buf,
                 Some(&aux),
                 Some(&out),
             ],
@@ -929,9 +1017,9 @@ pub fn render(
     // the alpha a mask overlay shows: copied out before the readback below submits
     let overlay_mask = req.overlay.mask(s).map(|m| {
         let list = s.masks.iter().filter(|m| m.visible && !m.components.is_empty()).take(lcc_pipeline::masks::max_masks(w, h));
-        match (list.map(|m| m.id).position(|id| id == m.id), masks.as_ref()) {
-            (Some(mi), Some(all)) => Ok(cx.slice(all, mi * n, n)),
-            _ => Err(m),
+        match list.map(|m| m.id).position(|id| id == m.id).zip(masks.as_ref()).and_then(|(mi, all)| all.plane(&mut cx, mi, n)) {
+            Some(plane) => Ok(plane),
+            None => Err(m),
         }
     });
     // every visible mask's alpha, for `Overlay::AllMasks` (one tint over all masks at once).
@@ -944,11 +1032,18 @@ pub fn render(
             if list.is_empty() {
                 return Vec::new();
             }
+            let all = match &**all {
+                MaskAlpha::Joined(b) => b,
+                // (planes too big for one buffer: one readback each)
+                MaskAlpha::Split { planes, .. } => {
+                    return planes.iter().take(list.len()).map(|b| Plane { width: w, height: h, data: cx.read(b, n.min(b.len)) }).collect();
+                }
+            };
             let raw: Vec<f32> = cx.read(all, n * list.len());
             let mut alphas = Vec::with_capacity(list.len());
             for mi in 0..list.len() {
                 let s = mi * n;
-                alphas.push(Plane { width: w, height: h, data: raw[s..s + n].to_vec() });
+                alphas.push(Plane { width: w, height: h, data: raw.get(s..s + n).map(<[f32]>::to_vec).unwrap_or_default() });
             }
             alphas
         })
@@ -1452,6 +1547,10 @@ const FIXED_BAND_BUDGET: usize = 2048 << 20;
 /// plans its noise reduction bands, each of the others may still allocate the buffers of its other stages.
 static RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The bytes the joint colour noise reduction's bands may take when pinned with
+/// [`crate::set_nr_band_budget`] (0: not pinned, planned from the device by [`band_budget_from`]).
+pub(crate) static NR_BAND_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Held while a noise reduction plans its bands and runs them: two plans made at once from the same
 /// memory would together ask for more than there is.
 static BANDS: Bands = Bands::new();
@@ -1608,8 +1707,14 @@ fn color_nr_joint(
     // 12 values per pixel (guide 3, two chroma buffers 2 + 2, paths 2, weights 2; up to 12 while the
     // speck brake and the guide run). The budget for both together is `band_budget_from` the device's
     // memory where its backend reports it (`lcc_gpumem`, `Gpu::vram`), else a fixed 2 GB;
-    // `<PREFIX>_NR_GPU_BAND_MB` overrides it.
-    let fixed = budget.or_else(|| lcc_brand::env("NR_GPU_BAND_MB").and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb.saturating_mul(1 << 20)));
+    // a budget pinned with `set_nr_band_budget`, else `<PREFIX>_NR_GPU_BAND_MB`, overrides it.
+    let pinned = match NR_BAND_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        bytes => Some(bytes),
+    };
+    let from_env = || lcc_brand::env("NR_GPU_BAND_MB").and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb.saturating_mul(1 << 20));
+    let pinned_used = budget.is_none() && pinned.is_some();
+    let fixed = budget.or(pinned).or_else(from_env);
     let renders = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
     let memory = crate::ctx::memory();
     let measured = cx.gpu.vram.map(|vram| band_budget_from(vram, memory.allocated, memory.pooled, renders));
@@ -1618,7 +1723,9 @@ fn color_nr_joint(
         eprintln!(
             "  gpu joint budget: {} MB ({}, {renders} render(s) on the device)",
             budget >> 20,
-            if fixed.is_some() {
+            if pinned_used {
+                "pinned"
+            } else if fixed.is_some() {
                 "NR_GPU_BAND_MB"
             } else if measured.is_some() {
                 "device memory"
@@ -2137,7 +2244,7 @@ fn masks(
     plan: &Plan<'_>,
     host: &mut Host,
     planes: &mut Planes,
-) -> (Option<Arc<Buf>>, Vec<[f32; MASK_TERMS]>, Vec<Option<[Lut1; 3]>>) {
+) -> (Option<Arc<MaskAlpha>>, Vec<[f32; MASK_TERMS]>, Vec<Option<[Lut1; 3]>>) {
     let s = &*plan.settings;
     // as the CPU path keeps them: the first `max_masks`, so over-cap documents render the same
     let list: Vec<_> =
@@ -2158,9 +2265,61 @@ fn masks(
     (Some(alpha), terms, curves)
 }
 
-/// The alpha planes of the visible masks `list` (concatenated, then the blurred chromaticity).
+/// The alpha planes of the visible masks `list`: concatenated, then the blurred chromaticity, or
+/// one buffer per mask when together they exceed the device's buffer limit ([`MaskAlpha`]).
 #[allow(clippy::too_many_arguments)]
-fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Host, list: &[&lcc_develop::Mask]) -> Buf {
+fn mask_alpha(
+    cx: &mut Cx<'_>,
+    src: &Arc<Rgb32f>,
+    lin: &Buf,
+    prep: &Prep,
+    plan: &Plan<'_>,
+    host: &mut Host,
+    list: &[&lcc_develop::Mask],
+) -> MaskAlpha {
+    let n = plan.w * plan.h;
+    let joined = n.checked_mul(list.len()).and_then(|v| v.checked_add(if prep.chroma.is_some() { 3 * n } else { 0 }));
+    match joined.filter(|&len| cx.gpu.fits(len)) {
+        Some(len) => {
+            let alpha = cx.zeroed(len);
+            if let Some(ch) = &prep.chroma {
+                cx.copy_into(ch, &alpha, n * list.len());
+            }
+            let comp_plane = cx.gpu.buffer(n);
+            for (mi, m) in list.iter().enumerate() {
+                mask_plane(cx, src, lin, prep, plan, host, m, &alpha, mi, &comp_plane);
+            }
+            MaskAlpha::Joined(alpha)
+        }
+        None => {
+            let comp_plane = cx.gpu.buffer(n);
+            let planes = list
+                .iter()
+                .map(|m| {
+                    let alpha = cx.zeroed(n);
+                    mask_plane(cx, src, lin, prep, plan, host, m, &alpha, 0, &comp_plane);
+                    alpha
+                })
+                .collect();
+            MaskAlpha::Split { planes, chroma: prep.chroma.clone() }
+        }
+    }
+}
+
+/// Evaluate mask `m` into plane `mi` of `alpha` (`comp_plane`: scratch for one component).
+#[allow(clippy::too_many_arguments)]
+fn mask_plane(
+    cx: &mut Cx<'_>,
+    src: &Arc<Rgb32f>,
+    lin: &Buf,
+    prep: &Prep,
+    plan: &Plan<'_>,
+    host: &mut Host,
+    m: &lcc_develop::Mask,
+    alpha: &Buf,
+    mi: usize,
+    comp_plane: &Buf,
+) {
     use lcc_develop::{MaskOp, MaskShape};
     let s = &*plan.settings;
     let (w, h) = (plan.w, plan.h);
@@ -2171,12 +2330,7 @@ fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: 
     let [a, b, c, d, e, f] = frame.out_to_norm(w, h).0;
     let (kx, ky) = (frame.ow / long, frame.oh / long);
     let aff = [a * kx, b * ky, c * kx, d * ky, e * kx, f * ky].map(|v| (v as f32).to_bits());
-    let alpha = cx.zeroed(n * list.len() + if prep.chroma.is_some() { 3 * n } else { 0 });
-    if let Some(ch) = &prep.chroma {
-        cx.copy_into(ch, &alpha, n * list.len());
-    }
-    let comp_plane = cx.gpu.buffer(n);
-    for (mi, m) in list.iter().enumerate() {
+    {
         // its coordinates on the photo before the warp (`masks::evaluate_one`): through a lens or
         // perspective warp the kernels' affine positions don't hold, so its gradients run on the CPU
         let mframe = plan.frame.for_mask(m.on_photo);
@@ -2308,7 +2462,7 @@ fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: 
                 Some(k) => {
                     p[2] = k;
                     let aux = (!aux.is_empty()).then(|| cx.gpu.upload(&aux));
-                    cx.run("shape", &p, &[Some(lin), Some(&prep.log_l), aux.as_ref(), Some(&comp_plane), Some(&alpha)], groups2(w, h, [16, 16]));
+                    cx.run("shape", &p, &[Some(lin), Some(&prep.log_l), aux.as_ref(), Some(comp_plane), Some(alpha)], groups2(w, h, [16, 16]));
                     None
                 }
                 None => {
@@ -2322,7 +2476,7 @@ fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: 
                     Some(cx.gpu.upload(&v.data))
                 }
             };
-            let cbuf = plane.as_ref().unwrap_or(&comp_plane);
+            let cbuf = plane.as_ref().unwrap_or(comp_plane);
             let k = [n as u32, 0, mi as u32, op];
             // An inverted mask is inverted again at the end, so combine on its visible side:
             // invert the plane, combine, invert back. Op 0 is the plain copy of the first
@@ -2332,17 +2486,17 @@ fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: 
             let flip = m.invert && op != 0;
             let fk = [n as u32, 0, mi as u32, 1, 1f32.to_bits()];
             if flip {
-                cx.run("finalize", &fk, &[None, None, None, None, Some(&alpha)], groups1(n));
+                cx.run("finalize", &fk, &[None, None, None, None, Some(alpha)], groups1(n));
             }
-            cx.run("combine", &k, &[None, None, None, Some(cbuf), Some(&alpha)], groups1(n));
+            cx.run("combine", &k, &[None, None, None, Some(cbuf), Some(alpha)], groups1(n));
             if flip {
-                cx.run("finalize", &fk, &[None, None, None, None, Some(&alpha)], groups1(n));
+                cx.run("finalize", &fk, &[None, None, None, None, Some(alpha)], groups1(n));
             }
         }
         // Refine Edges and Feather (`masks::evaluate_one`): on the combined alpha, before the
         // mask's invert and amount
         if m.refine > 0.0 || m.feather > 0.0 {
-            let mut plane = cx.slice(&alpha, mi * n, n);
+            let mut plane = cx.slice(alpha, mi * n, n);
             if m.refine > 0.0 {
                 let k = (m.refine / 100.0).clamp(0.0, 1.0) as f32;
                 let sigma = (0.04 * frame.output_long(w, h) as f32 * k).max(1.0);
@@ -2352,23 +2506,88 @@ fn mask_alpha(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, lin: &Buf, prep: &Prep, plan: 
                 let k = (m.feather / 100.0).clamp(0.0, 1.0) as f32;
                 plane = gaussian(cx, &plane, w, h, 1, 0.02 * frame.output_long(w, h) as f32 * k);
             }
-            cx.copy_into(&plane, &alpha, mi * n);
+            cx.copy_into(&plane, alpha, mi * n);
         }
         let amt = (m.adjust.amount / 100.0) as f32;
-        cx.run(
-            "finalize",
-            &[n as u32, 0, mi as u32, m.invert as u32, amt.to_bits()],
-            &[None, None, None, Some(&comp_plane), Some(&alpha)],
-            groups1(n),
-        );
+        cx.run("finalize", &[n as u32, 0, mi as u32, m.invert as u32, amt.to_bits()], &[None, None, None, Some(comp_plane), Some(alpha)], groups1(n));
     }
-    alpha
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lcc_develop::DevelopSettings;
+
+    /// The colour NR of processes V1–V7 (`local::colour_nr`) on the device matches the CPU: the 3 × 3
+    /// chromaticity median exactly (it is a selection), the whole step to float rounding. The median's
+    /// insertion sort over a private array came out wrong on Vulkan, where Windows' compute moved with
+    /// issue #934 (up to 81 8-bit levels in the equivalence tests); DX12 had hidden it.
+    #[test]
+    fn colour_nr_before_v8_matches_the_cpu() {
+        let Some(gpu) = crate::device() else {
+            lcc_testkit::skip!(Gpu, "no GPU adapter");
+            return;
+        };
+        let _scope = crate::ctx::RenderScope::new(&gpu);
+        // odd sizes (a last workgroup part full), hashed colour noise with some negative values
+        let (w, h) = (97usize, 61usize);
+        let hash = |x: usize, y: usize, c: usize| {
+            let mut v = (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b) ^ (c as u32 + 1).wrapping_mul(0xc2b2_ae35) | 1;
+            v ^= v << 13;
+            v ^= v >> 17;
+            v ^= v << 5;
+            v as f32 / u32::MAX as f32
+        };
+        let img = Rgb32f::from_fn(w, h, |x, y| [0, 1, 2].map(|c| hash(x, y, c) * 0.4 - 0.02));
+        let n = w * h;
+        let mut cx = Cx::new(&gpu);
+        let src = gpu.upload(rgb_words(&img));
+        let med = cx.gpu.buffer(n * 3);
+        map(&mut cx, "chroma_med", n, &[w as u32], [Some(&src), None, None], &med);
+        let gpu_med = cx.read_rgb(&med, w, h);
+        let chroma = Rgb32f::from_fn(w, h, |x, y| {
+            let c = img.get(x, y).map(|v| v.max(0.0));
+            let yl = lcc_color::luminance_2020(c).max(1e-6);
+            c.map(|v| v / yl)
+        });
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = [[0.0f32; 9]; 3];
+                for (k, (dx, dy)) in (-1..=1isize).flat_map(|dy| (-1..=1isize).map(move |dx| (dx, dy))).enumerate() {
+                    let c = chroma.get_clamped(x as isize + dx, y as isize + dy);
+                    for ch in 0..3 {
+                        v[ch][k] = c[ch];
+                    }
+                }
+                for ch in 0..3 {
+                    v[ch].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let (want, got) = (v[ch][4], gpu_med.get(x, y)[ch]);
+                    assert!((want - got).abs() <= 1e-6 * want.abs().max(1.0), "median at ({x}, {y}) channel {ch}: GPU {got}, CPU {want}");
+                }
+            }
+        }
+        // the whole step, as `denoise` runs it
+        let mut s = DevelopSettings { process: lcc_develop::Process::V7.version(), ..Default::default() };
+        s.detail.nr_color = 25.0;
+        let Some(nr) = local::nr_params(&s, 1.0).1 else { panic!("Color 25 has parameters") };
+        let clamped = cx.gpu.buffer(n * 3);
+        map(&mut cx, "clamp0_k", n, &[], [Some(&src), None, None], &clamped);
+        let blurred = gaussian(&mut cx, &clamped, w, h, 3, nr.sigma);
+        let out = cx.gpu.buffer(n * 3);
+        map(
+            &mut cx,
+            "nr_col",
+            n,
+            &[nr.t.to_bits(), local::SPECKLE_LO.to_bits(), local::SPECKLE_HI.to_bits()],
+            [Some(&src), Some(&med), Some(&blurred)],
+            &out,
+        );
+        let gpu_out = cx.read_rgb(&out, w, h);
+        let mut cpu = img.clone();
+        local::denoise_with(&mut cpu, &s, 1.0, false, None);
+        let worst = gpu_out.data.iter().zip(&cpu.data).flat_map(|(p, q)| (0..3).map(move |c| (p[c] - q[c]).abs())).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "colour NR V7, GPU vs CPU: {worst}");
+    }
 
     /// Runs `upload_with` on a thread whose upload takes 800 ms, and returns how long `read` took
     /// on this thread while that upload ran.

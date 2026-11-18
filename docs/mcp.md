@@ -67,9 +67,8 @@ Or check a project-scoped `.mcp.json` into your repo:
 
 ### Codex
 
-The macOS release includes a separate `<cli>-<version>-macos-universal.zip`;
-unpack it alongside the desktop app if you do not want to build from source. Use the CLI
-and app from the same release. Verify both downloads against that release's `SHA256SUMS.txt`.
+On macOS the CLI is inside the app, `/Applications/<app>.app/Contents/MacOS/<cli>`, so the CLI and
+app always come from the same release (verify the download against that release's `SHA256SUMS.txt`).
 
 Register the CLI's stdio server with Codex using its **absolute** installed path:
 
@@ -103,13 +102,15 @@ The release packages ship `<cli>` alongside the desktop app, so no build is need
 |---|---|
 | Windows (MSI) | `C:\Program Files\<app>\<cli>.exe` by default (wherever you installed it otherwise), not on `PATH` |
 | Linux (deb, rpm) | `/usr/bin/<cli>` |
-| macOS | the separate `<cli>-<version>-macos-<arch>.zip` release asset (the `.app` holds only the desktop app) |
+| macOS | inside the app: `/Applications/<app>.app/Contents/MacOS/<cli>`, not on `PATH` (the manual's Install page shows how to link it there) |
 
 ```sh
 # Windows, default install folder
 claude mcp add <binary> -- "C:\Program Files\<app>\<cli>.exe" mcp
-# Linux, or macOS with the CLI unzipped onto PATH
+# Linux, or macOS with the CLI linked onto PATH
 claude mcp add <binary> -- <cli> mcp
+# macOS, from inside the app
+claude mcp add <binary> -- /Applications/<app>.app/Contents/MacOS/<cli> mcp
 ```
 
 ### Other clients (Claude Desktop, Cursor, …)
@@ -187,6 +188,10 @@ per-request `_meta` receive `resultType: complete` and list/read cache hints; re
 | `crop {id?, rect?, angle?, reset?}` | Normalized crop rect `[x0,y0,x1,y1]` and straighten angle; at least one of `rect`, `angle`, `reset: true`. The crop always ends inside the photo: an `angle` alone keeps the crop if it still fits, else shrinks it to the largest of its aspect that does |
 | `render_photo {id?, size?, format?, path?}` | Render with current settings → **image content** (PNG, or JPEG with `format: "jpeg"`), long edge `size` (default 1024); the image travels in the reply, so it also works over `--connect` to an app on another machine (`path` saves a copy on this one) |
 | `export {path \| dir, id? \| ids?, format?, longEdge? \| shortEdge? \| width?/height? \| megapixels? \| percent?, dontEnlarge?, ppi?, quality?, colorSpace?, bitDepth?, …}` | Full-quality render to `.png` / `.jpg` / `.tif` / `.webp` / `.avif` / `.jxl` (`jxlLossless`, `jxlEffort`, `jxlProgressive`); `format: "original"` copies the file + an XMP sidecar with the edits, `format: "dng"` writes raw photos as DNG with the edits embedded. No size param = 3000 px long edge; `longEdge: 0` = full size (cropped, native resolution); `width` + `height` fit either orientation (Lightroom's Dimensions); with `fit: "widthHeight"` they limit the width and the height as the photo stands (Width & Height); `dontEnlarge` defaults to true |
+
+`import` validates every `paths` array entry before discovering files or importing any of them.
+A non-string entry is a tool error naming its zero-based index (for example, `paths[1]`);
+the whole request is refused, including in Copy and Move modes. A single path string is also accepted.
 
 `get_develop {id}` and `render_photo {id}` use that photo without changing the selection.
 `set_develop`, `crop` and `export` with a supplied photo `id` end the current edit interaction,

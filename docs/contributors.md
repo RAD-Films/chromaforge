@@ -1,35 +1,27 @@
-# Contributors in the About window
+# Contributor credits
 
 > Names in angle brackets (`<app>`, `<binary>`, `<cli>`, `<PREFIX>`, `<settings_dir>`, …) are the values set in
 > [`brand.toml`](../brand.toml); see the README.
 
-**About ▸ Contributors** credits everyone who contributed to the app, and **About ▸ Models** credits
-the AI models named in `Co-Authored-By` trailers. This follows the shared craftrules standard
-[`standards/contributors.md`](https://github.com/storytold/craftrules/blob/main/standards/contributors.md);
-this page is the local copy of the decision.
+The contributor records credit everyone who contributed to the app, and the AI models named in
+`Co-Authored-By` trailers. This page is the decision.
 
 ## Decision
 
-- Two files, both **compiled into the binary** by the UI crate's `build.rs` (nothing is read from
-  disk or the network at run time; the web build has them too):
+- Two files in [`contributors/`](../contributors/):
   - [`contributors/contributors.json`](../contributors/contributors.json): commit stats per GitHub
-    username. **Generated** by `craftrules/scripts/contributors.py`; never hand-edit.
+    username. **Generated** by `contributors/fork-contributors.py`; never hand-edit.
   - [`contributors/people.toml`](../contributors/people.toml): the names people chose for
     themselves. **Each contributor adds only their own entry**, in their own PR.
-- Each contributor gets one line: GitHub username (always), display name (opt-in, or their synced
+- Each contributor gets one record: GitHub username (always), display name (opt-in, or their synced
   GitHub profile name), real name (only if they told us), merged PRs, commits, lines added, lines
   deleted, binary assets added, binary assets removed, first and last commit date.
-- The list is shown as a **grab bag** (names flowing as text) or a **table**, in the same order. It
-  sorts by name, PRs, commits, lines added, lines deleted, line delta, binary assets added/removed,
-  first or last commit date. The name toggle cycles **Username → Display name → Real name**; a
-  missing name falls back to `@username`. Alphabetical sorting is case-insensitive and ignores the `@`.
 
 ## In the app
 
-- The About dialog (`crates/ui-egui/src/panels/dialogs.rs`, Help ▸ About <app>) has the tabs
-  **About · Contributors · Models**; the control channel can switch them with
-  `ui.clickWidget {"id": "button:aboutTab-contributors"}` (`-about`, `-models`), and the list view
-  with `button:creditsGrabBag` / `button:creditsTable`.
+- Since 2026-11-15 the app no longer shows these lists: Help ▸ About <app> shows only the app's
+  name, version, licences and links. The files are kept up to date for the repository's own
+  credits.
 
 ## Credit yourself
 
@@ -42,20 +34,13 @@ display_name = "Nickname"
 sync_github_name = true   # use the name on your public GitHub profile as display name
 ```
 
-or, with craftrules checked out next to `craft-apps/`:
-
-```sh
-python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "Your Name" --sync-github-name
-```
-
 Names show after the next refresh: the script checks that each entry was committed by its own
 user (or by a maintainer with a `consent_source`). Delete your entry to remove your names.
 
 ## Refreshing (maintainers)
 
 ```sh
-python3 ../../craftrules/scripts/contributors.py .           # regenerate + verify; needs git, Python 3.11+, gh
-python3 ../../craftrules/scripts/contributors.py --check .   # verify people.toml only
+python3 contributors/fork-contributors.py   # regenerate contributors.json; needs `gh` signed in and the `upstream` remote fetched
 ```
 
 Commit the updated `contributors/contributors.json`. Git author names and emails are never recorded.

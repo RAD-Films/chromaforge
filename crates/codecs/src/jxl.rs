@@ -131,7 +131,8 @@ pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
         meta.icc = icc;
     }
     if let Ok(AuxBoxData::Data(ex)) = img.aux_boxes().first_exif() {
-        meta.exif = Some(ex.payload().to_vec());
+        // The box declares where the TIFF header starts inside its payload; skip any prefix before it.
+        meta.exif = usize::try_from(ex.tiff_header_offset()).ok().and_then(|offset| ex.payload().get(offset..)).map(<[u8]>::to_vec);
     }
     if let AuxBoxData::Data(x) = img.aux_boxes().first_xml() {
         meta.xmp = Some(String::from_utf8_lossy(x).trim_end_matches('\0').to_string());
@@ -260,12 +261,11 @@ mod tests {
         assert_eq!(pick_alpha(&[ExtraChannelType::Depth, ASSOCIATED, STRAIGHT]), Some(AlphaChannel { index: 1, associated: true }));
         assert_eq!(pick_alpha(&[]), None);
         assert_eq!(pick_alpha(&[ExtraChannelType::Black, SPOT, ExtraChannelType::Depth]), None);
-    }
-
-    #[test]
-    fn associated_and_straight_alpha() {
-        assert_eq!(pick_alpha(&[ASSOCIATED]).map(|a| a.associated), Some(true));
-        assert_eq!(pick_alpha(&[STRAIGHT]).map(|a| a.associated), Some(false));
+        // associated and straight alpha
+        {
+            assert_eq!(pick_alpha(&[ASSOCIATED]).map(|a| a.associated), Some(true));
+            assert_eq!(pick_alpha(&[STRAIGHT]).map(|a| a.associated), Some(false));
+        }
     }
 
     #[test]

@@ -1,9 +1,13 @@
 //! [`Manager`]: installed plug-ins, their grants, enabled state, logs and data.
 //!
 //! On disk (a folder, usually `<settings>/plugins`): `<id>.wasm` per plug-in, `plugins.json` with
-//! each plug-in's `{enabled, grant}`, `data/<id>.json`, its metadata namespace (per library), and
-//! `settings/<id>.json`, its settings and remembered dialog values (for the whole app). A manager
-//! without a folder keeps everything in memory (tests, the web build).
+//! each plug-in's `{enabled, grant, denied, signer?}` (what the user allowed, what they said no to,
+//! and the author key pinned at its first signed install, [`Pin`]), `data/<id>.json`, its metadata namespace (per library), and
+//! `settings/<id>.json`, its settings and remembered dialog values (for the whole app), and
+//! `previous/<id>.wasm` + `previous/<id>.json`, the version an update replaced, its settings and
+//! its signer (checked when it goes back), to
+//! go back to ([`Manager::rollback`]; nothing loads from that folder). A manager without a folder
+//! keeps everything in memory (tests, the web build).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -14,9 +18,10 @@ use serde_json::{Value, json};
 
 use crate::context::{CallContext, HostApi, JobReporter, Unwatched};
 use crate::manifest::{Field, dialog_args, parse_version};
-use crate::permissions::Permissions;
+use crate::permissions::{Permissions, Request, refused_root};
 use crate::runtime::{Limits, Plugin};
-use crate::settings::{SettingsStore, command_scope, destination_scope};
+use crate::settings::{MAX_SETTINGS_BYTES, SettingsStore, command_scope, destination_scope};
+use crate::signature::{Signature, Signer};
 use crate::store::{NamespaceStore, write_atomic};
 use crate::{Error, Result};
 
@@ -28,6 +33,8 @@ const MAX_PLUGINS: usize = 256;
 const MAX_BATCH: usize = 10_000;
 /// Longest message a `prepare` hook may show.
 const MAX_PREPARE_MESSAGE: usize = 4096;
+/// Largest `previous/<id>.json` read back: the settings it keeps, and room for its version.
+const MAX_PREVIOUS_BYTES: u64 = MAX_SETTINGS_BYTES as u64 + 64 * 1024;
 
 /// One installed plug-in.
 #[derive(Debug)]
@@ -36,6 +43,10 @@ pub struct Installed {
     pub enabled: bool,
     /// What the user granted (the effective set is this ∩ the manifest's request).
     pub grant: Permissions,
+    /// What the user said no to when asked, with the date: never asked again.
+    pub denied: Vec<Denial>,
+    /// Folders the manifest asks for that can't be granted, with why ([`refused_root`]).
+    refused: Vec<(String, String)>,
     pub log: VecDeque<String>,
     store: Option<NamespaceStore>,
     /// Its settings and remembered dialog values (shared with a call running off the lock).
@@ -47,12 +58,73 @@ pub struct Installed {
     /// uninstalled), shared with a call running off the lock, so a job's next `{continue}` call
     /// gets a revoke, a disable or a removal made while it runs.
     live: Arc<Mutex<Permissions>>,
+    /// Its module file (`None` without a folder): `<id>.wasm`, or the file it was copied in as.
+    path: Option<PathBuf>,
+    /// The author key pinned for it.
+    pin: Pin,
 }
 
 impl Installed {
+    /// The author key pinned for it ([`Pin`]).
+    pub fn pin(&self) -> &Pin {
+        &self.pin
+    }
+
+    /// Its `plugins.json` entry.
+    fn entry(&self) -> Entry {
+        Entry { enabled: self.enabled, grant: self.grant.clone(), denied: self.denied.clone(), signer: self.pin.stored() }
+    }
+
+    /// Its module file in the plug-ins folder (`None` without a folder).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// The capabilities calls actually get.
     pub fn effective(&self) -> Permissions {
-        self.grant.intersect(&self.plugin.manifest().permissions)
+        self.grant.intersect(&self.plugin.manifest().permissions).without_refused(|p| self.refused.iter().any(|(r, _)| r == p))
+    }
+
+    /// Where `r` stands: allowed, denied (on a date), refused (a folder that can't be granted)
+    /// or never asked.
+    pub fn state(&self, r: &Request) -> RequestState {
+        if let Some((_, why)) = self.refused.iter().find(|(p, _)| r.group == crate::Group::Fs && r.value.as_deref() == Some(p)) {
+            RequestState::Refused(why.clone())
+        } else if self.effective().holds(r) {
+            RequestState::Allowed
+        } else if let Some(d) = self.denied.iter().find(|d| d.request == *r) {
+            RequestState::Denied(d.on.clone())
+        } else {
+            RequestState::Never
+        }
+    }
+
+    /// Each request of the manifest with its state, as `plugin.list` gives them.
+    pub fn requests(&self) -> Vec<Value> {
+        let requested = &self.plugin.manifest().permissions;
+        requested
+            .requests()
+            .into_iter()
+            .map(|r| {
+                let mut v = json!({"group": r.group, "value": r.value});
+                if r.group == crate::Group::Fs {
+                    v["write"] = json!(requested.fs.iter().any(|f| Some(&f.path) == r.value.as_ref() && f.write));
+                }
+                match self.state(&r) {
+                    RequestState::Allowed => v["state"] = json!("allowed"),
+                    RequestState::Never => v["state"] = json!("never"),
+                    RequestState::Denied(on) => {
+                        v["state"] = json!("denied");
+                        v["deniedOn"] = json!(on);
+                    }
+                    RequestState::Refused(why) => {
+                        v["state"] = json!("refused");
+                        v["reason"] = json!(why);
+                    }
+                }
+                v
+            })
+            .collect()
     }
 
     /// Hands [`Installed::effective`] (nothing while disabled) to calls running now: their next
@@ -76,10 +148,16 @@ impl Installed {
             "id": m.id, "name": m.name, "version": m.version, "description": m.description, "author": m.author,
             "requires": m.requires,
             "enabled": self.enabled, "size": self.plugin.size(),
-            "requested": m.permissions, "granted": self.effective(),
+            "requested": m.permissions, "granted": self.effective(), "requests": self.requests(),
             "commands": m.commands, "hooks": m.hooks, "publish": m.publish,
             "exportDestinations": m.export_destinations, "metadataFields": m.metadata_fields,
             "settings": m.settings,
+            // its own pictures (`plugin.picture` gives them)
+            "icon": m.icon.is_some(), "header": m.header.is_some(),
+            // where it comes from: homepage, repository, changelog, license, issues
+            "about": m.about.info(),
+            // the author key pinned for it, as a fingerprint; null: unsigned
+            "signer": self.pin.signer().map(|s| s.fingerprint()),
             // a page showing the settings is out of date when either changes (an update, or a
             // value set by the plug-in or another window)
             "moduleHash": self.plugin.module_hash(), "settingsRevision": self.settings().revision(),
@@ -130,6 +208,157 @@ struct State {
 struct Entry {
     enabled: bool,
     grant: Permissions,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    denied: Vec<Denial>,
+    /// The pinned author key in standard base64 ([`Pin`]); none: unsigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signer: Option<String>,
+}
+
+impl Entry {
+    fn pin(&self) -> Pin {
+        match &self.signer {
+            None => Pin::None,
+            Some(text) => Signer::from_base64(text).map_or_else(|_| Pin::Unreadable(text.clone()), Pin::Key),
+        }
+    }
+}
+
+/// The author key pinned for an installed plug-in: set at its first signed install, kept while
+/// later files are signed by the same key, and changed only when the user says yes to another
+/// signer ([`SignerAnswer`]). A file that no longer matches it doesn't load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pin {
+    /// Installed unsigned: its first signed version pins its key.
+    None,
+    Key(Signer),
+    /// `plugins.json` holds something that isn't a key (kept as it was): treated as another signer.
+    Unreadable(String),
+}
+
+impl Pin {
+    /// The pinned key, when there is one that can be read.
+    pub fn signer(&self) -> Option<Signer> {
+        match self {
+            Pin::Key(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// As `plugins.json` keeps it.
+    fn stored(&self) -> Option<String> {
+        match self {
+            Pin::None => None,
+            Pin::Key(s) => Some(s.to_base64()),
+            Pin::Unreadable(text) => Some(text.clone()),
+        }
+    }
+
+    /// The pin a file signed as `signature` (none or valid) sets when nothing was pinned.
+    fn of(signature: &Signature) -> Pin {
+        signature.signer().map_or(Pin::None, Pin::Key)
+    }
+
+    /// A pin as a JSON file keeps it ([`Pin::stored`]): `null` for none, a key in base64, and
+    /// anything else as [`Pin::Unreadable`].
+    fn read(value: &Value) -> Pin {
+        match value {
+            Value::Null => Pin::None,
+            Value::String(text) => Signer::from_base64(text).map_or_else(|_| Pin::Unreadable(text.clone()), Pin::Key),
+            other => Pin::Unreadable(other.to_string()),
+        }
+    }
+
+    /// Whether a file signed as `file` is signed exactly as this pin says: by its key, or (for
+    /// [`Pin::None`]) not at all.
+    fn matches(&self, file: &Signature) -> bool {
+        match (self, file) {
+            (Pin::Key(k), Signature::Valid(s)) => k == s,
+            (Pin::None, Signature::None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The user's answer to "this file isn't signed by the key pinned for the plug-in: install it
+/// anyway?" ([`Manager::install_loaded_as`]), as `plugin.install` takes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SignerAnswer {
+    /// Not asked: a file that isn't signed by the pinned key is refused, saying why.
+    #[default]
+    None,
+    /// Yes to the file's signer (`acceptSigner`): its full public key in base64, as
+    /// `plugin.inspectFile` gives it in `signerKey`, or its fingerprint (spaces and case ignored).
+    /// It becomes the pinned key. Only for a file signed by exactly that key.
+    Signer(String),
+    /// Yes to an unsigned file (`acceptUnsigned`): the pin goes.
+    Unsigned,
+}
+
+/// What `current` (`None`: not installed) becomes when a file signed as `file` installs over it,
+/// or why that needs the user's yes. `trusted`: a file the user had installed (a rollback).
+fn decide_pin(name: &str, current: Option<&Pin>, file: &Signature, answer: &SignerAnswer, trusted: bool) -> Result<Pin> {
+    let signer = file.signer();
+    let current = match current {
+        None | Some(Pin::None) => return Ok(Pin::of(file)),
+        Some(Pin::Key(k)) if signer == Some(*k) => return Ok(Pin::Key(*k)),
+        Some(c) => c,
+    };
+    if trusted {
+        return Ok(Pin::of(file));
+    }
+    if let Some(pin) = answered(file, answer) {
+        return Ok(pin);
+    }
+    let was = match current {
+        Pin::Key(k) => format!("was installed signed by {}", k.fingerprint()),
+        _ => "has a pinned signer in plugins.json that can't be read".to_string(),
+    };
+    Err(signer_error(name, &was, file))
+}
+
+/// The pin the user's `answer` says yes to for a file signed as `file`, when it says yes to exactly
+/// that file's signer (or to its being unsigned).
+fn answered(file: &Signature, answer: &SignerAnswer) -> Option<Pin> {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    match (file, answer) {
+        (Signature::Valid(s), SignerAnswer::Signer(given))
+            if Signer::from_base64(given.trim()).ok() == Some(*s) || squash(given) == squash(&s.fingerprint()) =>
+        {
+            Some(Pin::Key(*s))
+        }
+        (Signature::None, SignerAnswer::Unsigned) => Some(Pin::None),
+        _ => None,
+    }
+}
+
+/// Why a file signed as `file` needs the user's yes: plug-in `name` `was` (how it was signed).
+fn signer_error(name: &str, was: &str, file: &Signature) -> Error {
+    let (is, ask) = match file.signer() {
+        // the full key, so a yes from a script covers exactly this signer (the fingerprint works too)
+        Some(s) => (format!("this file is signed by {}", s.fingerprint()), format!("acceptSigner: \"{}\"", s.to_base64())),
+        None => ("this file isn't signed".to_string(), "acceptUnsigned: true".to_string()),
+    };
+    Error::Signer(format!("\"{name}\" {was}, but {is}: install it only if you trust where it came from ({ask} says yes, and pins the new signer)"))
+}
+
+/// A request the user said no to, and when (`YYYY-MM-DD`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Denial {
+    #[serde(flatten)]
+    pub request: Request,
+    pub on: String,
+}
+
+/// Where one request of a plug-in stands ([`Installed::state`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestState {
+    Allowed,
+    /// The user said no, on this date: later calls fail without asking.
+    Denied(String),
+    /// A folder no one can grant, and why ([`refused_root`]).
+    Refused(String),
+    Never,
 }
 
 /// A plug-in call prepared by [`Manager::begin`]: it owns what the call needs, so it can run
@@ -152,6 +381,16 @@ pub struct PendingCall {
     /// A job ([`crate::CommandDecl::job`]), by its command's label: its `job.*` calls reach a
     /// [`JobReporter`], and a reply `{continue: state}` calls it again.
     job: Option<String>,
+    /// What the plug-in may be asked about: its manifest's request without the folders no one
+    /// may grant.
+    askable: Permissions,
+    /// The requests the user said no to: refused without asking.
+    denied: Vec<Request>,
+    /// The user can be asked ([`PendingCall::ask_user`]): a refused call that was never asked
+    /// about is noted in `needs` instead of telling the plug-in to go to the Plug-in Manager.
+    asking: bool,
+    /// What calls were refused for that the user was never asked about ([`PendingCall::take_needs`]).
+    needs: Vec<Request>,
 }
 
 impl PendingCall {
@@ -163,6 +402,19 @@ impl PendingCall {
     /// Whether this call is a job ([`PendingCall::run_with`] reports its progress).
     pub fn is_job(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Lets the call note what it needs that the user was never asked about, for the host to ask
+    /// once it ends ([`PendingCall::take_needs`]): for a command the user started, with the user at
+    /// the app. Not for a job, which runs with nobody to ask.
+    pub fn ask_user(&mut self) {
+        self.asking = self.job.is_none();
+    }
+
+    /// The requests calls were refused for that the user was never asked about (only with
+    /// [`PendingCall::ask_user`]), each once, in the order they came.
+    pub fn take_needs(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.needs)
     }
 
     /// A job's command label (as the manifest gives it).
@@ -254,6 +506,10 @@ impl PendingCall {
             fields: &manifest.settings,
             read_only: self.read_only,
             job,
+            askable: &self.askable,
+            denied: &self.denied,
+            asking: self.asking,
+            needs: &mut self.needs,
         };
         let mut outcome = plugin.invoke(&self.request, &mut ctx);
         // what the host did on the plug-in's behalf that the user should see in its log
@@ -263,16 +519,36 @@ impl PendingCall {
     }
 }
 
-/// Refuses a grant from a command that names a program the user hasn't allowed in `granted`, or
-/// more of one (a wider entry, [`crate::ProgramDecl::within`]). Repeating or leaving out granted
-/// programs is fine: only the user adds them.
-fn programs_kept(grant: &Permissions, granted: &Permissions) -> Result<()> {
-    match grant.programs.iter().find(|p| !granted.programs.iter().any(|g| p.within(g))) {
-        Some(p) => Err(Error::Params(format!(
-            "programs can only be allowed by the user, in the Plug-in Manager (File ▸ Plug-ins ▸ Plug-in Manager…); this grant names {:?}, which the user hasn't allowed as it stands",
-            p.id
+/// Refuses a grant from a command that holds anything `granted` doesn't (a permission, a host, a
+/// folder or its `write`, a program or a wider entry of one, [`Permissions::more_than`]). Repeating
+/// or leaving out what is granted is fine: only the user adds, when the plug-in asks or in the
+/// Plug-in Manager.
+fn adds_nothing(grant: &Permissions, requested: &Permissions, granted: &Permissions) -> Result<()> {
+    // what the manifest doesn't ask for is cut back, except a program entry: a wider one than the
+    // granted entry is an error, not the manifest's entry in its place
+    let mut cut = grant.intersect(requested);
+    cut.programs = grant.programs.clone();
+    match cut.more_than(granted) {
+        Some(r) => Err(Error::Params(format!(
+            "permissions can only be allowed by the user, when the plug-in asks or in the Plug-in Manager (File ▸ Plug-ins ▸ Plug-in Manager…); this grant adds `{r}`, which the user hasn't allowed"
         ))),
         None => Ok(()),
+    }
+}
+
+/// Why a file doesn't load against its plug-in's pin ([`Pin::Key`] it isn't signed by, or
+/// [`Pin::Unreadable`]); its grant and data are kept.
+fn pin_error(pin: &Pin, file: &Signature) -> String {
+    let is = match file.signer() {
+        Some(s) => format!("it is signed by {}", s.fingerprint()),
+        None => "it isn't signed".to_string(),
+    };
+    match pin {
+        Pin::Key(k) => format!(
+            "its file isn't signed by the key pinned when it was installed ({}): {is}. It may have been replaced; install it again to choose whether to trust it",
+            k.fingerprint()
+        ),
+        _ => "the signer pinned for it in plugins.json can't be read; install it again to choose whether to trust its signer".to_string(),
     }
 }
 
@@ -302,18 +578,25 @@ impl Failed {
 #[derive(Debug)]
 pub struct Manager {
     dir: Option<PathBuf>,
+    /// Folders no plug-in may be granted (the settings folder; the plug-ins folder always is).
+    protected: Vec<PathBuf>,
     limits: Limits,
     /// The host features plug-ins may require ([`crate::HOST_FEATURES`]).
     features: Vec<String>,
     plugins: BTreeMap<String, Installed>,
     /// Modules in the folder that failed to load.
     pub failed: Vec<Failed>,
+    /// Modules in the folder past the most it loads ([`MAX_PLUGINS`], counting every `.wasm`,
+    /// pixel filters too), by file name: none of them was looked at.
+    pub skipped: Vec<PathBuf>,
     /// `plugins.json` entries of modules that didn't load, written back unchanged, so a plug-in that
     /// loads again (the app updated, the module replaced) keeps its enabled state and grant.
     kept: BTreeMap<String, Entry>,
     /// The versions of modules that didn't load because they need features this version lacks, by
     /// id: installing an older one over them is still a downgrade.
     unloaded: BTreeMap<String, String>,
+    /// The version kept to go back to ([`Manager::rollback`]), by id: of loaded plug-ins only.
+    previous: BTreeMap<String, String>,
     /// The open library's id: plug-in data is kept per library (photo ids are per library).
     library: String,
     /// Where `program.start` makes run folders (`None`: [`crate::programs::runs_root`]).
@@ -324,12 +607,15 @@ impl Default for Manager {
     fn default() -> Self {
         Manager {
             dir: None,
+            protected: Vec::new(),
             limits: Limits::default(),
             features: crate::HOST_FEATURES.iter().map(|f| f.to_string()).collect(),
             plugins: BTreeMap::new(),
             failed: Vec::new(),
+            skipped: Vec::new(),
             kept: BTreeMap::new(),
             unloaded: BTreeMap::new(),
+            previous: BTreeMap::new(),
             library: String::new(),
             runs_root: None,
         }
@@ -352,13 +638,20 @@ impl Manager {
     pub fn open_with_features(dir: &Path, features: &[&str]) -> Result<Manager> {
         let io = |e: std::io::Error| Error::Io(format!("{}: {e}", dir.display()));
         std::fs::create_dir_all(dir).map_err(io)?;
+        // unreadable: never written over by the pins set below, so the grants in it aren't lost
+        let mut readable = true;
         let state: State = match std::fs::read(dir.join("plugins.json")) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
                 log::warn!("plugins.json is unreadable ({e}); plug-ins load disabled");
+                readable = false;
                 State::default()
             }),
-            Err(_) => State::default(),
+            Err(e) => {
+                readable = e.kind() == std::io::ErrorKind::NotFound;
+                State::default()
+            }
         };
+        let mut pinned_now = false;
         // run folders a program still used when the app last quit
         #[cfg(not(target_arch = "wasm32"))]
         crate::programs::sweep_old_runs(&crate::programs::runs_root(), crate::programs::STALE_RUN_AGE);
@@ -370,7 +663,9 @@ impl Manager {
             .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wasm")))
             .collect();
         files.sort();
-        files.truncate(MAX_PLUGINS);
+        m.skipped = files.split_off(files.len().min(MAX_PLUGINS));
+        // the first module (by file name) with an id is the one that loads
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for f in files {
             let file = f.display().to_string();
             // installed modules are `<id>.wasm`: the id when the manifest can't be read
@@ -385,16 +680,39 @@ impl Manager {
                 }
             };
             let id = p.id().to_string();
+            if let Some(first) = seen.get(&id) {
+                m.failed.push(Failed { error: duplicate_error(first), file, missing: Vec::new(), id, path: Some(f) });
+                continue;
+            }
             let missing = p.manifest().missing_features(&m.features);
             if !missing.is_empty() {
                 // the app was downgraded: keep its grant and data for when it's updated again
                 m.keep(&state, &id);
-                m.unloaded.insert(id.clone(), p.manifest().version.clone());
+                m.unloaded.entry(id.clone()).or_insert_with(|| p.manifest().version.clone());
                 m.failed.push(Failed { file, error: Error::Unsupported(missing.clone()).to_string(), missing, id, path: Some(f) });
                 continue;
             }
+            // a file that isn't signed by the pinned key doesn't load (replaced behind the app's
+            // back); not in plugins.json, or pinned as unsigned: its own signer is pinned
+            let pin = match state.plugins.get(&id).map(Entry::pin) {
+                Some(Pin::Key(k)) if p.signature().signer() == Some(k) => Pin::Key(k),
+                Some(Pin::None) | None => {
+                    // written at once, so a file swapped in before the next save can't take its place
+                    pinned_now |= p.signature().signer().is_some();
+                    Pin::of(p.signature())
+                }
+                Some(pin) => {
+                    m.keep(&state, &id);
+                    m.failed.push(Failed { file, error: pin_error(&pin, p.signature()), missing: Vec::new(), id, path: Some(f) });
+                    continue;
+                }
+            };
+            // only a module that loads holds its id: one that can't gives way to a later file
+            seen.insert(id.clone(), file.clone());
+            m.unloaded.remove(&id);
             // not in plugins.json (copied in by hand): disabled, nothing granted
-            let (enabled, grant) = state.plugins.get(&id).map_or((false, Permissions::default()), |e| (e.enabled, e.grant.clone()));
+            let (enabled, grant, denied) =
+                state.plugins.get(&id).map_or((false, Permissions::default(), Vec::new()), |e| (e.enabled, e.grant.clone(), e.denied.clone()));
             let mut log = VecDeque::new();
             if let Err(e) = p.manifest().semver() {
                 log.push_back(format!("loaded without a valid version ({e}); installing a new version will need one"));
@@ -402,9 +720,20 @@ impl Manager {
             let (settings, damaged) = m.open_settings(&id);
             log.extend(damaged);
             let live = Arc::new(Mutex::new(Permissions::default()));
-            let installed = Installed { plugin: Arc::new(p), enabled, grant, log, store: None, settings, busy: None, live };
+            let refused = m.refused_roots(&p.manifest().permissions);
+            let installed =
+                Installed { plugin: Arc::new(p), enabled, grant, denied, refused, log, store: None, settings, busy: None, live, path: Some(f), pin };
             installed.share_effective();
+            if let Some((version, ..)) = read_previous(dir, &id) {
+                m.previous.insert(id.clone(), version);
+            }
             m.plugins.insert(id, installed);
+        }
+        if pinned_now
+            && readable
+            && let Err(e) = m.save_over(&state)
+        {
+            log::warn!("plug-ins: the signers pinned at start-up couldn't be saved to plugins.json: {e}");
         }
         Ok(m)
     }
@@ -500,32 +829,88 @@ impl Manager {
         self.dir.as_deref()
     }
 
-    /// Installs (or updates) a module. `grant` = what the user approved, one by one, on the
-    /// install dialog. `None` grants nothing new: a fresh install gets no permissions, an update
-    /// keeps the previous grant (cut back to what the new version still asks for), so an update
-    /// can never gain a capability without the user approving it. The plug-in starts enabled.
+    /// Installs (or updates) a module, as a command does. `None` grants nothing new: a fresh
+    /// install gets no permissions (the plug-in asks the user for each as it needs it), an update
+    /// keeps the previous grant (cut back to what the new version still asks for) and the
+    /// denials, so an update can never gain a capability without the user allowing it. The
+    /// plug-in starts enabled.
     ///
     /// Refused, with nothing written: a plug-in that requires host features this version lacks, a
     /// `version` that isn't semver, and a lower version than the installed one unless
     /// `allow_downgrade` (the same version again is a repair, and allowed).
     ///
-    /// `grant` can't add a program (`programs`): only the user grants those, in the Plugin
-    /// Manager ([`Manager::install_bytes_by_user`]). It may repeat or leave out the programs the
-    /// installed version has granted; one it hasn't, or a wider entry, is an error and installs
-    /// nothing. A module whose code differs from the installed one (another digest) keeps none
-    /// of its programs, and its log says so: the user allowed them for the code they had.
+    /// `grant` can't add anything ([`Permissions::more_than`]): it may repeat or leave out what the
+    /// installed version has granted; anything more is an error and installs nothing. A module
+    /// whose code differs from the installed one (another digest) keeps none of its programs, and
+    /// its log says so: the user allowed them for the code they had.
     pub fn install_bytes(&mut self, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
         self.install_checked(bytes, grant, allow_downgrade, false)
     }
 
-    /// [`Manager::install_bytes`] as the user approved it in the Plug-in Manager's install dialog:
-    /// the grant may include programs. Never reachable from a command.
+    /// [`Manager::install_bytes`] as the user started it from the Plug-in Manager: a module whose
+    /// code differs keeps its programs. `grant` is taken as given (the install dialog passes none;
+    /// tests set one up this way). Never reachable from a command.
     pub fn install_bytes_by_user(&mut self, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
         self.install_checked(bytes, grant, allow_downgrade, true)
     }
 
+    /// Loads a module with the limits of plug-ins installed from now on, without installing it:
+    /// to look at its manifest first, then install it with [`Manager::install_loaded`].
+    pub fn load(&self, bytes: &[u8]) -> Result<Plugin> {
+        Plugin::load(bytes, self.limits.clone())
+    }
+
+    /// [`Manager::install_bytes`] for a module already loaded by [`Manager::load`] from `bytes`.
+    pub fn install_loaded(&mut self, plugin: Plugin, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
+        self.install_plugin(plugin, bytes, grant, allow_downgrade, false, false, &SignerAnswer::None)
+    }
+
+    /// [`Manager::install_loaded`] as the user approved it ([`Manager::install_bytes_by_user`]).
+    pub fn install_loaded_by_user(&mut self, plugin: Plugin, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
+        self.install_plugin(plugin, bytes, grant, allow_downgrade, true, false, &SignerAnswer::None)
+    }
+
+    /// [`Manager::install_loaded`] (`by_user`: [`Manager::install_loaded_by_user`]) with the user's
+    /// answer about a file that isn't signed by the key pinned for its plug-in. The first signed
+    /// install pins the file's key; a file signed by the pinned key keeps it; one signed by another
+    /// key, unsigned, or over a pin that can't be read is refused ([`Error::Signer`]) unless
+    /// `signer` says yes to exactly that ([`SignerAnswer`]), which pins the new signer (or none).
+    pub fn install_loaded_as(
+        &mut self,
+        plugin: Plugin,
+        bytes: &[u8],
+        grant: Option<Permissions>,
+        allow_downgrade: bool,
+        by_user: bool,
+        signer: &SignerAnswer,
+    ) -> Result<&Installed> {
+        self.install_plugin(plugin, bytes, grant, allow_downgrade, by_user, false, signer)
+    }
+
+    /// The pin plug-in `id` has: loaded, or kept for a module in the folder that didn't load.
+    /// `None`: not installed.
+    pub fn pin(&self, id: &str) -> Option<Pin> {
+        self.plugins.get(id).map(|i| i.pin.clone()).or_else(|| self.kept.get(id).map(Entry::pin))
+    }
+
     fn install_checked(&mut self, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool, by_user: bool) -> Result<&Installed> {
         let plugin = Plugin::load(bytes, self.limits.clone())?;
+        self.install_plugin(plugin, bytes, grant, allow_downgrade, by_user, false, &SignerAnswer::None)
+    }
+
+    /// `rollback`: going back to the version kept ([`Manager::rollback`]): it keeps no version to
+    /// go back to, logs the rollback, and pins that version's signer (the user had installed it).
+    #[allow(clippy::too_many_arguments)]
+    fn install_plugin(
+        &mut self,
+        plugin: Plugin,
+        bytes: &[u8],
+        grant: Option<Permissions>,
+        allow_downgrade: bool,
+        by_user: bool,
+        rollback: bool,
+        signer: &SignerAnswer,
+    ) -> Result<&Installed> {
         let (missing, version, downgrade) = self.install_check(plugin.manifest());
         if !missing.is_empty() {
             return Err(Error::Unsupported(missing));
@@ -540,6 +925,20 @@ impl Manager {
             return Err(Error::Downgrade { installed: installed.clone(), new });
         }
         let id = plugin.id().to_string();
+        // before anything is written: a file not signed by the pinned key needs the user's yes
+        let old_pin = self.pin(&id);
+        let pin = decide_pin(&plugin.manifest().name, old_pin.as_ref(), plugin.signature(), signer, rollback)?;
+        let pin_line = match (&old_pin, &pin) {
+            (_, Pin::Key(k)) if old_pin.as_ref().and_then(Pin::signer) == Some(*k) => None,
+            (None | Some(Pin::None), Pin::Key(k)) => Some(format!("signed by {}: pinned as its signer", k.fingerprint())),
+            (Some(_), Pin::Key(k)) if rollback => Some(format!("went back to the version signed by {}: pinned as its signer", k.fingerprint())),
+            (Some(_), Pin::Key(k)) => Some(format!("signer changed to {}, as you said yes to", k.fingerprint())),
+            (Some(Pin::Key(_) | Pin::Unreadable(_)), Pin::None) if rollback => {
+                Some("went back to the unsigned version: no signer is pinned".to_string())
+            }
+            (Some(Pin::Key(_) | Pin::Unreadable(_)), Pin::None) => Some("installed unsigned, as you said yes to: no signer is pinned".to_string()),
+            _ => None,
+        };
         // a module that stopped loading keeps its grant for the version that replaces it
         let mut previous = self.plugins.get(&id).map(|i| i.grant.clone()).or_else(|| self.kept.get(&id).map(|e| e.grant.clone())).unwrap_or_default();
         // programs were allowed for the code the user saw: different code from a command keeps
@@ -554,13 +953,16 @@ impl Manager {
                 .map(|p| format!("{}: this version's code is different, so it may no longer start it; allow it again in the Plug-in Manager", p.name))
                 .collect();
         }
+        // a grant from a command never adds to what the plug-in had: a fresh install starts with
+        // nothing, and only the user allows more, when the plug-in asks or in the Plug-in Manager
         if let Some(g) = &grant
             && !by_user
         {
-            programs_kept(g, &previous)?;
+            adds_nothing(g, &plugin.manifest().permissions, &previous)?;
         }
+        let denied = self.plugins.get(&id).map(|i| i.denied.clone()).or_else(|| self.kept.get(&id).map(|e| e.denied.clone())).unwrap_or_default();
         let grant = grant.unwrap_or_else(|| previous.clone()).intersect(&plugin.manifest().permissions);
-        // a granted program whose entry the update widened is unticked: say why
+        // a granted program whose entry the update widened is no longer allowed: say why
         let widened: Vec<String> = plugin
             .manifest()
             .permissions
@@ -569,15 +971,75 @@ impl Manager {
             .filter(|p| previous.program(&p.id).is_some_and(|g| !p.within(g)) && grant.program(&p.id).is_none())
             .map(|p| format!("{}: this version finds it in more places than you allowed; allow it again in the Plug-in Manager", p.name))
             .collect();
-        if let Some(dir) = &self.dir {
-            write_atomic(&dir.join(format!("{id}.wasm")), bytes)?;
-            let file = dir.join(format!("{id}.wasm")).display().to_string();
+        let old_version = self.plugins.get(&id).map(|i| i.plugin.manifest().version.clone());
+        // an update keeps the version it replaces, module and settings (before they're pruned), to
+        // go back to; read now, since the write replaces its file
+        let keep = match (&self.dir, self.plugins.get(&id)) {
+            (Some(_), Some(old)) if !rollback && !same_code => Some(
+                old.path
+                    .as_deref()
+                    .ok_or_else(|| Error::NotFound(format!("{id}.wasm")))
+                    .and_then(|p| read_module(p, &self.limits))
+                    .map(|b| (b, old.plugin.manifest().version.clone(), old.settings().snapshot(), old.pin.clone())),
+            ),
+            _ => None,
+        };
+        let path = self.dir.as_ref().map(|d| d.join(format!("{id}.wasm")));
+        if let Some(path) = &path {
+            write_atomic(path, bytes)?;
+            let file = path.display().to_string();
             self.failed.retain(|f| f.file != file);
+        }
+        // the version it replaces was copied in under another name: that file goes, or it would
+        // load again in place of this one at the next start
+        let stale = self.plugins.get(&id).and_then(|i| i.path.clone()).filter(|p| Some(p) != path.as_ref());
+        let mut stale_error = None;
+        if let Some(stale) = stale {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    stale_error =
+                        Some(format!("the old module {} couldn't be removed ({e}); remove it by hand, or it may load again", stale.display()))
+                }
+            }
+        }
+        let mut kept_error = None;
+        if let Some(dir) = &self.dir
+            && !rollback
+        {
+            match keep {
+                Some(keep) => {
+                    match keep.and_then(|(b, version, settings, pin)| keep_previous(dir, &id, &b, &version, &settings, &pin).map(|_| version)) {
+                        Ok(version) => {
+                            self.previous.insert(id.clone(), version);
+                        }
+                        Err(e) => {
+                            // none rather than an older one under the wrong version
+                            let _ = discard_previous(dir, &id);
+                            self.previous.remove(&id);
+                            kept_error = Some(format!("the version it replaces couldn't be kept to go back to: {e}"));
+                        }
+                    }
+                }
+                // the same code again keeps what it had; a fresh install finds one a removal kept
+                None if old_version.is_none() => match read_previous(dir, &id) {
+                    Some((version, ..)) => {
+                        self.previous.insert(id.clone(), version);
+                    }
+                    None => {
+                        self.previous.remove(&id);
+                    }
+                },
+                None => {}
+            }
         }
         self.kept.remove(&id);
         self.unloaded.remove(&id);
         let old = self.plugins.remove(&id);
         let mut log = old.as_ref().map(|i| i.log.clone()).unwrap_or_default();
+        log.extend(stale_error);
+        log.extend(kept_error);
         // a call still running keeps the cell, and gets the new version's grant on its next call
         let live = old.as_ref().map_or_else(|| Arc::new(Mutex::new(Permissions::default())), |i| i.live.clone());
         let settings = match old.map(|i| i.settings) {
@@ -597,18 +1059,24 @@ impl Manager {
         if let Err(e) = pruned {
             log.push_back(format!("settings: {e}"));
         }
-        let installed = Installed { plugin: Arc::new(plugin), enabled: true, grant, log, store: None, settings, busy: None, live };
+        let refused = self.refused_roots(&plugin.manifest().permissions);
+        let installed =
+            Installed { plugin: Arc::new(plugin), enabled: true, grant, denied, refused, log, store: None, settings, busy: None, live, path, pin };
         installed.share_effective();
         self.plugins.insert(id.clone(), installed);
         self.save()?;
         self.plugins
             .get_mut(&id)
             .map(|i| {
-                i.push_log(match downgrade {
-                    Some(old) => format!("downgraded from {old} to {new}"),
-                    None => format!("installed version {new}"),
+                i.push_log(match (rollback, old_version, downgrade) {
+                    (true, Some(old), _) => format!("rolled back from {old} to {new}"),
+                    (_, _, Some(old)) => format!("downgraded from {old} to {new}"),
+                    _ => format!("installed version {new}"),
                 });
-                for line in dropped.into_iter().chain(widened) {
+                let unknown = &i.plugin.manifest().unknown_fields;
+                let unknown = (!unknown.is_empty()).then(|| format!("unknown manifest fields: {}", unknown.join(", ")));
+                let ignored = i.plugin.manifest().dropped.iter().map(|d| format!("manifest value dropped: {d}")).collect::<Vec<_>>();
+                for line in pin_line.into_iter().chain(dropped).chain(widened).chain(unknown).chain(ignored) {
                     i.push_log(line);
                 }
                 &*i
@@ -628,11 +1096,117 @@ impl Manager {
         self.install_bytes_by_user(&bytes, grant, allow_downgrade)
     }
 
+    /// The version plug-in `id` goes back to ([`Manager::rollback`]), if one is kept.
+    pub fn previous_version(&self, id: &str) -> Option<&str> {
+        self.previous.get(id).map(String::as_str)
+    }
+
+    /// Goes back to the version of plug-in `id` its last update replaced: its module and its
+    /// settings as they were then. A downgrade nobody needs to confirm; the grant is kept, cut back
+    /// to what that version asks for, without programs (code that differs from a command, as for
+    /// [`Manager::install_bytes`]; the user's rollback keeps them, [`Manager::rollback_by_user`]).
+    /// No version is kept after it (one level deep).
+    ///
+    /// When the module can't be written, the current version stays as it was, settings too.
+    pub fn rollback(&mut self, id: &str) -> Result<&Installed> {
+        self.rollback_as(id, false, &SignerAnswer::None)
+    }
+
+    /// [`Manager::rollback`] as the user asked for it on the plug-in's page: it keeps the programs
+    /// granted (those the old version asks for). Never reachable from a command.
+    pub fn rollback_by_user(&mut self, id: &str) -> Result<&Installed> {
+        self.rollback_as(id, true, &SignerAnswer::None)
+    }
+
+    /// [`Manager::rollback`] (`by_user`: [`Manager::rollback_by_user`]) with the user's answer
+    /// about a kept version that isn't signed as it was when it was replaced: the signer recorded
+    /// beside it in `previous/<id>.json` (another key, unsigned, or invalid: changed since). Such a
+    /// file is refused ([`Error::Signer`]) unless `signer` says yes to exactly its signer, as for
+    /// [`Manager::install_loaded_as`]. A version kept before signers were recorded goes back as it is.
+    pub fn rollback_as(&mut self, id: &str, by_user: bool, signer: &SignerAnswer) -> Result<&Installed> {
+        let none = || Error::Params(format!("{id} has no previous version to go back to"));
+        if !self.plugins.contains_key(id) {
+            return Err(Error::NotFound(id.into()));
+        }
+        let Some(dir) = self.dir.clone().filter(|_| self.previous.contains_key(id)) else { return Err(none()) };
+        let (_, settings, recorded) = read_previous(&dir, id).ok_or_else(none)?;
+        let bytes = read_module(&previous_paths(&dir, id).0, &self.limits)?;
+        let plugin = Plugin::load(&bytes, self.limits.clone())?;
+        if plugin.id() != id {
+            return Err(Error::Failed(format!("the version kept to go back to is another plug-in ({})", plugin.id())));
+        }
+        // the kept file is still the one the update replaced: signed as it was then, or the user's yes
+        if let Some(recorded) = recorded
+            && !recorded.matches(plugin.signature())
+            && answered(plugin.signature(), signer).is_none()
+        {
+            let was = match &recorded {
+                Pin::Key(k) => format!("version {} was kept signed by {}", plugin.manifest().version, k.fingerprint()),
+                Pin::None => format!("version {} was kept unsigned", plugin.manifest().version),
+                Pin::Unreadable(_) => format!("version {} was kept with a signer that can't be read", plugin.manifest().version),
+            };
+            return Err(signer_error(&plugin.manifest().name, &was, plugin.signature()));
+        }
+        // the settings go back with the module or not at all: staged beside their file first
+        let file = SettingsStore::path_in(&dir, id);
+        let mut staged = file.clone().into_os_string();
+        staged.push(".rollback");
+        let staged = PathBuf::from(staged);
+        let restore = match &settings {
+            Value::Null => None,
+            s => Some(SettingsStore::snapshot_file(s).map_err(|e| Error::Failed(format!("the settings kept to go back to: {e}")))?),
+        };
+        if let Some(b) = &restore {
+            write_atomic(&staged, b)?;
+        }
+        match self.install_plugin(plugin, &bytes, None, true, by_user, true, &SignerAnswer::None) {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e);
+            }
+        }
+        let mut lines = Vec::new();
+        if restore.is_some() {
+            // under the store's lock, so a call running off the manager's can't save the settings
+            // it had over the file between the two
+            let store = self.plugins.get(id).map(|p| p.settings.clone());
+            let mut store = store.as_ref().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner));
+            match std::fs::rename(&staged, &file) {
+                Ok(()) => {
+                    if let Some(s) = store.as_mut() {
+                        s.restored(&settings);
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&staged);
+                    lines.push(format!("settings: the ones kept couldn't be put back ({e}); it keeps the current ones"));
+                }
+            }
+        }
+        self.previous.remove(id);
+        if let Err(e) = discard_previous(&dir, id) {
+            lines.push(format!("the version gone back to couldn't be removed from previous/: {e}"));
+        }
+        let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        for line in lines {
+            p.push_log(line);
+        }
+        Ok(&*p)
+    }
+
     /// Removes a plug-in, its module, its data and its settings.
     ///
     /// A plug-in in the folder that didn't load ([`Manager::failed`]: it needs features this version
     /// lacks, or its module can't be read) is removed the same way, by its id there.
     pub fn uninstall(&mut self, id: &str) -> Result<()> {
+        self.uninstall_with(id, false)
+    }
+
+    /// [`Manager::uninstall`]; `keep_data`: its data (`data/<id>.json`) and settings stay in the
+    /// folder, for a later install of the same id to pick up. Its grant and enabled state go either
+    /// way, and a call still running can't write its settings back.
+    pub fn uninstall_with(&mut self, id: &str, keep_data: bool) -> Result<()> {
         let is_failed = |f: &Failed| !id.is_empty() && f.id == id;
         if !self.plugins.contains_key(id) && !self.failed.iter().any(is_failed) {
             return Err(Error::NotFound(id.into()));
@@ -641,6 +1215,10 @@ impl Manager {
         // have, it can't write its file back (and if one can't be deleted, it keeps saving)
         let store = self.plugins.get(id).map(|p| p.settings.clone());
         let mut store = store.as_ref().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner));
+        // kept settings are the latest: a change whose save failed is written now, or nothing goes
+        if keep_data && let Some(s) = store.as_mut() {
+            s.save()?;
+        }
         // the files first: if one can't be deleted, nothing is forgotten (its entry stays saved)
         if let Some(dir) = &self.dir {
             let modules: Vec<PathBuf> = self.failed.iter().filter(|f| is_failed(f)).filter_map(|f| f.path.clone()).collect();
@@ -648,11 +1226,12 @@ impl Manager {
             let settings = SettingsStore::path_in(dir, id);
             let mut bad = settings.clone().into_os_string();
             bad.push(".bad");
-            let files = std::iter::once(dir.join(format!("{id}.wasm"))).chain(modules).chain([
-                dir.join("data").join(format!("{id}.json")),
-                settings,
-                bad.into(),
-            ]);
+            // its own module, when it was copied in under another name
+            let own = self.plugins.get(id).and_then(|p| p.path.clone());
+            let (previous, about) = previous_paths(dir, id);
+            let data = [dir.join("data").join(format!("{id}.json")), settings, bad.into(), about, previous];
+            let data = if keep_data { Vec::new() } else { data.to_vec() };
+            let files = std::iter::once(dir.join(format!("{id}.wasm"))).chain(own).chain(modules).chain(data);
             for f in files {
                 match std::fs::remove_file(&f) {
                     Ok(()) => {}
@@ -672,7 +1251,34 @@ impl Manager {
         self.failed.retain(|f| !is_failed(f));
         self.kept.remove(id);
         self.unloaded.remove(id);
+        self.previous.remove(id);
         self.save()
+    }
+
+    /// Deletes module `file` ([`Failed::file`]) that didn't load and drops its row; nothing else
+    /// changes (its id's entry and data stay): for a module another one with its id stands in for.
+    pub fn remove_failed_module(&mut self, file: &str) -> Result<()> {
+        let Some(at) = self.failed.iter().position(|f| f.file == file) else { return Err(Error::NotFound(file.into())) };
+        if let Some(path) = self.failed.get(at).and_then(|f| f.path.clone()) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(format!("{}: {e}", path.display()))),
+            }
+        }
+        self.failed.remove(at);
+        Ok(())
+    }
+
+    /// Unloads plug-in `id` and lists its module as failed with `error`, keeping its entry, grant
+    /// and data (as for a module that stopped loading): another module with its id comes first.
+    pub fn demote(&mut self, id: &str, error: String) -> bool {
+        let Some(p) = self.plugins.remove(id) else { return false };
+        *p.live.lock().unwrap_or_else(PoisonError::into_inner) = Permissions::default();
+        self.kept.insert(id.to_string(), p.entry());
+        let file = p.path.as_ref().map_or_else(|| format!("{id}.wasm"), |f| f.display().to_string());
+        self.failed.push(Failed { file, error, missing: Vec::new(), id: id.to_string(), path: p.path });
+        true
     }
 
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
@@ -684,17 +1290,19 @@ impl Manager {
     }
 
     /// Replaces the grant (revoking what it leaves out); it can never exceed the request. It can't
-    /// add a program: one the plug-in hasn't been granted, or a wider entry, is an error and
-    /// changes nothing (only the user grants programs, [`Manager::set_grant_by_user`]). Repeating
-    /// granted programs keeps them; leaving them out revokes them.
+    /// add anything ([`Permissions::more_than`]): a grant holding a permission, host, folder or
+    /// program the plug-in doesn't have is an error and changes nothing (only the user adds,
+    /// [`Manager::allow_by_user`]). Repeating what is granted keeps it; leaving it out revokes it.
     pub fn set_grant(&mut self, id: &str, grant: Permissions) -> Result<Permissions> {
-        let granted = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?.effective();
-        programs_kept(&grant, &granted)?;
+        let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        adds_nothing(&grant, &p.plugin.manifest().permissions, &p.effective())?;
         self.set_grant_by_user(id, grant)
     }
 
-    /// [`Manager::set_grant`] as the user set it in the Plug-in Manager: it may grant programs.
-    /// Never reachable from a command.
+    /// [`Manager::set_grant`] without the check: the whole grant at once, as the user set it.
+    /// Never reachable from a command (the Plug-in Manager allows one request at a time,
+    /// [`Manager::allow_by_user`]; tests set a grant this way). Folders that can't be granted
+    /// ([`refused_root`]) stay out of what calls get.
     pub fn set_grant_by_user(&mut self, id: &str, grant: Permissions) -> Result<Permissions> {
         let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
         p.grant = grant.intersect(&p.plugin.manifest().permissions);
@@ -703,6 +1311,78 @@ impl Manager {
         p.push_log(format!("permissions set to {}", serde_json::to_string(&e).unwrap_or_default()));
         self.save()?;
         Ok(e)
+    }
+
+    /// The user allows request `r` of plug-in `id` (when it asked, or on its Permissions tab): it
+    /// is granted as the manifest asks for it, and a denial of it is forgotten. An error when the
+    /// manifest doesn't ask for it, or it is a folder no one may grant ([`refused_root`]). Never
+    /// reachable from a command.
+    pub fn allow_by_user(&mut self, id: &str, r: &Request) -> Result<Permissions> {
+        let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let requested = &p.plugin.manifest().permissions;
+        if !requested.holds(r) || (r.value.is_none() && r.group.has_values()) {
+            return Err(Error::Params(format!("{id} doesn't ask for `{r}`")));
+        }
+        if let RequestState::Refused(why) = p.state(r) {
+            return Err(Error::Params(format!("`{r}` can't be granted: {why}")));
+        }
+        p.grant = p.grant.with(r, requested).intersect(requested);
+        p.denied.retain(|d| d.request != *r);
+        p.share_effective();
+        p.push_log(format!("allowed {r}"));
+        let e = p.effective();
+        self.save()?;
+        Ok(e)
+    }
+
+    /// The user said no to request `r` of plug-in `id` on `on` (`YYYY-MM-DD`): it isn't granted,
+    /// and calls that need it fail without asking until the user allows it. Never reachable from
+    /// a command.
+    pub fn deny_by_user(&mut self, id: &str, r: &Request, on: &str) -> Result<()> {
+        let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        if !p.plugin.manifest().permissions.holds(r) || (r.value.is_none() && r.group.has_values()) {
+            return Err(Error::Params(format!("{id} doesn't ask for `{r}`")));
+        }
+        p.grant = p.grant.without(r);
+        p.denied.retain(|d| d.request != *r);
+        p.denied.push(Denial { request: r.clone(), on: on.to_string() });
+        p.share_effective();
+        p.push_log(format!("denied {r}"));
+        self.save()
+    }
+
+    /// Revokes request `r` of plug-in `id` (every value of its group when `r` names none): open to
+    /// commands. What is revoked counts as never asked: the plug-in may ask again.
+    pub fn revoke(&mut self, id: &str, r: &Request) -> Result<Permissions> {
+        let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        p.grant = p.grant.without(r);
+        p.share_effective();
+        p.push_log(format!("revoked {r}"));
+        let e = p.effective();
+        self.save()?;
+        Ok(e)
+    }
+
+    /// Folders no plug-in may be granted, besides the plug-ins folder itself: the settings folder.
+    /// A request for a folder that holds one of them (or lies inside the plug-ins folder) is
+    /// refused: a plug-in that could write there could rewrite its own grant or another module.
+    pub fn set_protected(&mut self, folders: Vec<PathBuf>) {
+        self.protected = folders;
+        let refused: Vec<(String, Vec<(String, String)>)> =
+            self.plugins.iter().map(|(id, p)| (id.clone(), self.refused_roots(&p.plugin.manifest().permissions))).collect();
+        for (id, r) in refused {
+            if let Some(p) = self.plugins.get_mut(&id) {
+                p.refused = r;
+                p.share_effective();
+            }
+        }
+    }
+
+    /// The folders `requested` asks for that can't be granted, with why.
+    fn refused_roots(&self, requested: &Permissions) -> Vec<(String, String)> {
+        let mut protected = self.protected.clone();
+        protected.extend(self.dir.clone());
+        requested.fs.iter().filter_map(|f| refused_root(&f.path, &protected, self.dir.as_deref()).map(|why| (f.path.clone(), why))).collect()
     }
 
     pub fn get(&self, id: &str) -> Option<&Installed> {
@@ -715,9 +1395,17 @@ impl Manager {
     }
 
     fn save(&self) -> Result<()> {
+        self.save_over(&State::default())
+    }
+
+    /// [`Manager::save`] over `base`, the `plugins.json` read at start-up: its entries this manager
+    /// doesn't hold (modules past the most it loads, files it couldn't place) are written back as
+    /// they were, so a save nobody asked for drops nothing.
+    fn save_over(&self, base: &State) -> Result<()> {
         let Some(dir) = &self.dir else { return Ok(()) };
-        let mut plugins = self.kept.clone();
-        plugins.extend(self.plugins.iter().map(|(id, p)| (id.clone(), Entry { enabled: p.enabled, grant: p.grant.clone() })));
+        let mut plugins = base.plugins.clone();
+        plugins.extend(self.kept.iter().map(|(id, e)| (id.clone(), e.clone())));
+        plugins.extend(self.plugins.iter().map(|(id, p)| (id.clone(), p.entry())));
         let state = State { plugins };
         let bytes = serde_json::to_vec_pretty(&state).map_err(|e| Error::Io(e.to_string()))?;
         write_atomic(&dir.join("plugins.json"), &bytes)
@@ -766,6 +1454,8 @@ impl Manager {
         }
         p.share_effective();
         let perms = p.live.clone();
+        let askable = p.plugin.manifest().permissions.without_refused(|f| p.refused.iter().any(|(r, _)| r == f));
+        let denied = p.denied.iter().map(|d| d.request.clone()).collect();
         let plugin = p.plugin.clone();
         let store = p.store.take().unwrap_or_default();
         let settings = p.settings.clone();
@@ -787,6 +1477,10 @@ impl Manager {
             runs_root: self.runs_root.clone(),
             read_only,
             job: job.map(str::to_string),
+            askable,
+            denied,
+            asking: false,
+            needs: Vec::new(),
         })
     }
 
@@ -921,6 +1615,33 @@ impl Manager {
         source: &Value,
         host: &mut dyn HostApi,
     ) -> Result<Prepared> {
+        self.prepare_from(id, command, selection, source, host, None)
+    }
+
+    /// [`Manager::prepare_command_from`] for a command the user started, with the user at the app
+    /// ([`PendingCall::ask_user`]): what the prepare step was refused that the user was never
+    /// asked about is added to `needs` (each once), for the host to ask once it ends.
+    pub fn prepare_command_asking(
+        &mut self,
+        id: &str,
+        command: &str,
+        selection: &[String],
+        source: &Value,
+        host: &mut dyn HostApi,
+        needs: &mut Vec<Request>,
+    ) -> Result<Prepared> {
+        self.prepare_from(id, command, selection, source, host, Some(needs))
+    }
+
+    fn prepare_from(
+        &mut self,
+        id: &str,
+        command: &str,
+        selection: &[String],
+        source: &Value,
+        host: &mut dyn HostApi,
+        needs: Option<&mut Vec<Request>>,
+    ) -> Result<Prepared> {
         let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
         let decl = p.plugin.manifest().command(command).ok_or_else(|| Error::Params(format!("plug-in {id} has no command {command:?}")))?.clone();
         if !decl.prepare {
@@ -930,7 +1651,21 @@ impl Manager {
         if !source.is_null() {
             req["source"] = source.clone();
         }
-        let answer = self.invoke(id, &req, host, &[]).and_then(|v| {
+        let answer = self.begin(id, req, Vec::new()).and_then(|mut call| {
+            if needs.is_some() {
+                call.ask_user();
+            }
+            let outcome = call.run(host);
+            if let Some(needs) = needs {
+                for r in call.take_needs() {
+                    if !needs.contains(&r) {
+                        needs.push(r);
+                    }
+                }
+            }
+            self.end(call, Some(outcome))
+        });
+        let answer = answer.and_then(|v| {
             prepared_answer(&decl.dialog, &v).map_err(|e| {
                 // invoke logged failed calls; an answer that doesn't fit is logged here
                 if let Some(p) = self.plugins.get_mut(id) {
@@ -1309,8 +2044,57 @@ fn outcome(id: &str, r: Result<Value>) -> Value {
     }
 }
 
-/// Reads a module file: a regular file within the size limit.
-fn read_module(path: &Path, limits: &Limits) -> Result<Vec<u8>> {
+/// The version of plug-in `id` an update replaced, in `dir`: its module and `{version, settings}`.
+fn previous_paths(dir: &Path, id: &str) -> (PathBuf, PathBuf) {
+    let d = dir.join("previous");
+    (d.join(format!("{id}.wasm")), d.join(format!("{id}.json")))
+}
+
+/// The version kept for plug-in `id` in `dir` to go back to: its version, settings (`null`: none
+/// kept) and the signer pinned when it was replaced (`None`: kept before signers were recorded).
+/// `None`: no version is kept, or it can't be read.
+fn read_previous(dir: &Path, id: &str) -> Option<(String, Value, Option<Pin>)> {
+    let (module, about) = previous_paths(dir, id);
+    if !std::fs::metadata(&module).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let bytes = crate::safe_io::read_capped(&about, MAX_PREVIOUS_BYTES).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let version = v.get("version")?.as_str()?.to_string();
+    Some((version, v.get("settings").cloned().unwrap_or(Value::Null), v.get("signer").map(Pin::read)))
+}
+
+/// Keeps `module`, version `version` with `settings` and the signer pinned for it (`pin`), as plug-in
+/// `id`'s version to go back to.
+fn keep_previous(dir: &Path, id: &str, module: &[u8], version: &str, settings: &Value, pin: &Pin) -> Result<()> {
+    let (path, about) = previous_paths(dir, id);
+    write_atomic(&path, module)?;
+    // compact: the settings may be as large as their own file allows, and must read back
+    let text =
+        serde_json::to_vec(&json!({"version": version, "settings": settings, "signer": pin.stored()})).map_err(|e| Error::Io(e.to_string()))?;
+    write_atomic(&about, &text)
+}
+
+/// Deletes plug-in `id`'s version to go back to (what tells it's there first).
+fn discard_previous(dir: &Path, id: &str) -> Result<()> {
+    let (path, about) = previous_paths(dir, id);
+    for f in [about, path] {
+        match std::fs::remove_file(&f) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(format!("{}: {e}", f.display()))),
+        }
+    }
+    Ok(())
+}
+
+/// Why a module didn't load: `first`, earlier by file name, has its id.
+pub fn duplicate_error(first: &str) -> String {
+    format!("another module has this id: {first} (the first by file name loads)")
+}
+
+/// Reads a module file: a regular file within the size limit (refused before it is read).
+pub fn read_module(path: &Path, limits: &Limits) -> Result<Vec<u8>> {
     use std::io::Read;
     let io = |e: std::io::Error| Error::Io(format!("{}: {e}", path.display()));
     let meta = std::fs::metadata(path).map_err(io)?;

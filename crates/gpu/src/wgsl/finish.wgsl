@@ -21,6 +21,22 @@ fn tone_apply(y: f32) -> f32 {
     return v;
 }
 
+fn rgb_contrast_apply(v: f32, base: u32, zero: f32, peak: f32) -> f32 {
+    if (v <= 0.0) {
+        return zero;
+    }
+    if (v >= peak) {
+        return aux[base + RGB_CONTRAST_N - 1u] + (v - peak);
+    }
+    let u = sqrt(v / peak);
+    let f = u * f32(RGB_CONTRAST_N - 1u);
+    let i = min(u32(f), RGB_CONTRAST_N - 2u);
+    let t = f - f32(i);
+    let a = aux[base + i];
+    let b = aux[base + i + 1u];
+    return a + (b - a) * t;
+}
+
 // The camera chroma curve follows the tone LUT in `aux` (`ToneMap::chroma_scale`).
 fn chroma_scale(o: f32) -> f32 {
     let f = clamp(o, 0.0, 1.0) * f32(CHROMA_N - 1u);
@@ -62,6 +78,36 @@ fn lut_hdr(o: u32, x: f32, hdr: bool) -> f32 {
 fn curve(ch: u32, x: f32, hdr: bool) -> f32 {
     return lut_hdr(pu(F_CURVE_OFF) + ch * CURVE_N, x, hdr);
 }
+
+// `levels::StageK::eval` on one value: the stage record at word `o` of the parameters (active, black, 1/range,
+// out black, span, slope at 0, slope at 1, has a midtone table) and the table's place `off` in `aux`. The stretch is not
+// limited: the midtone curve (its samples, then its end slopes beyond 0 and 1) runs on, and the result is limited below
+// at 0, and above at 1 unless the render is HDR.
+const MIDTONE_N: u32 = 257u;
+fn levels_stage(o: u32, off: u32, x: f32, hdr: bool) -> f32 {
+    if (pf(o) == 0.0) {
+        return x;
+    }
+    let t = (x - pf(o + 1u)) * pf(o + 2u);
+    var g = t;
+    if (pf(o + 7u) != 0.0) {
+        if (t <= 0.0) {
+            g = pf(o + 5u) * t;
+        } else if (t >= 1.0) {
+            g = 1.0 + pf(o + 6u) * (t - 1.0);
+        } else {
+            let f = t * f32(MIDTONE_N - 1u);
+            let i = min(u32(f), MIDTONE_N - 2u);
+            g = aux[off + i] + (aux[off + i + 1u] - aux[off + i]) * (f - f32(i));
+        }
+    }
+    var y = max(pf(o + 3u) + pf(o + 4u) * g, 0.0);
+    if (!hdr) {
+        y = min(y, 1.0);
+    }
+    return y;
+}
+
 
 // The exact sRGB curve (`lcc_color::transfer`), unbounded above 1 as HDR renders encode.
 fn lin_to_srgb(v: f32) -> f32 {
@@ -157,6 +203,7 @@ fn local_mixer(o: u32, lch: vec3<f32>, strength: f32) -> vec3<f32> {
 }
 
 // `finish::local_point_colors`: each mask's Color Mixer, then its Point Color samples at the mask's opacity (at most 1).
+// `i`, `n`: the pixel's index in the mask planes and their stride (`main`'s `mi`, `mn`).
 fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
     var lch = vec3<f32>(0.0);
     var any = false;
@@ -195,6 +242,38 @@ fn local_point_colors(d: vec3<f32>, i: u32, n: u32) -> vec3<f32> {
     return oklab_inv(vec3<f32>(lch.x, lch.y * cos(lch.z), lch.y * sin(lch.z)));
 }
 
+// `PrimariesK::apply` (the colourist wheels). The Color wheels are ASC CDL's SOP per channel —
+// lift's affine `x·(1−l)+l` pivots at white, gain's multiply at black, gamma a power, offset adds
+// last — then the Log wheels refine over their narrow zones between PRIM_LOW and PRIM_HIGH.
+fn primaries(rgb: vec3<f32>) -> vec3<f32> {
+    if (pu(F_PRIMARIES) == 0u) {
+        return rgb;
+    }
+    let t = clamp(lum2020(rgb), 0.0, 1.0);
+    let lm = clamp(pf(F_PRIM_LOW), 0.02, 0.9);
+    let hm = clamp(pf(F_PRIM_HIGH), lm + 0.05, 0.98);
+    let lws = 1.0 - sstep(lm - 0.10, lm + 0.10, t);
+    let lwh = sstep(hm - 0.10, hm + 0.10, t);
+    let lwm = max(1.0 - lws - lwh, 0.0);
+    var o = vec3<f32>(0.0);
+    for (var k = 0u; k < 3u; k++) {
+        let l = pf(F_PRIM_LIFT + k) + pf(F_PRIM_LIFT + 3u);
+        let g = pf(F_PRIM_GAIN + k) + pf(F_PRIM_GAIN + 3u);
+        let p = pf(F_PRIM_GAMMA + k) + pf(F_PRIM_GAMMA + 3u);
+        var x = rgb[k] * (1.0 - l) + l;
+        x = max(x * (1.0 + g), 0.0);
+        let e = clamp(1.0 / (1.0 + p), 0.25, 4.0);
+        x = pow(max(x, 0.0), e);
+        x += pf(F_PRIM_OFFSET + k) + pf(F_PRIM_OFFSET + 3u);
+        x += (pf(F_PRIM_SHADOW + k) + pf(F_PRIM_SHADOW + 3u)) * lws;
+        x += (pf(F_PRIM_MIDTONE + k) + pf(F_PRIM_MIDTONE + 3u)) * lwm;
+        x *= 1.0 + (pf(F_PRIM_HIGHLIGHT + k) + pf(F_PRIM_HIGHLIGHT + 3u)) * lwh;
+        x += pf(F_PRIM_LOG_OFFSET + k) + pf(F_PRIM_LOG_OFFSET + 3u);
+        o[k] = max(x, 0.0);
+    }
+    return o;
+}
+
 // `ColorOps::apply`.
 fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     if (pu(F_OPS_IDENTITY) != 0u && local_sat == 0.0 && local_hue == 0.0) {
@@ -216,6 +295,24 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
             ds += w[i] * pf(F_MIX_SAT + i);
             dl += w[i] * pf(F_MIX_LUM + i);
         }
+        let chroma_w = min(c / 0.12, 1.0);
+        h += dh * chroma_w;
+        c *= max(1.0 + ds, 0.0);
+        l += dl * chroma_w * sqrt(max(l, 0.05));
+    }
+    // `HslK` (the HSL curves): the hue picks the place on each LUT — hue[128], sat[128], lum[128]
+    // in that order (HSL_WORDS in `lcc_pipeline::colorops`) — and the mixer's own scales apply the
+    // deltas, fading hue and luminance towards neutrals as the mixer does
+    if (pu(F_HSL) != 0u) {
+        let n = 128u;
+        let x = rem_euclid(h / TAU, 1.0);
+        let f = clamp(x, 0.0, 0.999999) * f32(n - 1u);
+        let i0 = u32(f);
+        let i1 = min(i0 + 1u, n - 1u);
+        let t = f - f32(i0);
+        let dh = mix(pf(F_HSL_LUT + i0), pf(F_HSL_LUT + i1), t);
+        let ds = mix(pf(F_HSL_LUT + n + i0), pf(F_HSL_LUT + n + i1), t);
+        let dl = mix(pf(F_HSL_LUT + 2u * n + i0), pf(F_HSL_LUT + 2u * n + i1), t);
         let chroma_w = min(c / 0.12, 1.0);
         h += dh * chroma_w;
         c *= max(1.0 + ds, 0.0);
@@ -450,8 +547,8 @@ fn grain_sub_cover(hj: u32, dx: f32, dy: f32, d2: f32) -> f32 {
         }
         if (lump > 0.0) {
             let m = 0.5 + f32((shp >> 28u) & 15u) * (1.0 / 30.0);
-            let p2 = GRAIN_PHASES[(shp >> 20u) & 15u];
-            let p3 = GRAIN_PHASES[(shp >> 24u) & 15u];
+            let p2 = grain_phase((shp >> 20u) & 15u);
+            let p3 = grain_phase((shp >> 24u) & 15u);
             let c2 = c * c - sn * sn;
             let s2 = 2.0 * c * sn;
             let c3 = c * (4.0 * c * c - 3.0);
@@ -716,6 +813,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let i = y * w + x;
     let n = w * h;
+    // the mask planes' stride and this band's first pixel in `masks`: the whole image's planes
+    // (MASK_N = 0), or a band's rows copied out of planes too big for one buffer (`render`)
+    let mn = select(n, pu(F_MASK_N), pu(F_MASK_N) != 0u);
+    let mi = i - pu(F_MASK_I0);
     let gain = pf(F_GAIN);
     let ev = pf(F_EV);
     var c = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
@@ -732,7 +833,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var tint_amt = 0.0;
     let nm = pu(F_NMASK);
     for (var m = 0u; m < nm; m++) {
-        let a = masks[m * n + i];
+        let a = masks[m * mn + mi];
         if (a <= 0.0) {
             continue;
         }
@@ -757,7 +858,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let raw = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
         let y = lum2020(c);
         let ch0 = raw / max(lum2020(raw), 1e-6);
-        let o = nm * n + 3u * i;
+        let o = nm * mn + 3u * mi;
         let cb = vec3<f32>(masks[o], masks[o + 1u], masks[o + 2u]);
         c = max((ch0 + (cb - ch0) * mt) * y, vec3<f32>(0.0));
     }
@@ -829,7 +930,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // LOCAL_WB_EV)
     if (lt[6] != 0.0 || lt[7] != 0.0) {
         for (var m = 0u; m < nm; m++) {
-            let a = masks[m * n + i];
+            let a = masks[m * mn + mi];
             if (a <= 0.0) {
                 continue;
             }
@@ -906,7 +1007,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // --- tone map on luminance, highlight desaturation
     let yl = lum2020(c);
-    let o = tone_apply(yl);
+    var o = tone_apply(yl);
     var d = vec3<f32>(0.0);
     if (yl > 1e-9) {
         d = c * o / yl;
@@ -916,6 +1017,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
     }
     let peak = pf(F_PEAK);
+    if (pu(F_RGB_CONTRAST) != 0u) {
+        let rc_base = pu(F_RGB_CONTRAST_OFF);
+        let rc_zero = pf(F_RGB_CONTRAST_ZERO);
+        d = vec3<f32>(
+            rgb_contrast_apply(d.x, rc_base, rc_zero, peak),
+            rgb_contrast_apply(d.y, rc_base, rc_zero, peak),
+            rgb_contrast_apply(d.z, rc_base, rc_zero, peak),
+        );
+        o = rgb_contrast_apply(o, rc_base, rc_zero, peak);
+    }
     let hdr = peak > 1.0;
     let deep = pu(F_DEEP) != 0u;
     let mx = max(d.x, max(d.y, d.z));
@@ -930,10 +1041,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // --- primaries (the colourist wheels: lift/gamma/gain/offset, balance before the look)
+    d = primaries(d);
     // --- colour
     d = color_ops(d, lt[11], lt[12]);
     if (pu(F_LPOINTS) != 0u) {
-        d = local_point_colors(d, i, n);
+        d = local_point_colors(d, mi, mn);
     }
     if (tint_on) {
         let lab = oklab(d);
@@ -1036,6 +1149,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         e = vec3<f32>(encode_srgb(r.x), encode_srgb(r.y), encode_srgb(r.z));
     }
+    // --- Levels: each channel's own stage first, then the master's (one call site, as `finish_with`)
+    if (pu(F_LEVELS) != 0u) {
+        let c = vec3<f32>(
+            levels_stage(F_LEVELS_R, pu(F_LEVELS_OFF_R), e.x, hdr),
+            levels_stage(F_LEVELS_G, pu(F_LEVELS_OFF_G), e.y, hdr),
+            levels_stage(F_LEVELS_B, pu(F_LEVELS_OFF_B), e.z, hdr));
+        e = vec3<f32>(
+            levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.x, hdr),
+            levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.y, hdr),
+            levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.z, hdr));
+    }
     if (pu(F_CURVES) != 0u) {
         let e0 = e;
         e = vec3<f32>(curve(0u, e.x, hdr), curve(1u, e.y, hdr), curve(2u, e.z, hdr));
@@ -1049,7 +1173,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let so = pu(F_LCURVE_OFF);
         for (var m = 0u; m < nm; m++) {
             let slot = aux[so + m];
-            let a = masks[m * n + i];
+            let a = masks[m * mn + mi];
             if (slot < 0.0 || a <= 0.0) {
                 continue;
             }

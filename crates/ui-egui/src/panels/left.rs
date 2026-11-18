@@ -258,6 +258,61 @@ pub(crate) fn set_tree_open(app: &mut LccApp, ui: &egui::Ui, key: &str, open_id:
     ui.data_mut(|d| d.insert_temp(open_id, open));
 }
 
+/// An Option / Alt-click on a triangle, being applied to the rows drawn after it that sit deeper
+/// than it (the rows inside it). Rows that only appear once their parent opens are reached on the
+/// next pass; the sweep ends after a pass that changed nothing. Folding keeps the clicked row open
+/// until then, so the rows inside it are still drawn to fold.
+#[derive(Clone, Default)]
+struct BranchSweep {
+    root: String,
+    indent: f32,
+    open: bool,
+    pass: u64,
+    changed: bool,
+    active: bool,
+}
+
+fn sweep_id() -> egui::Id {
+    egui::Id::new("lc-branch-sweep")
+}
+
+fn branch_sweep(app: &mut LccApp, ui: &egui::Ui, key: &str, indent: f32, open_id: egui::Id, open: &mut bool) {
+    let Some(mut s) = ui.data(|d| d.get_temp::<BranchSweep>(sweep_id())) else { return };
+    let pass = ui.ctx().cumulative_pass_nr();
+    if s.pass != pass {
+        if !s.changed {
+            // nothing moved in the last pass: the sweep is done (a folded branch closes its root now)
+            ui.data_mut(|d| d.remove_temp::<BranchSweep>(sweep_id()));
+            if !s.open {
+                app.ui.set_tree_open(&s.root, false);
+                if s.root == key {
+                    *open = false;
+                    ui.data_mut(|d| d.insert_temp(open_id, false));
+                }
+            }
+            return;
+        }
+        s.pass = pass;
+        s.changed = false;
+        s.active = false;
+    }
+    if s.root == key {
+        s.active = true;
+    } else if s.active {
+        if indent > s.indent {
+            if *open != s.open {
+                *open = s.open;
+                set_tree_open(app, ui, key, open_id, s.open);
+                s.changed = true;
+            }
+        } else {
+            s.active = false;
+        }
+    }
+    ui.ctx().request_repaint();
+    ui.data_mut(|d| d.insert_temp(sweep_id(), s));
+}
+
 /// The chevron of a tree row that has rows inside it (Albums' folders, Local, By Date, Folders,
 /// Keywords): a click flips `open` and remembers it under `key`. Returns the chevron's response
 /// (it sits on the row and takes its clicks, so a row's context menu is attached to it too).
@@ -272,9 +327,24 @@ fn tree_toggle(
     widget: String,
 ) -> egui::Response {
     let tri = disclosure_chevron(ui, row, indent, *open, open_id.with("triangle"), widget);
+    branch_sweep(app, ui, key, indent, open_id, open);
     if tri.clicked() {
-        *open = !*open;
-        set_tree_open(app, ui, key, open_id, *open);
+        if ui.input(|i| i.modifiers.alt) {
+            // Option / Alt-click: the row and everything inside it open, or all fold
+            let open_all = !*open;
+            let pass = ui.ctx().cumulative_pass_nr();
+            ui.data_mut(|d| {
+                d.insert_temp(sweep_id(), BranchSweep { root: key.to_string(), indent, open: open_all, pass, changed: true, active: true })
+            });
+            if open_all {
+                *open = true;
+                set_tree_open(app, ui, key, open_id, true);
+            }
+            ui.ctx().request_repaint();
+        } else {
+            *open = !*open;
+            set_tree_open(app, ui, key, open_id, *open);
+        }
     }
     let label = if *open { crate::i18n::tr("Collapse") } else { crate::i18n::tr("Expand") };
     tri.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
@@ -966,7 +1036,7 @@ fn local_rows(app: &mut LccApp, ui: &mut egui::Ui, now: &LocalNow) {
     {
         let picked = app.services.pick_folder.as_mut().and_then(|f| f());
         if let Some(path) = picked {
-            match app.run("library.browse", json!({"path": path})) {
+            match app.run("library.browse", json!({"path": path, "show": "all"})) {
                 // the picked folder stays in Local (and comes back if it was hidden)
                 Ok(r) => {
                     let dir = r["path"].as_str().unwrap_or(&path).to_string();
@@ -1237,7 +1307,9 @@ pub(crate) fn folder_tree(
     let tr = tree_toggle(app, ui, &resp, indent, &key, open_id, &mut open, format!("folderToggle:{path}"));
     if !tr.clicked()
         && resp.clicked()
-        && let Err(e) = app.run("library.browse", json!({"path": path}))
+        // every photo of the folder, library ones too: the Import tab's Show Not Imported is
+        // that tab's alone, and kept it would hide a library folder's photos here (#881)
+        && let Err(e) = app.run("library.browse", json!({"path": path, "show": "all"}))
     {
         app.toast(ui.ctx(), e);
     }
@@ -1343,6 +1415,13 @@ fn albums_tree(app: &mut LccApp, ui: &mut egui::Ui, all: &AlbumKids, parent: Opt
                 app.ui.dragging_album = Some(a.id.0);
             }
             album_drag_over(app, ui, &resp, a, None, indent);
+            // the device-sync pill, left of the photo count
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(pill) = app.session.sync_collection_pill(a.id) {
+                let size = super::sync_pill::size(ui, &pill);
+                let at = egui::pos2(resp.rect.right() - 44.0 - size.x, resp.rect.center().y - size.y / 2.0);
+                super::sync_pill::paint(ui, at, &pill, &format!("badge:syncCollection:{}", a.id.0));
+            }
             if !a.is_smart() {
                 drop_target(app, ui, &resp, a);
             }
@@ -1661,7 +1740,7 @@ fn drop_target(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response, a: &A
                 if skipped > 0 {
                     msg.push_str(" · ");
                     msg.push_str(&crate::i18n::tr_format!(
-                        "{n} Local photo{} skipped: collections hold library photos (Add to My Photos first)",
+                        "{n} Local photo{} skipped: collections hold catalog photos (Add to My Photos first)",
                         if skipped == 1 { "" } else { "s" },
                         n = skipped
                     ));
@@ -1814,6 +1893,16 @@ fn folder_menu(app: &mut LccApp, resp: &egui::Response, a: &Album) {
             app.session.catalog.albums().filter(|f| f.folder && !is_within(app, f.id, a.id)).map(|f| (f.id.0, f.name.clone())).collect();
         folders.sort_by_key(|(_, n)| n.to_lowercase());
         super::collections::export_item(app, ui, a.id.0, &a.name);
+        // how this collection syncs with other devices: Settings ▸ Sync
+        #[cfg(not(target_arch = "wasm32"))]
+        if a.smart.is_none() && !a.quick {
+            let b = ui.button(crate::i18n::tr("Sync…"));
+            crate::widgets::register(ui.ctx(), format!("menu:albumSync:{}", a.id.0), b.rect);
+            if b.clicked() {
+                let _ = app.run("app.settings", json!({"tab": "sync"}));
+                ui.close();
+            }
+        }
         if a.folder {
             super::collections::import_item(app, ui, Some(a.id.0));
         }
@@ -1938,16 +2027,29 @@ pub(crate) fn reveal_chosen(app: &mut LccApp, ui: &egui::Ui, tree: &[FolderNode]
 /// instead of under every folder from the disk down to it (the full path is the row's hover
 /// text). Folders listed side by side with the same name say which folder each is in:
 /// `trip (2024)`, `trip (2025)`. Disk rows stay as they are.
-pub(crate) fn sidebar_folders(mut nodes: Vec<FolderNode>) -> Vec<FolderNode> {
-    fn lift(mut n: FolderNode) -> FolderNode {
-        while !n.volume && n.own == 0 && n.label.is_none() && n.children.len() == 1 {
+/// A folder in `shown` (folder keys, added by Show Parent Folder) always keeps its own row.
+pub(crate) fn sidebar_folders(nodes: Vec<FolderNode>, shown: &std::collections::BTreeSet<String>) -> Vec<FolderNode> {
+    shape_folders(nodes, true, shown)
+}
+
+/// Only the chain right below a disk is lifted (`lift`): once a folder is listed, every folder
+/// inside it keeps its own row, so `2026` → `January` → `31st` nests as it does on disk.
+fn shape_folders(mut nodes: Vec<FolderNode>, lift: bool, shown: &std::collections::BTreeSet<String>) -> Vec<FolderNode> {
+    let shape = |mut n: FolderNode| {
+        while lift
+            && !shown.contains(&lcc_catalog::query::folder_key(&n.path))
+            && !n.volume
+            && n.own == 0
+            && n.label.is_none()
+            && n.children.len() == 1
+        {
             let Some(child) = n.children.pop() else { break };
             n = child;
         }
-        n.children = sidebar_folders(std::mem::take(&mut n.children));
+        n.children = shape_folders(std::mem::take(&mut n.children), n.volume, shown);
         n
-    }
-    nodes = nodes.into_iter().map(lift).collect();
+    };
+    nodes = nodes.into_iter().map(shape).collect();
     disambiguate(&mut nodes);
     nodes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name)));
     nodes
@@ -2066,7 +2168,7 @@ fn folder_drop_target(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response
     let refused = if !n.selectable {
         Some(crate::i18n::tr("This row covers more than one disk: drop on a folder inside it"))
     } else if photos.iter().any(|p| p.local) {
-        Some(crate::i18n::tr("Local photos aren't in the library yet: Add to My Photos first, then move them"))
+        Some(crate::i18n::tr("Local photos aren't in the catalog yet: Add to My Photos first, then move them"))
     } else {
         None
     };
@@ -2199,7 +2301,7 @@ fn locate_missing_item(app: &mut LccApp, ui: &mut egui::Ui, n: &FolderNode) {
 /// the Folders row for that very folder, else (a folder above rows) the folder itself, as a folder
 /// holding other folders. `None` when no library photo lies in `path` or inside it. Reads the
 /// cached Folders tree only; the disk is not touched.
-fn library_node_for(tree: &[FolderNode], path: &str) -> Option<(FolderNode, String)> {
+pub(crate) fn library_node_for(tree: &[FolderNode], path: &str) -> Option<(FolderNode, String)> {
     use lcc_catalog::query::folder_within;
     fn exact<'a>(tree: &'a [FolderNode], path: &str) -> Option<&'a FolderNode> {
         tree.iter().find_map(|n| if same_folder(&n.path, path) { Some(n) } else { exact(&n.children, path) })
@@ -2249,7 +2351,7 @@ fn synchronize_item(app: &mut LccApp, ui: &mut egui::Ui, target: Option<(&Folder
     let r = ui
         .add_enabled(target.is_some(), egui::Button::new(crate::i18n::tr("Synchronize Folder…")))
         .on_hover_text(crate::i18n::tr("Find photos added to or missing from this folder on disk, and XMP sidecars changed by other apps"))
-        .on_disabled_hover_text(crate::i18n::tr("No photo in this folder is in the library yet"));
+        .on_disabled_hover_text(crate::i18n::tr("No photo in this folder is in the catalog yet"));
     crate::widgets::register(ui.ctx(), "folderSynchronize", r.rect);
     if r.clicked()
         && let Some((n, name)) = target
@@ -2269,7 +2371,7 @@ pub(crate) fn folder_export_blocker(n: &FolderNode) -> Option<&'static str> {
     if !n.selectable {
         Some("This row covers more than one disk: export a folder inside it")
     } else if n.count == 0 {
-        Some("No photo in this folder is in the library yet")
+        Some("No photo in this folder is in the catalog yet")
     } else {
         None
     }
@@ -2425,6 +2527,12 @@ fn disk_folder_menu(app: &mut LccApp, resp: &egui::Response, row: FolderRow, pat
                 }
             }
         }
+        if row == FolderRow::Library {
+            if drawn {
+                ui.separator();
+            }
+            super::folders::subfolder_photos_item(app, ui);
+        }
     });
 }
 
@@ -2490,7 +2598,7 @@ fn folder_item(app: &mut LccApp, ui: &mut egui::Ui, row: FolderRow, item: Folder
         FolderItem::AddToMyPhotos => {
             let r = ui
                 .add_enabled(crate::import::can_open(app), egui::Button::new(crate::i18n::tr("Add to My Photos…")))
-                .on_hover_text(crate::i18n::tr("Reviews the photos in this folder, then adds them to the library where they are; no file is touched"))
+                .on_hover_text(crate::i18n::tr("Reviews the photos in this folder, then adds them to the catalog where they are; no file is touched"))
                 .on_disabled_hover_text(crate::i18n::tr("An import is running"));
             register(ui.ctx(), "folderAddToMyPhotos", r.rect);
             if r.clicked() {
@@ -2634,6 +2742,9 @@ fn folder_item(app: &mut LccApp, ui: &mut egui::Ui, row: FolderRow, item: Folder
             if r.clicked()
                 && let Some(parent) = parent_folder(path)
             {
+                // the parent gets a row of its own in the Folders list even when it holds no
+                // photo itself; choosing it then opens the rows above it
+                app.caches.show_folder(&parent);
                 if let Err(e) = app.run("library.source", json!({"kind": "libraryFolder", "path": parent})) {
                     app.toast(ui.ctx(), e);
                 }
@@ -2676,9 +2787,9 @@ fn folder_item(app: &mut LccApp, ui: &mut egui::Ui, row: FolderRow, item: Folder
             let Some(n) = node else { return };
             let disk = item == FolderItem::RemoveDisk;
             let (text, hint) = if disk {
-                ("Remove Disk from Library…", "Moves every photo imported from this disk to Recently Deleted; no file is touched")
+                ("Remove Disk from Catalog…", "Moves every photo imported from this disk to Recently Deleted; no file is touched")
             } else {
-                ("Remove from Library…", "Moves the photos imported from this folder to Recently Deleted; no file is touched")
+                ("Remove from Catalog…", "Moves the photos imported from this folder to Recently Deleted; no file is touched")
             };
             let r = ui.button(crate::i18n::tr(text)).on_hover_text(crate::i18n::tr(hint));
             register(ui.ctx(), "folderRemove", r.rect);
@@ -2769,27 +2880,21 @@ mod tests {
         elide_head(text, max as f32, |s| s.chars().count() as f32)
     }
 
+    /// A label that fits is left alone; a long path loses its leading folders, not its end; a
+    /// single name too long is cut at the end, on a character boundary.
     #[test]
-    fn a_label_that_fits_is_left_alone() {
-        assert_eq!(fit("/Users/me/Pictures", 18), "/Users/me/Pictures");
-    }
-
-    #[test]
-    fn a_long_path_loses_its_leading_folders_not_its_end() {
-        assert_eq!(fit("/Users/me/Pictures/Lightroom", 20), "…/Pictures/Lightroom");
-        assert_eq!(fit("/Users/me/Pictures/Lightroom", 12), "…/Lightroom");
-    }
-
-    #[test]
-    fn a_single_name_too_long_is_cut_at_the_end() {
-        assert_eq!(fit("2024-summer-holiday", 8), "2024-su…");
-        assert_eq!(fit("2024-summer-holiday", 1), "…");
-        assert_eq!(fit("2024-summer-holiday", 0), "…");
-    }
-
-    #[test]
-    fn multibyte_names_are_cut_on_character_boundaries() {
-        assert_eq!(fit("/写真/夏休み旅行の記録", 6), "夏休み旅行…");
+    fn a_long_label_loses_its_leading_folders_not_its_end() {
+        for (text, max, want) in [
+            ("/Users/me/Pictures", 18, "/Users/me/Pictures"),
+            ("/Users/me/Pictures/Lightroom", 20, "…/Pictures/Lightroom"),
+            ("/Users/me/Pictures/Lightroom", 12, "…/Lightroom"),
+            ("2024-summer-holiday", 8, "2024-su…"),
+            ("2024-summer-holiday", 1, "…"),
+            ("2024-summer-holiday", 0, "…"),
+            ("/写真/夏休み旅行の記録", 6, "夏休み旅行…"),
+        ] {
+            assert_eq!(fit(text, max), want, "{text:?} in {max}");
+        }
     }
 
     fn names(v: &[(String, String)]) -> Vec<&str> {
@@ -2882,7 +2987,7 @@ mod tests {
     /// hidden attribute, so Home's tree does not list AppData and open down into its temp folder.
     #[test]
     fn subfolders_leave_out_hidden_folders() {
-        let dir = std::env::temp_dir().join(format!("lc-ui-hidden-subfolders-{}", std::process::id()));
+        let dir = lcc_testkit::TempDir::new("lc-ui-hidden-subfolders");
         let _ = std::fs::remove_dir_all(&dir);
         for name in ["Shown", ".dot", "Hidden"] {
             std::fs::create_dir_all(dir.join(name)).unwrap();

@@ -132,6 +132,16 @@ impl HostApi for JobHost {
     fn library_add(&mut self, _: &Value) -> Result<Value, String> {
         Err(format!("library.add: {NO_WRITES}"))
     }
+    fn photo_pixels(&mut self, photo: &str, long_edge: u32) -> Result<Value, String> {
+        self.reachable()?;
+        self.0.pixels_within(photo, long_edge, Some(ANSWER_WAIT))
+    }
+    fn set_crop(&mut self, _: &str, _: [f64; 4], _: Option<f64>) -> Result<Value, String> {
+        Err(format!("develop.setCrop: {NO_WRITES}"))
+    }
+    fn virtual_copy(&mut self, _: &str, _: Option<&str>) -> Result<Value, String> {
+        Err(format!("photo.virtualCopy: {NO_WRITES}"))
+    }
     fn find_program(&mut self, program: &lcc_plugins::ProgramDecl) -> Vec<lcc_plugins::Found> {
         self.0.find_program(program)
     }
@@ -319,38 +329,40 @@ mod tests {
     }
 
     #[test]
-    fn a_job_that_counts_photos_is_a_batch_and_wait_returns_its_result() {
-        let _turn = turn();
-        install(&job_module(
-            "test.count",
-            &[r#"{"method":"job.itemDone","params":{}}"#, r#"{"method":"job.itemFailed","params":{"why":"b.jpg: broken"}}"#],
-            r#"{"ok":{"message":"Counted"}}"#,
-        ));
-        let mut s = Session::with_demo();
-        let r = s.execute("plugin.run", &json!({"plugin": "test.count", "command": "go", "wait": true})).unwrap();
-        assert_eq!(r, json!({"message": "Counted"}), "wait: the job's own result");
-        let summary = s.activity.finished().into_iter().find(|b| b.kind == "pluginJob").expect("a batch summary");
-        assert_eq!((summary.done, summary.failed, summary.reported), (2, 1, false), "{summary:?}");
-        assert!(summary.reasons.iter().any(|r| r.contains("b.jpg")), "{summary:?}");
-        // in the background, how it ended waits for the app
-        let started = s.execute("plugin.run", &json!({"plugin": "test.count", "command": "go"})).unwrap();
-        let ended = within("the job's end", || take_finished(&mut s).into_iter().find(|v| v["job"] == started["job"]));
-        assert_eq!(ended["ok"]["message"], "Counted", "{ended}");
-        assert_eq!(ended["label"], "Go Far", "{ended}");
-    }
-
-    #[test]
-    fn a_failed_job_says_why_and_logs_it() {
-        let _turn = turn();
-        install(&job_module("test.fail", &[], r#"{"error":"the disk is full"}"#));
-        let mut s = Session::with_demo();
-        let e = s.execute("plugin.run", &json!({"plugin": "test.fail", "command": "go", "wait": true})).unwrap_err().to_string();
-        assert!(e.contains("the disk is full"), "{e}");
-        let started = s.execute("plugin.run", &json!({"plugin": "test.fail", "command": "go"})).unwrap();
-        let ended = within("the job's end", || take_finished(&mut s).into_iter().find(|v| v["job"] == started["job"]));
-        assert!(ended["error"].as_str().is_some_and(|e| e.contains("the disk is full")), "{ended}");
-        let log = s.execute("plugin.log", &json!({"id": "test.fail"})).unwrap();
-        assert!(log.as_array().unwrap().iter().any(|l| l.as_str().is_some_and(|l| l.contains("the disk is full"))), "{log}");
+    fn a_job_that_counts_photos_is_a_batch_wait_returns_its_result_and_a_failed_job_says_why() {
+        // a job that counts photos is a batch and wait returns its result
+        {
+            let _turn = turn();
+            install(&job_module(
+                "test.count",
+                &[r#"{"method":"job.itemDone","params":{}}"#, r#"{"method":"job.itemFailed","params":{"why":"b.jpg: broken"}}"#],
+                r#"{"ok":{"message":"Counted"}}"#,
+            ));
+            let mut s = Session::with_demo();
+            let r = s.execute("plugin.run", &json!({"plugin": "test.count", "command": "go", "wait": true})).unwrap();
+            assert_eq!(r, json!({"message": "Counted"}), "wait: the job's own result");
+            let summary = s.activity.finished().into_iter().find(|b| b.kind == "pluginJob").expect("a batch summary");
+            assert_eq!((summary.done, summary.failed, summary.reported), (2, 1, false), "{summary:?}");
+            assert!(summary.reasons.iter().any(|r| r.contains("b.jpg")), "{summary:?}");
+            // in the background, how it ended waits for the app
+            let started = s.execute("plugin.run", &json!({"plugin": "test.count", "command": "go"})).unwrap();
+            let ended = within("the job's end", || take_finished(&mut s).into_iter().find(|v| v["job"] == started["job"]));
+            assert_eq!(ended["ok"]["message"], "Counted", "{ended}");
+            assert_eq!(ended["label"], "Go Far", "{ended}");
+        }
+        // a failed job says why and logs it
+        {
+            let _turn = turn();
+            install(&job_module("test.fail", &[], r#"{"error":"the disk is full"}"#));
+            let mut s = Session::with_demo();
+            let e = s.execute("plugin.run", &json!({"plugin": "test.fail", "command": "go", "wait": true})).unwrap_err().to_string();
+            assert!(e.contains("the disk is full"), "{e}");
+            let started = s.execute("plugin.run", &json!({"plugin": "test.fail", "command": "go"})).unwrap();
+            let ended = within("the job's end", || take_finished(&mut s).into_iter().find(|v| v["job"] == started["job"]));
+            assert!(ended["error"].as_str().is_some_and(|e| e.contains("the disk is full")), "{ended}");
+            let log = s.execute("plugin.log", &json!({"id": "test.fail"})).unwrap();
+            assert!(log.as_array().unwrap().iter().any(|l| l.as_str().is_some_and(|l| l.contains("the disk is full"))), "{log}");
+        }
     }
 
     /// A host that breaks on a catalog read.
@@ -367,7 +379,7 @@ mod tests {
         let _turn = turn();
         let bytes = job_module("test.boom", &[r#"{"method":"catalog.query","params":{}}"#], r#"{"ok":{"message":"never"}}"#);
         let read = lcc_plugins::Permissions { catalog: true, ..Default::default() };
-        manager().get_or_insert_with(Manager::in_memory).install_bytes(&bytes, Some(read), false).unwrap();
+        manager().get_or_insert_with(Manager::in_memory).install_bytes_by_user(&bytes, Some(read), false).unwrap();
         let mut s = Session::with_demo();
         let begin =
             |s: &mut Session| manager().as_mut().unwrap().begin_command("test.boom", "go", &json!({}), &[], &Value::Null, &mut SessionHost(s));

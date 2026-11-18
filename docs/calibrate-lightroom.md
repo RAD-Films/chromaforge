@@ -42,16 +42,16 @@ On ARM PCs the files say `arm64` instead of `x64`.
 
 ### macOS
 
-The app's disk image holds only the app: download **`chromaforge-cli-26.43.7-macos-universal.zip`** from the same
-release too (signed and notarized, for Apple silicon and Intel). Double-click it in Finder to unzip, then open
-**Terminal** (Applications ▸ Utilities) and run it from that folder:
+The tool is inside the app (`chromaforge-<version>-macos-arm64.dmg`, or `-macos-x64.dmg` on Intel; earlier releases had it as a separate
+`chromaforge-cli-<version>-macos-universal.zip`). Open the app once first, so macOS knows you allowed it (the
+manual's Install page has the steps), then open **Terminal** (Applications ▸ Utilities) and run it from there:
 
 ```sh
-cd ~/Downloads
-./chromaforge-cli --help
+/Applications/Chromaforge.app/Contents/MacOS/chromaforge-cli --help
 ```
 
-To run it from anywhere, move it onto your PATH once: `sudo mv ~/Downloads/chromaforge-cli /usr/local/bin/`.
+To type just `chromaforge-cli`, link it onto your PATH once (the Install page has the details):
+`ln -sf /Applications/Chromaforge.app/Contents/MacOS/chromaforge-cli ~/.local/bin/chromaforge-cli`.
 
 ### Linux
 
@@ -192,13 +192,20 @@ Adobe-converted DNGs and Adobe-rendered pixels never ship.
 ## For developers: adding a contribution
 
 ```sh
-chromaforge-cli calibrate-lightroom add path/to/<Make>_<Model>.json [--repo .] [--contributor "Name"]
+chromaforge-cli calibrate-lightroom add path/to/<Make>_<Model>.json [--repo .] [--contributor "Name"] [--lens "Lens model"] [--replace]
 ```
 
 `add` parses and validates the file (format version, allow-listed fields, matrix and table bounds), optionally sets
 the contributor, writes the canonical form to `crates/camdb/data/calibrations/<Make>_<Model>.json` and adds (or
 replaces) its row in `assets/ATTRIBUTION.md`. Commit both, with the release notes. A file that fails validation is
 refused with the reason and nothing is written.
+
+**One file per camera, lens and editor.** A fit can be for one lens: `--lens` (on `fit` or `add`) records the
+photos' Exif lens model (`LensModel`, the model identifier only, never a serial number) and the file becomes
+`<Make>_<Model>_<Lens>.json`. A photo uses its own lens's calibration when there is one, else the camera's lens-less
+calibration, and never a calibration made for another lens; phones whose cameras share one Exif model (e.g. a main,
+wide and ultrawide module) need this. `add` refuses to overwrite a calibration already there for the same camera,
+lens and editor; pass `--replace` to replace it (the two fits are not merged).
 
 Before committing, try a contribution in a debug build without adding it: point
 `CHROMAFORGE_CAMERA_CALIBRATIONS` at a folder holding the JSON and open that camera's raws. `chromaforge-cli calibrate-lightroom

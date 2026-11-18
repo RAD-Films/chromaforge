@@ -39,8 +39,9 @@ pub fn config_dir() -> Option<PathBuf> {
     config_dir_with(lcc_brand::env_os("CONFIG_DIR"), portable_dir, lcc_brand::settings_dir)
 }
 
-/// The recent-catalogs list (File ▸ Open Recent Catalog, the startup default) in [`config_dir`], like every
-/// other settings file: `<PREFIX>_CONFIG_DIR` and portable mode apply; an empty override keeps no list.
+/// The old recent-catalogs list in [`config_dir`], like every other settings file: `<PREFIX>_CONFIG_DIR` and
+/// portable mode apply; an empty override keeps no list. The desktop app reads it once, to carry its libraries
+/// over into the settings' recent list (issue #871).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn recent_catalogs_file() -> Option<PathBuf> {
     config_dir().map(|d| crate::catalog::library::RecentCatalogs::file_in(&d))
@@ -347,18 +348,12 @@ mod config_tests {
     }
 
     #[test]
-    fn config_override_wins_without_reading_user_profile() {
+    fn config_override_wins_empty_disables_and_unset_keeps_the_platform_default() {
         let actual = config_dir_with(Some(OsString::from("isolated/settings")), || panic!("no portable probe"), || panic!("the default is not read"));
         assert_eq!(actual, Some(PathBuf::from("isolated/settings")));
-    }
-
-    #[test]
-    fn config_empty_override_disables_profile_without_reading_defaults() {
+        // empty: no settings folder at all, and the defaults are not read
         assert_eq!(config_dir_with(Some(OsString::new()), || panic!("no portable probe"), || panic!("the default is not read")), None);
-    }
-
-    #[test]
-    fn config_unset_override_keeps_platform_defaults() {
+        // unset: the platform's own
         assert_eq!(config_dir_with(None, || None, || Some(PathBuf::from("/xdg/app"))), Some(PathBuf::from("/xdg/app")));
         assert_eq!(config_dir_with(None, || None, || None), None);
     }
@@ -375,6 +370,17 @@ mod config_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No test writes into the user's settings folder: in a test binary the settings folder is a temporary one
+    /// (`lcc_brand::is_test_binary`), unless whoever runs the tests chose one with `<PREFIX>_CONFIG_DIR`.
+    #[test]
+    fn tests_use_a_temporary_settings_folder() {
+        if lcc_brand::env_os("CONFIG_DIR").is_some() {
+            return;
+        }
+        let dir = config_dir().expect("a settings folder");
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+    }
 
     /// Issue #163: the recent-catalogs list follows the config-dir resolver, never the platform folder
     /// when `<PREFIX>_CONFIG_DIR` is set, and none at all when it is empty.

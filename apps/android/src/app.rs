@@ -28,6 +28,11 @@ pub fn main(activity: AndroidApp) {
         pictures: external.unwrap_or_else(|| config_root.clone()),
     });
     lcc_engine::guard::install_hook(Some(config_root.join(format!("{}-panics.log", lcc_brand::BINARY))));
+    // freed decode buffers go back to the system at once, not at the allocator's next purge (a phone has no memory to
+    // spare): after each decode, preview build and import, and on entering Develop
+    lcc_engine::memory::set_release_hook(|| {
+        let _ = lcc_sysmem::release_free_memory();
+    });
 
     let host = match Host::new(&activity) {
         Ok(h) => Some(Arc::new(h)),
@@ -95,7 +100,7 @@ fn open_session(dir: Option<PathBuf>) -> (Session, Option<LibraryProblem>) {
         s
     };
     let Some(dir) = dir else {
-        return (fresh(), Some(LibraryProblem::new("", "There is no folder to keep the library in.")));
+        return (fresh(), Some(LibraryProblem::new("", "There is no folder to keep the catalog in.")));
     };
     let mut s = fresh();
     match s.open_library(&dir, false) {
@@ -105,7 +110,7 @@ fn open_session(dir: Option<PathBuf>) -> (Session, Option<LibraryProblem>) {
             (s, None)
         }
         Err(e) => {
-            log::error!("can't open library {}: {e}", dir.display());
+            log::error!("can't open catalog {}: {e}", dir.display());
             (fresh(), Some(LibraryProblem::new(dir.to_string_lossy(), e.to_string())))
         }
     }
@@ -333,7 +338,7 @@ impl eframe::App for App {
             log::error!("{e}");
         }
         if let Err(e) = self.app.session.close_library() {
-            log::error!("saving the library failed: {e}");
+            log::error!("saving the catalog failed: {e}");
         }
         if !self.app.shutdown(EXIT_WAIT) {
             log::warn!("close: background work was still running after {EXIT_WAIT:?}");

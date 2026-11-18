@@ -578,6 +578,17 @@ fn crop(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
             }
         }
     });
+    padded(ui, |ui| {
+        ui.label(crate::i18n::tr("Crop Mask"));
+        let levels = crate::state::CROP_MASK_OPACITY_LEVELS;
+        let labels: Vec<String> = levels.iter().map(|v| if *v == 0 { crate::i18n::tr("Off").to_string() } else { format!("{v}%") }).collect();
+        let items: Vec<(&str, String)> = labels.iter().map(|l| (l.as_str(), format!("cropMask{l}"))).collect();
+        let items: Vec<(&str, &str)> = items.iter().map(|(l, k)| (*l, k.as_str())).collect();
+        let active = levels.iter().position(|v| *v == app.ui.crop_mask_opacity);
+        if let Some(level) = crate::widgets::segmented(ui, "cropMask", &items, active, 6).and_then(|i| levels.get(i)) {
+            let _ = app.run("view.cropMaskOpacity", json!({"opacity": level}));
+        }
+    });
     divider(ui);
     header(ui, "Geometry");
     // a clip takes the crop, straighten and flips only: Upright and the transform sliders are photo-only
@@ -627,7 +638,7 @@ fn crop(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
             if guided {
                 ui.label(
                     egui::RichText::new(crate::i18n::tr_format!(
-                        "{} of 4 guides — drag along lines that should be vertical or horizontal.",
+                        "{} of 4 guides. Drag along lines that should be vertical or horizontal.",
                         d.geometry.guides.len()
                     ))
                     .size(11.0)
@@ -729,10 +740,83 @@ fn mode_segmented_bar(ui: &mut egui::Ui, id: &str, active_key: &str) -> Option<&
     chosen
 }
 
+/// Makes (or remakes) the film-dust mask from the infrared pass at the develop settings' sensitivity and expand.
+fn film_dust_mask(app: &mut LccApp, ctx: &egui::Context, d: &lcc_develop::DevelopSettings) {
+    if let Err(e) = app.run("spot.filmDustMask", json!({"sensitivity": d.film_dust.sensitivity, "expand": d.film_dust.expand})) {
+        app.toast(ctx, e);
+    }
+}
+
+/// The Remove panel's Infrared Dust Removal, on a photo with a scanner's infrared pass: one
+/// switch (the develop step), what the photo shows (the photo, the infrared pass, or the marks
+/// that are filled), the two settings, and the marks as a mask for the brush and generative fill.
+fn infrared_dust(app: &mut LccApp, ui: &mut egui::Ui, d: &lcc_develop::DevelopSettings) {
+    let t = Tokens::get(ui.ctx());
+    padded(ui, |ui| {
+        ui.horizontal(|ui| {
+            let mut on = d.film_dust.on();
+            let r = ui.checkbox(&mut on, egui::RichText::new(crate::i18n::tr("Infrared Dust Removal")).strong()).on_hover_text(crate::i18n::tr(
+                "Fill in the dust, hairs and scratches the scanner's infrared pass shows, before the picture is converted (as the scanner's own infrared cleaning does)",
+            ));
+            register(ui.ctx(), "checkbox:filmDustRemove", r.rect);
+            if r.changed() {
+                let _ = app.run("develop.set", json!({"control": "filmDust.remove", "value": if on { 1.0 } else { 0.0 }}));
+            }
+        });
+        ui.label(
+            egui::RichText::new(crate::i18n::tr(
+                "Dust, hairs and scratches block infrared light. Check the Infrared or Mask view, then switch it on.",
+            ))
+            .size(11.0)
+            .color(t.text_dim),
+        );
+        ui.add_space(4.0);
+        // what the photo shows
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(crate::i18n::tr("View")).size(11.5).color(t.text_dim));
+            for (v, label, hint) in [
+                (0u8, "Photo", "The photo, with dust removal as set"),
+                (1, "Infrared", "The scanner's infrared pass, with what will be filled in red"),
+                (2, "Mask", "What will be filled, white on black"),
+            ] {
+                let r = text_button(ui, &format!("filmDustView{v}"), crate::i18n::tr(label), app.ui.film_dust_view == v)
+                    .on_hover_text(crate::i18n::tr(hint));
+                if r.clicked() {
+                    app.ui.film_dust_view = v;
+                }
+            }
+        });
+    });
+    super::edit::control_as(app, ui, d, "filmDust.sensitivity", true, Some("Strength"));
+    super::edit::control_as(app, ui, d, "filmDust.expand", true, Some("Grow"));
+    padded(ui, |ui| {
+        ui.horizontal(|ui| {
+            let film_mask = d.masks.iter().find(|m| m.name == lcc_engine::cmd::film_dust::MASK_NAME).map(|m| m.id);
+            let mask_selected = film_mask.is_some() && app.session.active_mask == film_mask;
+            if text_button(ui, "filmDustMask", crate::i18n::tr("Edit as Mask"), mask_selected)
+                .on_hover_text(crate::i18n::tr(
+                    "The same marks as a mask you can brush and fill: Fill Selected Mask or Generate into Selected Mask removes what it covers (a fibre too large to fill smoothly)",
+                ))
+                .clicked()
+            {
+                film_dust_mask(app, ui.ctx(), d);
+            }
+        });
+    });
+}
+
 fn remove(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
     let d = app.session.develop_of(id).unwrap_or_default();
     header(ui, "Remove");
     let t = Tokens::get(ui.ctx());
+    // a film scanner's RGBI file: its infrared pass drives Remove Film Dust (a develop step)
+    let has_infrared = app.session.source_info(id).infrared.is_some();
+    if has_infrared {
+        infrared_dust(app, ui, &d);
+        divider(ui);
+    } else if app.ui.film_dust_view != 0 {
+        app.ui.film_dust_view = 0;
+    }
 
     padded(ui, |ui| {
         // Mode icon segmented bar
@@ -1349,6 +1433,21 @@ fn hold_list_in_place(ui: &mut egui::Ui, top: f32) {
     ui.ctx().request_discard("the Keyword List holds its place");
 }
 
+/// Edit Set…: the current set's nine slots in the Edit Keyword Set dialog (Recent Keywords becomes a named set).
+pub(crate) fn edit_keyword_set(app: &mut LccApp) {
+    let sets = lcc_engine::cmd::keywords::keyword_sets_json(&app.session);
+    let current = sets["current"].as_str().unwrap_or_default().to_string();
+    let mut slots: Vec<String> = sets["keywords"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_string)).collect();
+    slots.resize(9, String::new());
+    let named = current != lcc_engine::cmd::keywords::RECENT;
+    app.ui.dialog = Some(crate::state::Dialog::KeywordSet {
+        replaces: named.then(|| current.clone()),
+        name: if named { current } else { String::new() },
+        slots,
+        as_new: false,
+    });
+}
+
 /// The keyword set: pick a set, then nine buttons (⌥1–⌥9; Alt+1–Alt+9 off macOS) that toggle its keywords on
 /// the selected photos, empty slots included; "Save as Set…" keeps the current nine under a name.
 fn keyword_set(app: &mut LccApp, ui: &mut egui::Ui) {
@@ -1374,16 +1473,7 @@ fn keyword_set(app: &mut LccApp, ui: &mut egui::Ui) {
                 let edit = ui.button(crate::i18n::tr("Edit Set…"));
                 register(ui.ctx(), "keywordSetMenu:edit", edit.rect);
                 if edit.clicked() {
-                    let mut slots: Vec<String> =
-                        sets["keywords"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_string)).collect();
-                    slots.resize(9, String::new());
-                    let named = current != lcc_engine::cmd::keywords::RECENT;
-                    app.ui.dialog = Some(crate::state::Dialog::KeywordSet {
-                        replaces: named.then(|| current.clone()),
-                        name: if named { current.clone() } else { String::new() },
-                        slots,
-                        as_new: false,
-                    });
+                    edit_keyword_set(app);
                 }
                 if ui.button(crate::i18n::tr("Save Current Keywords as Set…")).clicked() {
                     app.ui.dialog = Some(crate::state::Dialog::TextPrompt {
@@ -1435,7 +1525,7 @@ fn keyword_set(app: &mut LccApp, ui: &mut egui::Ui) {
                     [bw, 22.0],
                     egui::Button::new(egui::RichText::new(short).size(11.5).color(if on { t.text } else { t.text_label })).selected(on).truncate(),
                 )
-                .on_hover_text(format!("{} — {}", k.replace('|', " › "), key(i)));
+                .on_hover_text(format!("{}: {}", k.replace('|', " › "), key(i)));
             register(ui.ctx(), format!("kwSet:{}", i + 1), r.rect);
             if on {
                 register(ui.ctx(), format!("kwSetOn:{}", i + 1), r.rect);
@@ -1604,9 +1694,10 @@ fn activity(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
 
 /// The heading of a History group: its Develop section, or for a step that spans several sections
 /// (a preset, paste, sync…) the step itself.
-fn group_title(section: Option<&str>, step_label: &str, presets: &[lcc_develop::Preset]) -> String {
+pub(crate) fn group_title(section: Option<&str>, step_label: &str, presets: &[lcc_develop::Preset]) -> String {
     let name = match section {
         Some("basic") => "Basic",
+        Some("levels") => "Levels",
         Some("curve") => "Tone Curve",
         Some("color") => "Color",
         Some("grading") => "Color Grading",

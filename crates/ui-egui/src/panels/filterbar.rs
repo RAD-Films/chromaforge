@@ -262,6 +262,15 @@ pub fn show(app: &mut LccApp, outer: &mut egui::Ui) {
             filter(app, json!({"label": Value::Null, "labels": names}));
         }
     }
+    // photos without a label: the hollow swatch; ANDs with the colours above
+    let none_on = f.labels_none;
+    let resp = toggle(ui, "label-none", none_on, "Photos without a colour label", |p, r, c| {
+        p.circle_stroke(r.center(), 5.5, Stroke::new(1.5, c));
+    });
+    count(ui, "filter:count:labelnone", tally.unlabeled);
+    if resp.clicked() {
+        filter(app, json!({"labelsNone": !none_on}));
+    }
     ui.add_space(14.0);
 
     // kind + edited
@@ -326,6 +335,19 @@ pub fn show(app: &mut LccApp, outer: &mut egui::Ui) {
         });
         #[cfg(not(target_arch = "wasm32"))]
         super::connections::smart_search_box(app, ui);
+    }
+    // Vignetting Calibration references: only while the catalog holds a map (or the filter is set)
+    if f.vignetting_reference.is_some() || app.session.catalog.vignetting_maps().next().is_some() {
+        let options = [
+            ("Vignetting reference: any photo", Value::Null),
+            ("Vignetting reference", json!("reference")),
+            ("Not a vignetting reference", json!("none")),
+        ];
+        let want = f.vignetting_reference.as_deref();
+        let current = options.iter().find(|(_, v)| v.as_str() == want).map_or("Vignetting reference: any photo", |(l, _)| *l);
+        picker(app, ui, "vignettingReference", current, want.is_some(), |_| {
+            options.iter().map(|(l, v)| (l.to_string(), json!({"vignettingReference": v.clone()}), want == v.as_str())).collect()
+        });
     }
 
     // metadata pickers
@@ -467,7 +489,7 @@ pub fn show(app: &mut LccApp, outer: &mut egui::Ui) {
 /// The Metadata columns' height (points), under the filter bar's rows: a column's field, its search box and its values.
 pub const COLUMNS_HEIGHT: f32 = 198.0;
 /// The fields a Metadata column can list (`library.facetPick`'s fields), with their headers.
-pub const COLUMN_FIELDS: [(&str, &str); 23] = [
+pub const COLUMN_FIELDS: [(&str, &str); 25] = [
     ("year", "Date"),
     ("camera", "Camera"),
     ("lens", "Lens"),
@@ -480,6 +502,8 @@ pub const COLUMN_FIELDS: [(&str, &str); 23] = [
     ("format", "File Format"),
     ("iso", "ISO"),
     ("focal", "Focal Length"),
+    ("aperture", "Aperture"),
+    ("shutter", "Shutter Speed"),
     ("aspect", "Aspect Ratio"),
     ("title", "Title"),
     ("headline", "Headline"),
@@ -500,8 +524,9 @@ const MAX_COLUMNS: usize = 6;
 /// The filter bar's commands (`menus_fork`).
 pub const COMMANDS: &[crate::menus::UiCommand] = &[("view.filterColumns", "Metadata Filter Columns", None, "")];
 
-/// `view.filterColumns {show?: bool, column?: index, field?: name, count?: 1..6}` → `{columns}`: shows or hides the
-/// filter bar's Metadata columns (no argument toggles), sets the field one column lists, or the number of columns.
+/// `view.filterColumns {show?: bool, column?: index, field?: name, count?: 1..6, toggle?: name}` → `{columns}`: shows or
+/// hides the filter bar's Metadata columns (no argument toggles), sets the field one column lists, or the number of
+/// columns; `toggle` adds the field's column (the columns appear if hidden) or removes it (the last one hides them all).
 pub fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     if id != "view.filterColumns" {
         return None;
@@ -530,6 +555,36 @@ fn filter_columns(app: &mut LccApp, p: &Value) -> Result<Value, String> {
                 .ok_or_else(|| format!("{C}: field is one of {}", COLUMN_FIELDS.map(|(k, _)| k).join(", ")))?,
         ),
     };
+    let toggle = match p.get("toggle") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|f| COLUMN_FIELDS.iter().any(|(k, _)| k == f))
+                .ok_or_else(|| format!("{C}: toggle is one of {}", COLUMN_FIELDS.map(|(k, _)| k).join(", ")))?,
+        ),
+    };
+    if let Some(f) = toggle {
+        let columns = &mut app.ui.filter_columns;
+        if let Some(i) = columns.iter().position(|c| c == f) {
+            columns.remove(i);
+            if i < app.ui.filter_column_search.len() {
+                app.ui.filter_column_search.remove(i);
+            }
+            if columns.is_empty() {
+                app.ui.filter_column_search.clear();
+                return Ok(json!({"columns": []}));
+            }
+        } else if columns.len() >= MAX_COLUMNS {
+            return Err(format!("{C}: at most {MAX_COLUMNS} columns"));
+        } else {
+            columns.push(f.to_string());
+        }
+        app.ui.filter_bar = true;
+        if !matches!(app.ui.view, crate::state::ViewMode::PhotoGrid | crate::state::ViewMode::SquareGrid) {
+            app.ui.view = crate::state::ViewMode::PhotoGrid;
+        }
+        return Ok(json!({"columns": app.ui.filter_columns}));
+    }
     let column = index("column", 0..=MAX_COLUMNS - 1)?;
     let count = index("count", 1..=MAX_COLUMNS)?;
     let show = match p.get("show") {

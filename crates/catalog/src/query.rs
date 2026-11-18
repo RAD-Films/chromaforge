@@ -53,7 +53,14 @@ pub struct Filter {
     /// Any of these labels (the filter bar's multi-select); empty = no constraint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<ColorLabel>,
+    /// Only photos with no colour label (the filter bar's hollow swatch, the Classic menu's "No
+    /// Label"); ANDs with `label` / `labels`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub labels_none: bool,
     pub kind: Option<MediaKind>,
+    /// Virtual copies only (`Some(true)`) or master photos only (`Some(false)`); Classic's Filter by Kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy: Option<bool>,
     pub edited: Option<bool>,
     pub album: Option<AlbumId>,
     /// Show "Recently Deleted" instead of the library.
@@ -67,6 +74,9 @@ pub struct Filter {
     /// the folders inside it (see [`crate::folders`]). Photos only browsed in Local are never part
     /// of it, unlike [`Filter::folder`].
     pub library_folder: Option<String>,
+    /// With [`Filter::library_folder`]: only the photos imported from that very folder, not from
+    /// the folders inside it (the Folders panel's Show Photos in Subfolders turned off).
+    pub library_folder_only: bool,
     /// A keyword; hierarchical keywords match their children too (`travel` finds `travel|italy`).
     pub keyword: Option<String>,
     /// A person: photos with a named face region of this name (case-insensitive), as read from XMP.
@@ -106,6 +116,10 @@ pub struct Filter {
     /// Immich link state: `linked`, `notLinked` (no confirmed link) or `probable`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub immich: Option<String>,
+    /// Vignetting Calibration reference ([`vignetting_reference_is`]): `reference` (in use) or `none` (not a
+    /// reference, or a withdrawn one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vignetting_reference: Option<String>,
     /// A folder on disk: its files only (browsed ones too); `subfolders` includes everything below.
     pub folder: Option<String>,
     pub subfolders: bool,
@@ -580,6 +594,17 @@ pub fn immich_state_is(cat: &Catalog, id: PhotoId, want: &str) -> bool {
     }
 }
 
+/// Whether photo `id` is what `want` says to Vignetting Calibration: `reference` (of a map in use) or `none` (not a
+/// reference; a withdrawn reference counts as none). Derived from the catalog's map table
+/// ([`Catalog::is_vignetting_reference`]), so it can't be stale. Unknown values match nothing.
+pub fn vignetting_reference_is(cat: &Catalog, id: PhotoId, want: &str) -> bool {
+    match want {
+        "reference" => cat.is_vignetting_reference(id),
+        "none" => !cat.is_vignetting_reference(id),
+        _ => false,
+    }
+}
+
 /// What [`Filter::prepare`] works out once for a pass over many photos.
 pub(crate) struct Prepared {
     root: Option<String>,
@@ -746,7 +771,13 @@ fn token_matches(p: &Photo, tok: &str, kept: Option<&[Box<str>]>) -> bool {
         return match field {
             "rating" | "stars" => cmp(p.rating as f64, val),
             "flag" => Flag::parse(val) == Some(p.flag),
-            "label" | "color" => p.label.is_some_and(|l| format!("{l:?}").eq_ignore_ascii_case(val)),
+            "label" | "color" => {
+                if val.eq_ignore_ascii_case("none") || val.eq_ignore_ascii_case("no") {
+                    p.label.is_none()
+                } else {
+                    p.label.is_some_and(|l| format!("{l:?}").eq_ignore_ascii_case(val))
+                }
+            }
             "iso" => p.meta.iso.is_some_and(|i| cmp(i as f64, val)),
             "f" | "aperture" => p.meta.aperture.is_some_and(|a| cmp32(a, val)),
             "focal" => p.meta.focal_mm.is_some_and(|a| cmp32(a, val)),
@@ -851,7 +882,16 @@ impl Filter {
     /// This filter without the quick culling filters (stars, flags, colour labels): what the filter
     /// bar counts its photos in, so "Picked 47" stays readable while only the picks are shown.
     pub fn without_quick(&self) -> Filter {
-        Filter { rating: 0, rating_op: RatingOp::default(), flag: None, flags: Vec::new(), label: None, labels: Vec::new(), ..self.clone() }
+        Filter {
+            rating: 0,
+            rating_op: RatingOp::default(),
+            flag: None,
+            flags: Vec::new(),
+            label: None,
+            labels: Vec::new(),
+            labels_none: false,
+            ..self.clone()
+        }
     }
 
     /// The flags that `flag` and `flags` let through together; `None` when neither is set.
@@ -912,8 +952,14 @@ impl Filter {
         if !self.labels.is_empty() {
             v.push(format!("label {}", self.labels.iter().map(|l| format!("{l:?}").to_lowercase()).collect::<Vec<_>>().join(" or ")));
         }
+        if self.labels_none {
+            v.push("label none".into());
+        }
         if let Some(k) = self.kind {
             v.push(format!("kind {}", format!("{k:?}").to_lowercase()));
+        }
+        if let Some(c) = self.copy {
+            v.push(if c { "virtual copies".into() } else { "master photos".into() });
         }
         if let Some(e) = self.edited {
             v.push(if e { "edited".into() } else { "unedited".into() });
@@ -957,6 +1003,13 @@ impl Filter {
         }
         if let Some(fcs) = &self.faces {
             v.push(format!("faces {fcs}"));
+        }
+        if let Some(r) = &self.vignetting_reference {
+            v.push(match r.as_str() {
+                "reference" => "vignetting reference".to_string(),
+                "none" => "not a vignetting reference".to_string(),
+                other => format!("vignetting reference {other}"),
+            });
         }
         if !self.text.trim().is_empty() {
             v.push(format!("“{}”", self.text.trim()));
@@ -1037,6 +1090,9 @@ impl Filter {
         if self.flag.is_some_and(|f| f != p.flag) || self.label.is_some_and(|l| Some(l) != p.label) || self.kind.is_some_and(|k| k != p.kind) {
             return false;
         }
+        if self.copy.is_some_and(|c| c != p.copy_of.is_some()) {
+            return false;
+        }
         if self.edited.is_some_and(|e| e != p.is_edited()) {
             return false;
         }
@@ -1051,6 +1107,9 @@ impl Filter {
         if !self.labels.is_empty() && !p.label.is_some_and(|l| self.labels.contains(&l)) {
             return false;
         }
+        if self.labels_none && p.label.is_some() {
+            return false;
+        }
         if !self.facets.iter().all(|f| f.matches(p, cat)) {
             return false;
         }
@@ -1062,6 +1121,11 @@ impl Filter {
         }
         if let Some(want) = &self.immich
             && !immich_state_is(cat, p.id, want)
+        {
+            return false;
+        }
+        if let Some(want) = &self.vignetting_reference
+            && !vignetting_reference_is(cat, p.id, want)
         {
             return false;
         }
@@ -1104,7 +1168,7 @@ impl Filter {
             return false;
         }
         if let Some(root) = prepared.root.as_deref()
-            && !photo_in_root(p, root)
+            && !(photo_in_root(p, root) && (!self.library_folder_only || photo_directly_in(p, root)))
         {
             return false;
         }
@@ -1531,6 +1595,11 @@ pub(crate) fn photo_in_root(p: &Photo, root: &str) -> bool {
     crate::local::folder_of(p).is_some_and(|f| key_within(&f, root))
 }
 
+/// Whether `p` lies in the folder `root` itself (a [`folder_key`]), not in a folder inside it.
+pub(crate) fn photo_directly_in(p: &Photo, root: &str) -> bool {
+    crate::local::folder_of(p).is_some_and(|f| f.trim_end_matches('/') == root.trim_end_matches('/'))
+}
+
 /// [`folder_within`] for two paths already turned into their [`folder_key`].
 pub(crate) fn key_within(p: &str, r: &str) -> bool {
     // `.` or `a/..` name no folder: not "everything"
@@ -1558,17 +1627,5 @@ pub fn merged_kind(file_name: &str) -> Option<&'static str> {
         Some("focusStack")
     } else {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests_sort_default {
-    /// A new library's grid has no date sections, as Lightroom Classic's Grid (the fork's default; grouping by day,
-    /// month or year is still a choice in the Sort menu, and a library that saved one keeps it).
-    #[test]
-    fn the_grid_starts_ungrouped_as_in_lightroom_classic() {
-        assert_eq!(super::Sort::default().group, crate::GroupBy::None);
-        let saved: super::Sort = serde_json::from_str(r#"{"key": "captureDate", "ascending": true, "group": "day"}"#).unwrap();
-        assert_eq!(saved.group, crate::GroupBy::Day, "a saved choice stays");
     }
 }

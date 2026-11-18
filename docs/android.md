@@ -11,7 +11,7 @@ covers what exists today.
 | App host (`apps/android`, NativeActivity; JNI in `crates/android-host`) | 🟡 runs on the emulator: import via the system picker, Develop, library kept across restarts; status-bar insets not handled yet |
 | APK / AAB packaging (`cargo xtask android package`), release job (on by default; `RELEASE_ANDROID=false` turns it off) | ✅ arm64-v8a and x86_64 APKs, one AAB with both (arm64 APK 75 MB) |
 | Play Store upload | not started (needs the Play developer account) |
-| Peer-to-peer catalog sync between desktop and Android | 🟡 pairing (Settings ▸ Sync, `crates/peer`; discovery over mDNS / DNS-SD); catalog exchange next |
+| Peer-to-peer catalog sync between desktop and Android | 🟡 pairing and device sync of the catalog or chosen collections (Settings ▸ Sync, `crates/peer`, `crates/sync`; [sync.md](sync.md)); not yet tested between real devices |
 | Modern layout, phone- and tablet-sized (`crates/ui-egui/src/modern.rs`, on by default on Android, `view.modernLayout` elsewhere) | 🟡 photo-first Develop (tap for tools, single-tool drag adjust in groups Basic (white balance + tone), Colour (presence), Tone (parametric curve), Detail, Optics, Effects (vignette, grain); hold for the original, Edit panel beside / under the photo), slim Library bar, swipe scrolling with momentum and long-press multi-select, Back (`touch.back`, predictive back), cutout and system-bar insets, a pinned or floating histogram (`touch.histogram`), touch Settings and Export sheets; Settings ▸ General ▸ Layout switches Touch / Desktop on every platform (desktop default Desktop, mouse works); verified on Waydroid, not yet on a phone or tablet; not yet: pinch in adjust mode, tool-specific touch UIs for Crop / Masks |
 
 ## Design
@@ -45,6 +45,10 @@ covers what exists today.
   they take the desktop's drop path: photos open the import review, presets import as presets. A share that arrives
   before the native side is up waits in the activity until `Host::new` calls `hostReady()`. Copy failures are logged
   and shown as a toast.
+- **HEIC/HEIF photos** (what iPhones shoot) open like on the desktop: the same pure-Rust decoder
+  (`lcc-heif`), on through the Android app's default `heif` feature, so the import review, the camera roll
+  (MediaStore files HEIC shots as images) and the pickers (`image/heif`) all take them. Distributors who must
+  avoid HEVC (patents) build with `--no-default-features`, as on the desktop.
 - **Peer discovery** is multicast DNS service discovery (RFC 6762 / 6763, `crates/peer`), the same as Bonjour, so
   a future iOS build can join. Android's Wi-Fi drops multicast unless an app holds a `WifiManager.MulticastLock`:
   the activity acquires one in `onCreate` (permission `CHANGE_WIFI_MULTICAST_STATE`) and releases it in `onDestroy`.
@@ -98,6 +102,16 @@ The Storage Access Framework hands out `content://` documents, but the engine re
   files it doesn't (CR3 on most devices) are looked up in its Files table by extension, which only All files access
   can see on Android 11+. In the Play build such raws are left out of the camera roll; pick their folder instead
   (copied).
+- **Watching.** Adding the roll for keeps — the first-start question's Add Camera Roll, or Settings ▸ Folders ▸
+  Camera roll ▸ Import… — sets `cameraRollWatch` in `ui.json`: the roll is watched (issue #1024). The watch lists
+  it again through the same service when the library opens, when the app comes to the front and every five
+  minutes (`camera_roll::watch_tick`, folder polling's cadence), and hands the paths the library doesn't have
+  (a photo in Recently Deleted counts as had) to an import in place, without the review and with the library's
+  import settings; the activity stack shows the import, and the toast when it is done says how many new photos
+  the roll brought. Nothing found says nothing. While an import, a scan, a waiting review or a folder
+  synchronize runs, nothing is listed — a listing made then is dropped, and the next one picks the news up.
+  Settings ▸ Folders ▸ Camera roll has a *Watch for new photos* checkbox to turn the watch off and on
+  (`camera_roll::set_watch`); declining the first-start question never enables it.
 - **Asking.** In the GitHub build the activity asks once, at the first start (remembered in its `storage`
   SharedPreferences): the system's All files access page on 11+, the runtime permission before. The Play build
   never asks. `app.allFilesAccess` (Settings ▸ Folders ▸

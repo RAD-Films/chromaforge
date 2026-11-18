@@ -72,6 +72,9 @@ pub struct Stack {
     entries: Vec<(PluginFilter, Result<Arc<lcc_filters::Filter>, String>)>,
     /// Identifies what the stack computes (ids, the builds that run, params, analysis).
     pub key: u64,
+    /// `prefixes[k]`: the key of the stack's first `k` filters (`prefixes[len] == key`), so a
+    /// native run can start from what an earlier stack with those first filters made.
+    prefixes: Vec<u64>,
 }
 
 impl Stack {
@@ -88,22 +91,38 @@ impl Stack {
                 (f.clone(), r)
             })
             .collect();
-        let key = crate::hash_of(
-            entries
-                .iter()
-                .map(|(f, r)| {
-                    let build = r.as_ref().map(|x| x.module_hash().to_string()).unwrap_or_default();
-                    let analysis = f.analysis.as_ref().map(Value::to_string).unwrap_or_default();
-                    (f.plugin.clone(), build, Value::Object(f.params.clone()).to_string(), analysis)
-                })
-                .collect::<Vec<_>>(),
-        );
-        Stack { entries, key }
+        let descs: Vec<_> = entries
+            .iter()
+            .map(|(f, r)| {
+                let build = r.as_ref().map(|x| x.module_hash().to_string()).unwrap_or_default();
+                let analysis = f.analysis.as_ref().map(Value::to_string).unwrap_or_default();
+                (f.plugin.clone(), build, Value::Object(f.params.clone()).to_string(), analysis)
+            })
+            .collect();
+        // the stack runs on the source with its film dust filled in: a change there is a new input
+        let film = info
+            .infrared
+            .as_ref()
+            .filter(|_| s.film_dust.on())
+            .map(|ir| (ir.width, ir.height, s.film_dust.sensitivity.to_bits(), s.film_dust.expand.to_bits()));
+        let prefixes: Vec<u64> = (0..=descs.len()).map(|k| crate::hash_of((descs.get(..k).unwrap_or_default().to_vec(), film))).collect();
+        let key = prefixes.last().copied().unwrap_or_default();
+        Stack { entries, key, prefixes }
     }
 
     /// No filters.
     pub fn empty() -> Stack {
-        Stack { entries: Vec::new(), key: 0 }
+        Stack { entries: Vec::new(), key: 0, prefixes: vec![0] }
+    }
+
+    /// Number of filters.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The key of the stack's first `k` filters ([`Self::key`] for all of them).
+    pub fn prefix_key(&self, k: usize) -> Option<u64> {
+        self.prefixes.get(k).copied()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -125,9 +144,45 @@ impl Stack {
 
     /// Runs the stack on `img` (interleaved RGB as `encoding` says), in order; each filter that is
     /// missing or fails leaves the image as it was and adds a warning.
+    /// Stops at the render's cancel ([`crate::with_cancel`]): the filters still to run are skipped
+    /// and the render is marked cut short.
     pub fn apply(&self, img: &mut [[f32; 3]], w: usize, h: usize, frame: lcc_filters::FrameInfo, encoding: &str, warnings: &mut Vec<String>) {
-        let cancel = AtomicBool::new(false);
-        for (f, r) in &self.entries {
+        let run = Run { give_way: &AtomicBool::new(false), start: 0, keep_at: None };
+        self.apply_run(img, w, h, frame, encoding, warnings, run);
+    }
+
+    /// [`Self::apply`] of the filters from `run.start` on, also stopped when `run.give_way` is set
+    /// (another render takes the run over): `gave_way` true then, and `img` is part-filtered, for
+    /// the caller to drop. With `run.keep_at`, a copy of the image as it stands before that filter
+    /// and the warnings so far come back too.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_run(
+        &self,
+        img: &mut [[f32; 3]],
+        w: usize,
+        h: usize,
+        frame: lcc_filters::FrameInfo,
+        encoding: &str,
+        warnings: &mut Vec<String>,
+        run: Run<'_>,
+    ) -> Ran {
+        let own = Arc::new(AtomicBool::new(false));
+        let cancel = crate::cancel_flag().unwrap_or(own);
+        let give_way = run.give_way;
+        let gave_way = || give_way.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ran = Ran::default();
+        for (i, (f, r)) in self.entries.iter().enumerate().skip(run.start) {
+            if gave_way() {
+                ran.gave_way = true;
+                return ran;
+            }
+            if run.keep_at == Some(i) {
+                ran.kept = Some((img.to_vec(), warnings.clone()));
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::note_cut();
+                return ran;
+            }
             let filter = match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -143,12 +198,42 @@ impl Stack {
                 continue;
             };
             let params = filter_params(f, encoding);
-            let r = crate::timed(&format!("plug-in {}", f.plugin), || filter.apply_rgb(img.as_flattened_mut(), w32, h32, frame, &params, &cancel));
-            if let Err(e) = r {
-                warnings.push(format!("{}skipped: {e}", warning_prefix(f)));
+            let r = crate::timed(&format!("plug-in {}", f.plugin), || {
+                filter.apply_rgb_until(img.as_flattened_mut(), w32, h32, frame, &params, &[&cancel, give_way])
+            });
+            match r {
+                Err(lcc_filters::Error::Cancelled) if gave_way() => {
+                    ran.gave_way = true;
+                    return ran;
+                }
+                Err(lcc_filters::Error::Cancelled) => {
+                    crate::note_cut();
+                    return ran;
+                }
+                Err(e) => warnings.push(format!("{}skipped: {e}", warning_prefix(f))),
+                Ok(()) => {}
             }
         }
+        ran
     }
+}
+
+/// How [`Stack::apply_run`] runs: from which filter, what stops it besides the render's cancel, and
+/// before which filter to keep a copy.
+#[derive(Clone, Copy)]
+pub(crate) struct Run<'a> {
+    pub give_way: &'a AtomicBool,
+    pub start: usize,
+    pub keep_at: Option<usize>,
+}
+
+/// What [`Stack::apply_run`] did besides filtering.
+#[derive(Default)]
+pub(crate) struct Ran {
+    /// It stopped for `give_way`.
+    pub gave_way: bool,
+    /// The image before filter `keep_at` (in the filters' encoding) and the warnings so far.
+    pub kept: Option<(Vec<[f32; 3]>, Vec<String>)>,
 }
 
 /// How a warning about stack entry `f` starts (`plug-in filter #3 "Negative" `): it names the entry
@@ -212,6 +297,25 @@ pub fn apply_source(stack: &Stack, img: &mut Rgb32f, frame: lcc_filters::FrameIn
     crate::for_rows(&mut img.data, img.width.max(1), |_, row| row.iter_mut().for_each(|c| *c = mul(&to_2020, *c)));
 }
 
+/// The Source filters' encoding (linear sRGB primaries) of `img` (linear Rec.2020), in place.
+pub(crate) fn to_filter_space(img: &mut Rgb32f) {
+    let (to_srgb, _) = matrices();
+    crate::for_rows(&mut img.data, img.width.max(1), |_, row| row.iter_mut().for_each(|c| *c = mul(&to_srgb, *c)));
+}
+
+/// Back from [`to_filter_space`].
+pub(crate) fn from_filter_space(img: &mut Rgb32f) {
+    let (_, to_2020) = matrices();
+    crate::for_rows(&mut img.data, img.width.max(1), |_, row| row.iter_mut().for_each(|c| *c = mul(&to_2020, *c)));
+}
+
+/// A native run of `stack` on `img`, already in the filters' encoding ([`to_filter_space`]), as
+/// `run` says ([`Stack::apply_run`]).
+pub(crate) fn apply_native(stack: &Stack, img: &mut Rgb32f, frame: lcc_filters::FrameInfo, warnings: &mut Vec<String>, run: Run<'_>) -> Ran {
+    let (w, h) = (img.width, img.height);
+    stack.apply_run(&mut img.data, w, h, frame, "linear", warnings, run)
+}
+
 fn scale_frame(f: lcc_filters::FrameInfo, k: f64) -> lcc_filters::FrameInfo {
     let s = |v: u32| ((v as f64 * k).round() as u32).max(1);
     lcc_filters::FrameInfo { x: (f.x as f64 * k).round() as u32, y: (f.y as f64 * k).round() as u32, full_w: s(f.full_w), full_h: s(f.full_h) }
@@ -254,6 +358,18 @@ pub fn filtered_source<'a>(src: &'a Rgb32f, info: &crate::SourceInfo, s: &Develo
 pub fn analysis_input_framed(src: &Rgb32f, s: &DevelopSettings, max_edge: usize) -> (Vec<f32>, usize, usize) {
     let frame = crate::geometry::Frame::new(src.width, src.height, s, true);
     // at most the crop's own resolution: a small crop isn't blown up
+    let (nw, nh) = frame.native_size();
+    let edge = (nw.max(nh).round() as usize).clamp(1, max_edge.max(1));
+    let (w, h) = frame.fit(edge, edge);
+    analysis_input(&frame.sample(src, w, h), max_edge)
+}
+
+/// The photo as the crop tool shows it before cropping (orientation, flips, lens and perspective;
+/// no crop, no straighten), downsized to a long edge of at most `max_edge` (never blown up), in
+/// linear sRGB primaries: `(samples, width, height)`. A point's position in it, normalized, is
+/// where `crop.set` puts that point of the photo, which is what a plug-in that finds a crop needs.
+pub fn uncropped_input(src: &Rgb32f, s: &DevelopSettings, max_edge: usize) -> (Vec<f32>, usize, usize) {
+    let frame = crate::geometry::Frame::new(src.width, src.height, s, false);
     let (nw, nh) = frame.native_size();
     let edge = (nw.max(nh).round() as usize).clamp(1, max_edge.max(1));
     let (w, h) = frame.fit(edge, edge);
@@ -303,5 +419,28 @@ mod tests_analysis_input {
         let (plain, pw, ph) = analysis_input_framed(&src, &DevelopSettings::default(), 1024);
         assert_eq!((pw, ph), (400, 200));
         assert!((mean(&plain) - mean(&whole)).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_uncropped_input_ignores_the_crop_but_follows_orientation_and_flips() {
+        let src = halves(400, 200);
+        let mut s = DevelopSettings::default();
+        s.crop.geometry.rect = lcc_geom::Rect::new(0.55, 0.1, 0.95, 0.9);
+        s.crop.geometry.angle = 5.0;
+        let (data, w, h) = uncropped_input(&src, &s, 1024);
+        assert_eq!((w, h), (400, 200), "the whole frame at its own resolution, crop ignored");
+        assert!((mean(&data) - 0.45).abs() < 0.05);
+        // never blown up, and shrunk to the long edge asked for
+        assert_eq!(uncropped_input(&src, &s, 100).1, 100);
+        // a flip is shown uncropped too: the bright half moves to the left
+        s.crop.flip_h = true;
+        let (flipped, w, _) = uncropped_input(&src, &s, 1024);
+        let left: f64 = (0..w / 4).map(|x| f64::from(flipped[3 * (100 * w + x)])).sum::<f64>() / (w / 4) as f64;
+        assert!(left > 0.6, "the left quarter is bright after a horizontal flip: {left}");
+        // a quarter turn swaps the sides
+        s.crop.flip_h = false;
+        s.orientation = lcc_geom::Orientation::Rotate90;
+        let (_, w, h) = uncropped_input(&src, &s, 1024);
+        assert_eq!((w, h), (200, 400));
     }
 }

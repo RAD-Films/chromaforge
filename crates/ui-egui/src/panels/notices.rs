@@ -7,11 +7,14 @@ use egui::{Align2, RichText, vec2};
 use crate::theme::Tokens;
 use crate::{LccApp, QuitPrompt};
 
-/// Collect the library's settings-file warnings (each is shown once), and the no-GPU notice once the GPU device has
-/// been tried.
+/// Collect the library's settings-file warnings (each is shown once), the no-GPU notice once the GPU device has
+/// been tried, and the missing-fonts notice once.
 pub fn logic(app: &mut LccApp) {
     let new = app.session.take_library_warnings();
     app.notices.extend(new);
+    if let Some(problems) = app.font_problems.take() {
+        app.notices.extend(font_notice(problems));
+    }
     use lcc_engine::gpu;
     if app.gpu_notice && app.gpu_applied == Some(true) && gpu::ready() {
         app.gpu_notice = false;
@@ -19,6 +22,20 @@ pub fn logic(app: &mut LccApp) {
             app.notices.extend(gpu_notice(gpu::unavailable_reason().as_deref(), app.ui.settings.gpu));
         }
     }
+}
+
+/// What to tell the user when fonts the package carries could not be read (`problems`, also in the log): which ones,
+/// and that reinstalling brings them back. Text in their scripts shows as empty boxes; Latin text never needs them.
+/// Nothing when every font loaded, or when they are built into the program.
+pub fn font_notice(problems: &[lcc_engine::fonts::FontProblem]) -> Option<String> {
+    if problems.is_empty() {
+        return None;
+    }
+    let fonts = problems.iter().map(|problem| problem.what.as_str()).collect::<Vec<_>>().join(", ");
+    Some(crate::i18n::tr_format!(
+        "Some of {app}'s fonts are missing or damaged ({fonts}), so some text may show as empty boxes. Reinstall {app} to restore them.",
+        fonts = fonts
+    ))
 }
 
 /// What to tell the user when GPU rendering is on (`enabled`) but the GPU could not be used for `reason`: only when no
@@ -71,7 +88,7 @@ pub fn may_close(app: &mut LccApp) -> bool {
     if app.session.unsaved().is_some()
         && let Err(e) = app.session.close_library()
     {
-        log::error!("quit: library not saved: {e}");
+        log::error!("quit: catalog not saved: {e}");
     }
     match app.session.unsaved() {
         None => true,
@@ -95,7 +112,19 @@ enum Choice {
     Ok,
 }
 
-fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&str, &str, Choice)]) -> Option<usize> {
+/// Where the backup schedule is set, as the menu bar shows it ("Disable backups in Edit ▸ Catalog Settings…"),
+/// translated; `None` if the command has no menu path.
+fn backup_hint() -> Option<String> {
+    let (_, label, _, menu) = crate::menus::ui_commands().find(|c| c.0 == "dialog.catalogSettings")?;
+    if menu.is_empty() {
+        return None;
+    }
+    let path: Vec<&str> = menu.split('>').chain([*label]).map(crate::i18n::tr).collect();
+    Some(crate::i18n::tr_format!("Disable backups in {path}", path = path.join(" ▸ ")))
+}
+
+/// A modal card: `text`, then `hint` (dimmer) when given, then the buttons.
+fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, hint: Option<&str>, buttons: &[(&str, &str, Choice)]) -> Option<usize> {
     let t = Tokens::get(ctx);
     let screen = ctx.content_rect();
     egui::Area::new(egui::Id::new((id, "dim"))).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
@@ -120,7 +149,12 @@ fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&s
             ui.spacing_mut().item_spacing.y = 8.0;
             crate::dialog_frame::card_header(ui, crate::i18n::tr(title), None);
             let mut layout = crate::dialog_frame::ModalLayout::begin(ui, window_id);
-            layout.body(ui, |ui| ui.add(egui::Label::new(RichText::new(text).color(t.text_label)).wrap()));
+            layout.body(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(text).color(t.text_label)).wrap());
+                if let Some(hint) = hint {
+                    ui.add(egui::Label::new(RichText::new(hint).color(t.text_dim)).wrap());
+                }
+            });
             layout.footer(ui, |ui| {
                 ui.add_space(4.0);
                 // (wrapping on a narrow window)
@@ -141,7 +175,7 @@ fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&s
 pub fn show(app: &mut LccApp, ctx: &egui::Context) {
     if let Some(QuitPrompt::Tasks(text)) = app.quit_prompt.clone() {
         let buttons = [("quitAnyway", "Quit Anyway", Choice::QuitAnyway), ("quitCancel", "Cancel", Choice::Cancel)];
-        let Some(i) = window(ctx, "quit-tasks", "Quit while tasks are running?", &text, &buttons) else { return };
+        let Some(i) = window(ctx, "quit-tasks", "Quit while tasks are running?", &text, None, &buttons) else { return };
         app.quit_prompt = None;
         if matches!(buttons[i].2, Choice::QuitAnyway) {
             app.session.activity.cancel_all();
@@ -158,7 +192,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             ("quitSkipBackup", "Skip This Time", Choice::QuitAnyway),
             ("quitCancel", "Cancel", Choice::Cancel),
         ];
-        let Some(i) = window(ctx, "quit-backup", "Back up the catalog?", &text, &buttons) else { return };
+        let Some(i) = window(ctx, "quit-backup", "Back up the catalog?", &text, backup_hint().as_deref(), &buttons) else { return };
         app.quit_prompt = None;
         match buttons[i].2 {
             Choice::Retry => app.exit_backup = Some(true),
@@ -176,7 +210,7 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
             ("quitAnyway", "Quit Anyway", Choice::QuitAnyway),
             ("quitCancel", "Cancel", Choice::Cancel),
         ];
-        let Some(i) = window(ctx, "quit-unsaved", "Quit with unsaved changes?", &text, &buttons) else { return };
+        let Some(i) = window(ctx, "quit-unsaved", "Quit with unsaved changes?", &text, None, &buttons) else { return };
         match buttons[i].2 {
             Choice::Retry => {
                 app.quit_prompt = None;
@@ -196,8 +230,8 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
     if let Some(text) = app.notices.first().cloned() {
         let buttons = [("noticeOk", "OK", Choice::Ok)];
         // an upgrade is news, not a problem: don't title it like one
-        let title = if text.starts_with(lcc_engine::library::UPGRADE_NOTICE_START) { "Library upgraded" } else { "Settings file problem" };
-        if window(ctx, "settings-notice", title, &text, &buttons).is_some() {
+        let title = if text.starts_with(lcc_engine::library::UPGRADE_NOTICE_START) { "Catalog upgraded" } else { "Settings file problem" };
+        if window(ctx, "settings-notice", title, &text, None, &buttons).is_some() {
             app.notices.remove(0);
         }
     }
@@ -205,7 +239,21 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::gpu_notice;
+    use super::{font_notice, gpu_notice};
+
+    /// A font the package lists but couldn't read is named, with what to do; nothing to say when all loaded.
+    #[test]
+    fn the_font_notice_names_the_fonts_and_says_to_reinstall() {
+        use lcc_engine::fonts::FontProblem;
+        assert_eq!(font_notice(&[]), None, "every font loaded");
+        let problems = [
+            FontProblem { what: "Noto Sans Arabic Regular".into(), detail: "missing".into() },
+            FontProblem { what: "NanumGothic Regular".into(), detail: "damaged".into() },
+        ];
+        let text = font_notice(&problems).expect("say which fonts");
+        assert!(text.contains("Noto Sans Arabic Regular") && text.contains("NanumGothic Regular"), "{text}");
+        assert!(text.contains("Reinstall") && text.contains(lcc_brand::DISPLAY_NAME), "{text}");
+    }
 
     #[test]
     fn the_gpu_notice_is_only_for_a_missing_adapter() {

@@ -143,6 +143,9 @@ pub struct RenderState {
     /// Patch (HDR display output): [`WgpuConfiguration::on_surface_configured`].
     pub on_surface_configured: Option<SurfaceConfiguredHook>,
 
+    /// Patch (present mode): [`WgpuConfiguration::choose_present_mode`].
+    pub choose_present_mode: Option<PresentModeHook>,
+
     /// Egui renderer responsible for drawing the UI.
     pub renderer: Arc<RwLock<Renderer>>,
 
@@ -336,6 +339,7 @@ impl RenderState {
             surface_formats: offered,
             display_hdr_info: Arc::new(RwLock::new(display_hdr_info)),
             on_surface_configured: config.on_surface_configured.clone(),
+            choose_present_mode: config.choose_present_mode.clone(),
             renderer: Arc::new(RwLock::new(renderer)),
             surface_config: config.surface,
         })
@@ -410,6 +414,17 @@ pub struct WgpuConfiguration {
     /// Patch (HDR display output): called after every window surface configure (a new
     /// swapchain), e.g. to set HDR metadata on it.
     pub on_surface_configured: Option<SurfaceConfiguredHook>,
+
+    /// Patch (present mode): picks the window surface's present mode from the adapter, the
+    /// surface's colour space and the modes the surface offers, at every configure. `None`
+    /// from the hook keeps [`SurfaceConfig::present_mode`]. A mode the surface doesn't offer
+    /// falls back to `AutoVsync` (FIFO), so the hook can never break presentation.
+    pub choose_present_mode: Option<PresentModeHook>,
+
+    /// Patch (device loss): called whenever a window frame acquired its surface texture, so the
+    /// app can tell a frame that was skipped once from a window that never draws again (a lost
+    /// device makes every later frame fail, see [`Self::on_surface_status`]).
+    pub on_frame_acquired: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// See [`WgpuConfiguration::open_device`].
@@ -418,6 +433,13 @@ pub type OpenDeviceHook = Arc<
             &wgpu::Adapter,
             &wgpu::DeviceDescriptor<'static>,
         ) -> Option<Result<(wgpu::Device, wgpu::Queue), String>>
+        + Send
+        + Sync,
+>;
+
+/// See [`WgpuConfiguration::choose_present_mode`]: (adapter, surface colour space, offered modes).
+pub type PresentModeHook = Arc<
+    dyn Fn(&wgpu::AdapterInfo, wgpu::SurfaceColorSpace, &[wgpu::PresentMode]) -> Option<wgpu::PresentMode>
         + Send
         + Sync,
 >;
@@ -440,6 +462,8 @@ impl core::fmt::Debug for WgpuConfiguration {
             hdr_output,
             open_device,
             on_surface_configured,
+            choose_present_mode,
+            on_frame_acquired,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
@@ -447,6 +471,8 @@ impl core::fmt::Debug for WgpuConfiguration {
             .field("hdr_output", &hdr_output)
             .field("open_device", &open_device.is_some())
             .field("on_surface_configured", &on_surface_configured.is_some())
+            .field("choose_present_mode", &choose_present_mode.is_some())
+            .field("on_frame_acquired", &on_frame_acquired.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -493,6 +519,8 @@ impl Default for WgpuConfiguration {
             hdr_output: false,
             open_device: None,
             on_surface_configured: None,
+            choose_present_mode: None,
+            on_frame_acquired: None,
         }
     }
 }

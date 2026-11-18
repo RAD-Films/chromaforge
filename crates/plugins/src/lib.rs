@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod about;
 mod b64;
 mod context;
 pub mod manager;
@@ -37,15 +38,23 @@ pub mod publish;
 mod runtime;
 mod safe_io;
 pub mod settings;
+pub mod signature;
 mod store;
 
-pub use context::{HostApi, JobReporter, JobUnit, NoHost, Unwatched};
-pub use manager::{Begun, Failed, Installed, Manager, PendingCall, Prepared, SettingsView};
-pub use manifest::{CommandDecl, DestinationDecl, Field, FieldKind, HOST_FEATURES, Hooks, Manifest, MetadataField, PublishDecl};
-pub use permissions::{FsRoot, Permissions};
+pub use about::About;
+pub use context::{HostApi, JobReporter, JobUnit, NoHost, PIXELS_DEFAULT_EDGE, PIXELS_MAX_EDGE, PIXELS_MIN_EDGE, Unwatched};
+pub use manager::{
+    Begun, Denial, Failed, Installed, Manager, PendingCall, Pin, Prepared, RequestState, SettingsView, SignerAnswer, duplicate_error, read_module,
+};
+pub use manifest::{
+    CommandDecl, DestinationDecl, Field, FieldKind, HOST_FEATURES, Header, Hooks, MAX_PICTURE_BYTES, MAX_QUICK_ACTIONS, Manifest, MetadataField,
+    PublishDecl,
+};
+pub use permissions::{FsRoot, Group, Permissions, Request, refused_root};
 pub use programs::{EndStatus, Exit, Found, ProgramDecl, Reservation, RunDir, Running, StartRequest};
-pub use runtime::{ABI_VERSION, Limits, Outcome, Plugin};
+pub use runtime::{ABI_VERSION, Inspection, Limits, MANIFEST_SECTION, ManifestSource, Outcome, Plugin};
 pub use settings::SettingsStore;
+pub use signature::{MAX_SIGNATURE_BYTES, SIGNATURE_SECTION, Signature, Signer};
 pub use store::NamespaceStore;
 
 /// A plug-in error. Every way a module can misbehave ends here, never in a panic.
@@ -57,6 +66,13 @@ pub enum Error {
     Abi(String),
     #[error("plug-in manifest: {0}")]
     Manifest(String),
+    /// The file's signature section doesn't hold up: never installed or loaded.
+    #[error("plug-in signature: {0}")]
+    Signature(String),
+    /// The file isn't signed by the key pinned for its plug-in (another key, or unsigned): it
+    /// installs only when the user says yes to that signer.
+    #[error("{0}")]
+    Signer(String),
     /// The plug-in requires host features this version of the app doesn't have.
     #[error("{}", missing_message(.0))]
     Unsupported(Vec<String>),

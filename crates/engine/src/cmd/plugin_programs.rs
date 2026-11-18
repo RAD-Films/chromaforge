@@ -101,6 +101,21 @@ impl HostApi for HookHost {
         self.0.ask_within(Relayed::LibraryAdd, params, ANSWER_WAIT)
     }
 
+    fn photo_pixels(&mut self, photo: &str, long_edge: u32) -> Result<Value, String> {
+        self.reachable()?;
+        self.0.pixels_within(photo, long_edge, Some(ANSWER_WAIT))
+    }
+
+    fn set_crop(&mut self, photo: &str, rect: [f64; 4], angle: Option<f64>) -> Result<Value, String> {
+        self.reachable()?;
+        self.0.ask_within(Relayed::SetCrop, &super::plugins::crop_params(photo, rect, angle), ANSWER_WAIT)
+    }
+
+    fn virtual_copy(&mut self, photo: &str, name: Option<&str>) -> Result<Value, String> {
+        self.reachable()?;
+        self.0.ask_within(Relayed::VirtualCopy, &super::plugins::copy_params(photo, name), ANSWER_WAIT)
+    }
+
     fn find_program(&mut self, program: &lcc_plugins::ProgramDecl) -> Vec<lcc_plugins::Found> {
         self.0.find_program(program)
     }
@@ -139,7 +154,7 @@ pub(super) fn start(s: &mut Session, run: StartRequest) -> Result<(), String> {
     guard.name("program", &run.program.name);
     guard.name("plugin", &run.plugin_name);
     guard.detail("The results come back when {program} closes");
-    guard.warn_on_stop("What {program} makes from now on won't come back to the library, and {program} keeps running.");
+    guard.warn_on_stop("What {program} makes from now on won't come back to the catalog, and {program} keeps running.");
     let library = s.plugin_library.clone();
     let host = HookHost(RelayHost::new(relay_sender(), s.desktop.clone()));
     let work = move || {

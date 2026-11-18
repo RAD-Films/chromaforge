@@ -167,6 +167,16 @@ pub fn parse_shutter_seconds(s: &str) -> Option<f64> {
     .filter(|v: &f64| v.is_finite() && *v > 0.0)
 }
 
+impl Meta {
+    /// Shutter speed in seconds: the exact [`Meta::exposure_time`] while `shutter` still shows it, otherwise
+    /// whatever `shutter` says (set by hand, or a catalog from before the exact time was kept).
+    pub fn shutter_seconds(&self) -> Option<f64> {
+        self.exposure_time
+            .filter(|t| lcc_meta::exposure_display_of(*t).is_some_and(|text| text == self.shutter.trim()))
+            .or_else(|| parse_shutter_seconds(&self.shutter))
+    }
+}
+
 /// The library label for a camera: the model alone when it already names the maker ("Canon IXUS
 /// 185"), otherwise "Make Model" ("Sony A7 IV"). Exports keep the two parts as read.
 pub fn camera_label(make: &str, model: &str) -> String {
@@ -198,11 +208,26 @@ pub struct Meta {
     /// two bodies of one model apart for their own camera profiles ([`Meta::camera_model`] says the model).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub camera_serial: String,
+    /// The lens maker (Exif `LensMake`), written back on export. Left out of the catalog JSON when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lens_make: String,
     pub lens: String,
     pub focal_mm: Option<f32>,
     pub aperture: Option<f32>,
+    /// Shutter speed for display, from [`lcc_meta::exposure_display_of`] (`1/3`, `0.3571`, `2.5″`), or typed by hand.
     pub shutter: String,
+    /// The file's exact exposure time in seconds, kept beside the rounded `shutter` text so export writes the
+    /// original duration; read through [`Meta::shutter_seconds`]. Left out of the catalog JSON when unknown, so
+    /// older catalogs read unchanged (upstream #1692).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure_time: Option<f64>,
     pub iso: Option<u32>,
+    /// Whether the flash fired (Exif `Flash`); `None` when the file does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash: Option<bool>,
+    /// Exposure compensation in EV (Exif `ExposureBiasValue`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure_bias: Option<f32>,
     /// The lens's focal range (mm, shortest and longest), from the file's LensSpecification: the loupe's shot info
     /// adds it to a lens name that doesn't say it (OneSlips PERF-CULL-7 a5f6da85e). Left out of the catalog JSON when
     /// unknown, so older catalogs read unchanged.
@@ -378,6 +403,10 @@ pub struct Photo {
     /// step, a version, Swap); `None`: the import state ([`Photo::before_base`]). Format version 16.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::settings_ref::opt")]
     pub before: Option<Arc<DevelopSettings>>,
+    /// When the photo was last exported (ISO 8601 local time, set by the engine's export; `None`: never,
+    /// or cleared by Photo ▸ Reset Export Status). Catalog format 17.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported: Option<String>,
     /// Assisted culling scores (`None` until analysed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<Analysis>,
@@ -511,6 +540,10 @@ pub struct Analysis {
     /// Combined 0..1 cull score from classical measures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cull_score: Option<f32>,
+    /// Suggested star rating 1..=5 from the cull score (bulk culling's starting point; the engine
+    /// never applies it over a rating the user set). Absent until a run suggested one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<u8>,
 }
 
 /// Raw formats whose files carry vendor white-balance multipliers but no colour matrices: their starting
@@ -522,6 +555,12 @@ pub fn relative_wb_format(format: &str) -> bool {
     ["ARW", "NEF", "NRW", "RW2", "RWL", "RAW", "RAF", "CR3", "CR2", "PEF", "SRW", "ORF", "ERF", "CRW", "MRW"]
         .iter()
         .any(|f| format.eq_ignore_ascii_case(f))
+}
+
+/// Whether a raw of `format` (its extension) carries a lens correction that starts on: DNG, RW2 / RWL and RAF
+/// (see [`Photo::lens_correction_built_in`]).
+pub fn lens_built_in_format(format: &str) -> bool {
+    ["DNG", "RW2", "RWL", "RAF"].iter().any(|f| format.eq_ignore_ascii_case(f))
 }
 
 /// Whether a raw of `format` shot on `camera` (Exif make and model, as [`Meta::camera`] keeps them) is developed
@@ -607,6 +646,7 @@ impl Photo {
             import_look: None,
             import_state: None,
             before: None,
+            exported: None,
             analysis: None,
             preview_only: None,
             preview_checked: String::new(),
@@ -671,7 +711,8 @@ impl Photo {
         }
     }
     /// The built-in defaults for this photo, before any user default preset: raws start from
-    /// their as-shot white balance; embedded lens corrections on when the file has them. They
+    /// their as-shot white balance; lens corrections off, except a format whose own correction
+    /// is part of the file ([`Photo::lens_correction_built_in`]). They
     /// carry the photo's own rendering process ([`lcc_develop::ProcessVersion`]): which
     /// process a photo renders with is not an edit, so comparisons with its defaults (edited?
     /// still as imported?) don't change when a newer process exists. A new photo has the latest.
@@ -680,12 +721,15 @@ impl Photo {
         let wb = if relative { Some((6500.0, 0.0)) } else { self.as_shot_wb };
         let mut d = match wb {
             Some((t, tint)) => DevelopSettings::for_raw(t, tint),
+            // (a raw edited in Kelvin whose as-shot white hasn't been read from its file yet, e.g. one imported before
+            // its camera was known: still a raw's sharpening, colour noise reduction and Remove Hot Pixels)
+            None if self.develops_raw() => DevelopSettings::for_raw(6500.0, 0.0),
             None => DevelopSettings::default(),
         };
         if self.develops_raw() && !relative {
             d.wb.scale = lcc_develop::WbScale::Kelvin;
         }
-        if self.embedded_lens.is_some() {
+        if self.lens_correction_built_in() {
             d.optics.lens_profile = true;
         }
         d.process = self.develop.process;
@@ -693,6 +737,16 @@ impl Photo {
         // import preference says, and its value is not an edit
         d.geometry.constrain_crop = self.develop.geometry.constrain_crop;
         d
+    }
+    /// Whether this photo's lens correction is on before anyone asks for it: the file carries
+    /// lens data ([`Photo::embedded_lens`]) and is a DNG (whose opcodes are part of the image),
+    /// a Panasonic / Leica RW2 or RWL (Micro Four Thirds and fixed-lens bodies correct
+    /// distortion in camera) or a Fujifilm RAF. Every other raw, including a lens the database
+    /// matches (a Canon CR3, a Nikon NEF, a Sony ARW), starts with "Enable Profile Corrections"
+    /// off, as in Lightroom Classic, so browsing and culling never pay for a warp nobody asked
+    /// for; the photo's own edit, a preset or the switch in Develop turns it on.
+    pub fn lens_correction_built_in(&self) -> bool {
+        self.embedded_lens.is_some() && lens_built_in_format(&self.format)
     }
     /// The file name's extension without the dot, as written (`CR2` for `IMG_0042.CR2`); empty
     /// when the name has none (`README`, a dot file such as `.hidden`).
@@ -742,12 +796,27 @@ impl Photo {
     pub fn in_library(&self) -> bool {
         !self.deleted && !self.local
     }
+    /// Whether the photo's settings are `defaults`, As Shot counting as As Shot whatever numbers it stores: it
+    /// reads the source's current white, and stored numbers can predate a decoder update or be on the relative scale
+    /// of a raw imported before its camera was edited in Kelvin.
+    pub fn develop_matches(&self, mut defaults: DevelopSettings) -> bool {
+        self.as_shot_normalised(&mut defaults);
+        *self.develop == defaults
+    }
+    fn as_shot_normalised(&self, defaults: &mut DevelopSettings) {
+        if self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot {
+            defaults.wb = self.develop.wb;
+        }
+    }
     /// Edited by the user: settings differ from what import gave the photo.
     pub fn is_edited(&self) -> bool {
         let mut defaults = self.import_defaults();
-        // As Shot reads the source's current WB; stored numbers can predate a decoder update.
-        if self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot {
-            defaults.wb = self.develop.wb;
+        self.as_shot_normalised(&mut defaults);
+        // Before lens corrections started off, import turned them on for every raw with lens data
+        // (a database match too): a photo with no history that differs from its defaults only
+        // there is still as imported.
+        if self.history.is_empty() && self.embedded_lens.is_some() && self.develop.optics.lens_profile && !defaults.optics.lens_profile {
+            defaults.optics.lens_profile = true;
         }
         *self.develop != defaults && !self.develop.is_unedited()
     }
@@ -842,20 +911,12 @@ mod camera_label_tests {
     use super::camera_label;
 
     #[test]
-    fn label_drops_a_repeated_maker() {
+    fn label_joins_the_parts_without_repeating_the_maker() {
         assert_eq!(camera_label("Canon", "Canon IXUS 185"), "Canon IXUS 185");
         assert_eq!(camera_label("Nothing", "Nothing Phone (3a) Pro"), "Nothing Phone (3a) Pro");
         assert_eq!(camera_label("SONY", "Sony A7 IV"), "Sony A7 IV");
-    }
-
-    #[test]
-    fn label_joins_distinct_parts() {
         assert_eq!(camera_label("Sony", "A7 IV"), "Sony A7 IV");
         assert_eq!(camera_label(" Apple ", " iPhone 15 "), "Apple iPhone 15");
-    }
-
-    #[test]
-    fn label_falls_back_to_the_part_that_exists() {
         assert_eq!(camera_label("", "Canon IXUS 185"), "Canon IXUS 185");
         assert_eq!(camera_label("Canon", ""), "Canon");
         assert_eq!(camera_label("  ", "  "), "");
@@ -866,6 +927,27 @@ mod camera_label_tests {
 mod edited_tests {
     use super::*;
     use lcc_develop::WbScale;
+
+    #[test]
+    fn shutter_seconds_prefers_the_exact_time_while_the_text_still_shows_it() {
+        let mut m = Meta { shutter: "0.3571".into(), exposure_time: Some(1.0 / 2.8), ..Default::default() };
+        assert_eq!(m.shutter_seconds(), Some(1.0 / 2.8));
+        m.shutter = "1/3".into();
+        m.exposure_time = Some(1.0 / 3.0);
+        assert_eq!(m.shutter_seconds(), Some(1.0 / 3.0));
+        // the text no longer matches the stored time (edited by hand): the text wins
+        m.shutter = "1/250".into();
+        assert_eq!(m.shutter_seconds(), Some(1.0 / 250.0));
+        // an older catalog without the exact time
+        m.exposure_time = None;
+        m.shutter = "2.5\u{2033}".into();
+        assert_eq!(m.shutter_seconds(), Some(2.5));
+        // the exact time stays out of the JSON when unknown, and round-trips when known
+        assert!(!serde_json::to_string(&m).unwrap().contains("exposure_time"));
+        m.exposure_time = Some(2.5);
+        let back: Meta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!((back.exposure_time, back.shutter_seconds()), (Some(2.5), Some(2.5)));
+    }
 
     #[test]
     fn raw_with_import_settings_is_not_edited() {
@@ -1002,5 +1084,31 @@ mod edited_tests {
             assert_eq!(p.camera_defaults().wb.mode, WbMode::AsShot);
             assert!(!p.is_edited());
         }
+    }
+
+    /// A raw whose camera is edited in Kelvin but whose as-shot white hasn't been read from its file yet (one imported
+    /// before its camera was known) still starts from a raw's defaults: sharpening, colour noise reduction and Remove
+    /// Hot Pixels, as import gave it. A raw shown from its embedded preview and a rendered photo don't.
+    #[test]
+    fn a_raw_whose_as_shot_white_is_not_read_yet_keeps_a_raws_defaults() {
+        let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "IMG_1370.CR3", "CR3", 10, 10, "2026-10-01T00:00:00");
+        p.kind = MediaKind::Raw;
+        p.meta.camera = "Canon Canon EOS R8".into();
+        assert!(!p.relative_wb(), "the R8 is edited in Kelvin");
+        assert_eq!(p.as_shot_wb, None);
+        let raw = DevelopSettings::for_raw(6500.0, 0.0);
+        let d = p.camera_defaults();
+        assert_eq!(d.detail, raw.detail, "a raw's sharpening, noise reduction and Remove Hot Pixels");
+        assert_eq!((d.wb.mode, d.wb.scale), (WbMode::AsShot, WbScale::Kelvin));
+        // imported while the camera was not known yet, on the relative scale: not an edit
+        p.develop = Arc::new(raw);
+        assert!(!p.is_edited());
+        assert!(p.develop_matches(p.camera_defaults()));
+        // a raw shown from its embedded preview develops nothing from raw data: no raw defaults
+        p.preview_only = Some("not decodable yet".into());
+        assert_eq!(p.camera_defaults(), DevelopSettings::default());
+        // nor does a rendered photo
+        let jpeg = Photo::new(PhotoId(2), Source::Demo { scene: 0 }, "a.jpg", "JPEG", 10, 10, "2026-10-01T00:00:00");
+        assert_eq!(jpeg.camera_defaults(), DevelopSettings::default());
     }
 }

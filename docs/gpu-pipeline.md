@@ -38,7 +38,7 @@ means to use (`lcc_gpu::backend`), for its compute device *and* for the desktop 
 
 | platform | default (window and compute) |
 |---|---|
-| Windows | DX12 only — the Vulkan driver is never loaded unless asked for |
+| Windows | Vulkan, DX12 as the fallback (each tried on its own; issue #934: DX12's FXC took 31 s to build the kernels on a cold shader cache). Compute follows the window's backend, else the first with a graphics card |
 | macOS | Metal |
 | Linux / BSD | Vulkan (the window also lists GL, eframe's default; no GL backend is compiled in) |
 
@@ -153,16 +153,26 @@ device and every kernel build; a crash while the window's renderer starts is avo
 or worked around with `<PREFIX>_GPU_BACKEND`.
 
 **The window's renderer and its fallback (Windows).** Before the window opens, each renderer is probed in
-order: DX12, GL, then eframe's OpenGL renderer (glow); Vulkan only when `<PREFIX>_GPU_BACKEND=vulkan` asks for it,
-since a broken Vulkan driver can crash the process before any window. A probe creates a device and builds egui's
+order: Vulkan, DX12, GL, then eframe's OpenGL renderer (glow). A broken Vulkan driver can crash the process before
+any window (#136): the marker below then puts Vulkan last. A probe creates a device and builds egui's
 pipeline inside wgpu error scopes, so a driver that cannot compile egui's shaders ("The parameter is
 incorrect. (0x80070057)" in `egui_pipeline`) is logged and skipped instead of killing the app; no pop-up
 unless that renderer was forced (#1624). The renderer
-that worked is remembered in the settings folder (`window-renderer`); a start that dies before the window is up
+that worked is remembered in the settings folder (`window-renderer-2`); a start that dies before the window is up
 leaves `window-init.marker`, and the next start (relaunched automatically, at most 4 times) tries that
 renderer last. `<PREFIX>_GPU_BACKEND=dx12 | vulkan | gl | glow` (or `WGPU_BACKEND`) forces one; DX12 stays
 first because a broken Vulkan driver can crash the process uncatchably (#136). Compute keeps its own
 device and falls back to the CPU as before.
+
+**A window device lost while running (#1194).** egui-wgpu skips a frame it cannot draw (#1098), so a
+window whose device was lost would skip every frame forever (frozen, "Application Hang"). eframe cannot
+rebuild a window's device in place, so `window_gpu::LossWatch` watches the frames instead (a vendored
+egui-wgpu hook, `on_frame_acquired`, reports each frame that got its texture): an unbroken run of failed
+frames — 30 over at least 2 s after the GPU reported a lost device, 600 over 20 s otherwise — means the
+device is gone. A single skipped frame, a hidden or resizing window never counts. The renderer is then written
+to `window-lost` in the settings folder (at once, so it survives the process being killed) and dropped from
+`window-renderer-2`; every later start tries it last (unless `<PREFIX>_GPU_BACKEND` forces it). The library and
+settings are saved, a native message box says what happened, and the app ends.
 
 **The window's surface: one frame in flight.** The window's wgpu options start from eframe's defaults
 (`NativeOptions::default().wgpu_options`, `window_gpu::base_options`), whose surface is egui-wgpu's
@@ -372,6 +382,12 @@ time spent waiting (for vsync, or for the GPU), the latest whole-frame and zoom-
 times, the render queue, renders thrown away as superseded, the GPU adapter and its memory, and a
 graph of the last frames with a tick where a render arrived. Once a second it logs the same
 numbers (`fps-hud:`), so a scripted drag (`ui.dragWidget`) can be measured from the log.
+
+**Present mode** (issue #633): the window presents with FIFO (vsync), except with HDR output on
+Wayland with an NVIDIA GPU, where it uses Mailbox when the surface offers it (FIFO there missed
+vblank at idle clocks: ~95 instead of 144 fps). `<PREFIX>_PRESENT=fifo` forces FIFO,
+`<PREFIX>_PRESENT=mailbox` asks for Mailbox anywhere it is offered; a mode the surface doesn't
+offer always falls back to FIFO.
 
 `render_bench` on `corpus/raw/arw-sony-a7m3-compressed.arw` (24 MP; loupe = 2560 px preview →
 1920×1280), min of 7 runs, wall clock, on a heavily shared machine (load average 60–110 on 14 cores,

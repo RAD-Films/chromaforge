@@ -17,6 +17,7 @@
 //! | `collections` | album id → album JSON (albums, smart albums, folders of albums) |
 //! | `stacks` | stack id → stack JSON |
 //! | `previews` | photo id → [`PreviewEntry`] JSON |
+//! | `vignetting_maps` | vignetting map id → [`crate::VignettingMapRecord`] JSON (only added to; a map can be withdrawn, format 18) |
 //! | `remote_identity` | (photo id, service, account) → [`RemoteIdentity`] JSON |
 //! | `remote_identity_by_remote` | (service, account, remote id) → photo id |
 //! | `folders`, `keywords`, `idx_camera`, `idx_captured_day` | value → photo ids (multimap): secondary indexes (rating and flag have too few values for an index to beat a scan) |
@@ -44,6 +45,8 @@ const SETTINGS: TableDefinition<u128, &[u8]> = TableDefinition::new("develop_set
 const COLLECTIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("collections");
 const STACKS: TableDefinition<u64, &[u8]> = TableDefinition::new("stacks");
 const PREVIEWS: TableDefinition<u64, &[u8]> = TableDefinition::new("previews");
+/// Flat-field maps by id (format 18; absent from older stores until their first checkpoint).
+const VIGNETTING_CALIBRATION: TableDefinition<&str, &[u8]> = TableDefinition::new("vignetting_maps");
 const REMOTE: TableDefinition<(u64, &str, &str), &[u8]> = TableDefinition::new("remote_identity");
 const REMOTE_BY_REMOTE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::new("remote_identity_by_remote");
 const FOLDERS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("folders");
@@ -160,6 +163,9 @@ struct Baseline {
     stacks: BTreeMap<StackId, Stack>,
     previews: BTreeMap<PhotoId, PreviewEntry>,
     remote: RemoteTable,
+    /// The vignetting maps written (the table only grows; a record changes when it is withdrawn or put in use again,
+    /// which [`Arc::ptr_eq`] tells: an op replaces the record it changes).
+    vignetting_maps: BTreeMap<lcc_develop::VignettingMapId, Arc<crate::VignettingMapRecord>>,
     head: Head,
 }
 
@@ -200,6 +206,102 @@ fn open_database(path: &Path, create: bool) -> Result<Database> {
     if create { b.create(path) } else { b.open(path) }.map_err(dberr)
 }
 
+/// The largest store [`CatalogDb::load`] reads into memory first; a larger one is read from the
+/// file page by page, as before.
+const MEMORY_LOAD_MAX: u64 = if cfg!(target_pointer_width = "64") { 4 << 30 } else { 256 << 20 };
+
+/// The store file's bytes in memory, as redb's storage for one load.
+///
+/// redb reads a file one page (4 KiB) at a time, in key order, which is anywhere in the file: on a
+/// network share or a hard disk each of those reads is a round trip or a seek, and a library of
+/// 300,000 photos took minutes to load (issue #979). The file read front to back in large pieces
+/// takes seconds there. Whatever redb writes while it has the copy open (it marks a store as open)
+/// stays in the copy and is dropped with it: the file is not touched.
+#[derive(Default)]
+pub(crate) struct MemFile(RwLock<Vec<u8>>);
+
+impl std::fmt::Debug for MemFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemFile").field("len", &self.bytes().len()).finish()
+    }
+}
+
+impl MemFile {
+    /// Read the file at `path` whole. An error when it is larger than `max` bytes, can't be read
+    /// or doesn't fit in memory (the caller then reads it from the file).
+    pub(crate) fn read(path: &Path, max: u64) -> std::io::Result<MemFile> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let too_big = || std::io::Error::other(format!("{len} bytes: more than is read into memory"));
+        if len > max {
+            return Err(too_big());
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(usize::try_from(len).map_err(|_| too_big())?).map_err(std::io::Error::other)?;
+        // in pieces of 8 MiB, and never past `max` should the file grow meanwhile
+        loop {
+            let left = max.saturating_sub(buf.len() as u64);
+            if left == 0 || (&mut file).take(left.min(8 << 20)).read_to_end(&mut buf)? == 0 {
+                break;
+            }
+        }
+        Ok(MemFile(RwLock::new(buf)))
+    }
+
+    fn bytes(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn bytes_mut(&self) -> std::sync::RwLockWriteGuard<'_, Vec<u8>> {
+        self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `offset..offset + len` as a range of a buffer of `total` bytes, if it lies inside it.
+    fn range(offset: u64, len: usize, total: usize) -> Option<std::ops::Range<usize>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= total).then_some(start..end)
+    }
+}
+
+impl redb::StorageBackend for MemFile {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.bytes().len() as u64)
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let bytes = self.bytes();
+        let from = Self::range(offset, out.len(), bytes.len()).and_then(|r| bytes.get(r));
+        let from = from.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read past the end of the store"))?;
+        out.copy_from_slice(from);
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        let len = usize::try_from(len).ok().filter(|l| *l as u64 <= MEMORY_LOAD_MAX.saturating_mul(2));
+        let len = len.ok_or_else(|| std::io::Error::other("the store's copy in memory can't grow that far"))?;
+        let mut bytes = self.bytes_mut();
+        let more = len.saturating_sub(bytes.len());
+        bytes.try_reserve(more).map_err(std::io::Error::other)?;
+        bytes.resize(len, 0);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let mut bytes = self.bytes_mut();
+        let total = bytes.len();
+        let to = Self::range(offset, data.len(), total).and_then(|r| bytes.get_mut(r));
+        let to = to.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "write past the end of the store"))?;
+        to.copy_from_slice(data);
+        Ok(())
+    }
+}
+
 impl CatalogDb {
     /// Create a new, empty store at `path` (replacing nothing: fails if it exists).
     pub fn create(path: &Path) -> Result<CatalogDb> {
@@ -237,6 +339,29 @@ impl CatalogDb {
     /// The file, opened for one operation.
     fn handle(&self) -> Result<Database> {
         open_database(&self.path, false)
+    }
+
+    /// The file's contents, read in one pass and opened from memory, for a load ([`MemFile`]).
+    /// `None` when that can't be done (too large, no memory, unreadable): the load then reads
+    /// the file itself, which reports what is wrong with it.
+    fn memory_handle(&self) -> Option<Database> {
+        let t = web_time::Instant::now();
+        let opened = MemFile::read(&self.path, MEMORY_LOAD_MAX).map_err(dberr).and_then(|mem| {
+            let bytes = mem.bytes().len();
+            let mut b = Database::builder();
+            b.set_cache_size(64 << 20);
+            b.create_with_backend(mem).map(|db| (db, bytes)).map_err(dberr)
+        });
+        match opened {
+            Ok((db, bytes)) => {
+                log::info!("catalog: read {} ({bytes} bytes) in {:.0} ms", self.path.display(), t.elapsed().as_secs_f64() * 1e3);
+                Some(db)
+            }
+            Err(e) => {
+                log::info!("catalog: reading {} page by page ({e})", self.path.display());
+                None
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -307,7 +432,11 @@ impl CatalogDb {
     fn load_inner(&mut self) -> Result<(Catalog, u64, usize)> {
         let (seq, generation, version) = self.check_format()?;
         (self.generation, self.version) = (generation, version);
-        let db = self.handle()?;
+        // (the check above opened the file itself: a store that was not closed cleanly is repaired there)
+        let db = match self.memory_handle() {
+            Some(db) => db,
+            None => self.handle()?,
+        };
         let r = db.begin_read().map_err(dberr)?;
         let mut bad = 0usize;
         let mut cat = Catalog::new();
@@ -327,7 +456,8 @@ impl CatalogDb {
 
         // settings first: photos refer to them
         let st = r.open_table(SETTINGS).map_err(dberr)?;
-        let mut raw: Vec<(u128, Vec<u8>)> = Vec::with_capacity(st.len().map_err(dberr)? as usize);
+        // (the count a store gives is only a hint: a damaged one can say billions, and reserving that much aborts)
+        let mut raw: Vec<(u128, Vec<u8>)> = Vec::with_capacity((st.len().map_err(dberr)? as usize).min(1 << 16));
         for e in st.iter().map_err(dberr)? {
             let (k, v) = e.map_err(dberr)?;
             raw.push((k.value(), v.value().to_vec()));
@@ -416,6 +546,27 @@ impl CatalogDb {
                 Err(_) => bad += 1,
             }
         }
+        // (a store from before format 18 has no such table)
+        match r.open_table(VIGNETTING_CALIBRATION) {
+            Ok(t) => {
+                for e in t.iter().map_err(dberr)? {
+                    let (k, v) = e.map_err(dberr)?;
+                    let row =
+                        serde_json::from_slice::<serde_json::Value>(v.value()).ok().and_then(|j| crate::vignetting_maps::read_row(k.value(), &j));
+                    match row {
+                        Some((id, rec)) => {
+                            cat.vignetting_maps.insert(id, Arc::new(rec));
+                        }
+                        None => {
+                            log::warn!("catalog: vignetting map {} is damaged and was left out", k.value().get(..8).unwrap_or(k.value()));
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(dberr(e)),
+        }
         let rt = r.open_table(REMOTE).map_err(dberr)?;
         let mut links = Vec::new();
         for e in rt.iter().map_err(dberr)? {
@@ -433,6 +584,7 @@ impl CatalogDb {
             stacks: cat.stacks.clone(),
             previews: cat.previews.clone(),
             remote: cat.remote.clone(),
+            vignetting_maps: cat.vignetting_maps.clone(),
             head: Head::of(&cat),
         };
         Ok((cat, seq, bad))
@@ -505,6 +657,7 @@ impl CatalogDb {
                 txn.delete_table(t).map_err(dberr)?;
             }
             txn.delete_table(SETTINGS).map_err(dberr)?;
+            txn.delete_table(VIGNETTING_CALIBRATION).map_err(dberr)?;
             txn.delete_table(REMOTE).map_err(dberr)?;
             txn.delete_table(REMOTE_BY_REMOTE).map_err(dberr)?;
             for t in STR_INDEXES {
@@ -571,6 +724,15 @@ impl CatalogDb {
             sync_map(&mut txn.open_table(COLLECTIONS).map_err(dberr)?, &self.base.albums, &cat.albums, |k| k.0, full)?;
             sync_map(&mut txn.open_table(STACKS).map_err(dberr)?, &self.base.stacks, &cat.stacks, |k| k.0, full)?;
             sync_map(&mut txn.open_table(PREVIEWS).map_err(dberr)?, &self.base.previews, &cat.previews, |k| k.0, full)?;
+            // vignetting maps: added or changed (withdrawn, in use again), never removed (the table only grows)
+            let mut ff = txn.open_table(VIGNETTING_CALIBRATION).map_err(dberr)?;
+            for (id, rec) in &cat.vignetting_maps {
+                if full || !self.base.vignetting_maps.get(id).is_some_and(|b| Arc::ptr_eq(b, rec)) {
+                    let j = serde_json::to_vec(rec.as_ref()).map_err(|e| CatalogError::Io(e.to_string()))?;
+                    ff.insert(id.as_str(), j.as_slice()).map_err(dberr)?;
+                }
+            }
+            drop(ff);
 
             let mut rt = txn.open_table(REMOTE).map_err(dberr)?;
             let mut rr = txn.open_table(REMOTE_BY_REMOTE).map_err(dberr)?;
@@ -611,6 +773,7 @@ impl CatalogDb {
         self.base.stacks.clone_from(&cat.stacks);
         self.base.previews.clone_from(&cat.previews);
         self.base.remote.clone_from(&cat.remote);
+        self.base.vignetting_maps.clone_from(&cat.vignetting_maps);
         self.base.head = Head::of(cat);
         self.last = stats;
         Ok(stats)

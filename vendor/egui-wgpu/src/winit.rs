@@ -149,6 +149,33 @@ impl Painter {
             }
         }
 
+        // Patch (present mode): the app's choice for this adapter and colour space, and FIFO
+        // when the surface doesn't offer the mode (Mailbox / Immediate are optional in Vulkan).
+        let offered_modes = surface_state
+            .surface
+            .get_capabilities(&render_state.adapter)
+            .present_modes;
+        if let Some(hook) = &render_state.choose_present_mode
+            && let Some(mode) = hook(
+                &render_state.adapter.get_info(),
+                surf_config.color_space,
+                &offered_modes,
+            )
+        {
+            surf_config.present_mode = mode;
+        }
+        if !matches!(
+            surf_config.present_mode,
+            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+        ) && !offered_modes.contains(&surf_config.present_mode)
+        {
+            log::warn!(
+                "window surface: {:?} isn't offered; using FIFO",
+                surf_config.present_mode
+            );
+            surf_config.present_mode = wgpu::PresentMode::AutoVsync;
+        }
+
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
         }
@@ -630,6 +657,14 @@ impl Painter {
             output_frame
         };
 
+        // Patch (device loss): tell the app a frame got its texture (see `on_frame_acquired`).
+        if matches!(
+            output_frame,
+            wgpu::CurrentSurfaceTexture::Success(_) | wgpu::CurrentSurfaceTexture::Suboptimal(_)
+        ) && let Some(acquired) = &self.config.on_frame_acquired
+        {
+            acquired();
+        }
         let output_frame = match output_frame {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {

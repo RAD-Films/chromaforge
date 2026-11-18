@@ -18,6 +18,19 @@ pub trait Store: Send {
     /// Replace a file atomically: after a crash either the old or the new content is visible,
     /// never a mix (native: write temp + fsync + rename + fsync directory).
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()>;
+    /// Create a file that doesn't exist yet: `AlreadyExists` when `name` is taken, and a file
+    /// that is there is never replaced, even when another writer creates it at the same moment
+    /// (that is the difference from reading first and then calling [`Store::write_atomic`]). Same
+    /// durability as [`Store::write_atomic`]: the file appears whole or not at all.
+    ///
+    /// The default checks and then writes, which is only as safe as the store is unshared: a store
+    /// that other writers can reach ([`FsStore`], [`MemStore`]) overrides it with one atomic step.
+    fn write_new(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        if self.read(name)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{name} already exists")));
+        }
+        self.write_atomic(name, data)
+    }
     /// [`Store::write_atomic`] with streamed content: `fill` writes the new content into the
     /// given writer (an error aborts and leaves the old file). Same durability: the file is
     /// replaced only once all of it is written (native: and fsynced). Returns its length.
@@ -61,6 +74,13 @@ pub trait Store: Send {
     /// v4 store ([`crate::db`]) beside its log. `None` (the default): JSON snapshots.
     fn dir(&self) -> Option<&Path> {
         None
+    }
+    /// Is there a folder called `name` among the files? The journal refuses a library laid out
+    /// with a folder this version doesn't read (upstream #3962) rather than load part of it and
+    /// overwrite the rest. The default: a flat store (no folders), so `false`.
+    fn has_folder(&mut self, name: &str) -> io::Result<bool> {
+        let _ = name;
+        Ok(false)
     }
 }
 
@@ -191,6 +211,12 @@ impl Store for FsStore {
         Ok(())
     }
 
+    fn write_new(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        // a hard link (or an exclusive create) publishes the complete, synced file under `name`
+        // only if nothing is there; no step replaces it
+        crate::safe_file::write_new(&self.path(name), data)
+    }
+
     fn write_atomic_with(&mut self, name: &str, fill: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<()>) -> io::Result<u64> {
         use std::io::Write;
         // written here, once the log thread is done (the next append starts it again)
@@ -287,6 +313,16 @@ impl Store for FsStore {
         self.dir.display().to_string()
     }
 
+    fn has_folder(&mut self, name: &str) -> io::Result<bool> {
+        // (a link to a folder counts: what it points at is what another build would read)
+        match std::fs::metadata(self.path(name)) {
+            Ok(md) => Ok(md.is_dir()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            // can't tell: an error, not a guess that would let the open go on to write
+            Err(e) => Err(e),
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(FsStore { dir: self.dir.clone(), appender: None, log: None, json_only: self.json_only }))
@@ -355,6 +391,16 @@ impl Store for MemStore {
         self.set(name, data.to_vec());
         Ok(())
     }
+    fn write_new(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        use std::collections::btree_map::Entry;
+        match self.files.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()) {
+            Entry::Occupied(_) => Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{name} already exists"))),
+            Entry::Vacant(v) => {
+                v.insert(data.to_vec());
+                Ok(())
+            }
+        }
+    }
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         self.files.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default().extend_from_slice(data);
         Ok(())
@@ -367,6 +413,11 @@ impl Store for MemStore {
     }
     fn describe(&self) -> String {
         "memory".into()
+    }
+    /// A file named `<name>/...` stands for a file inside folder `name`.
+    fn has_folder(&mut self, name: &str) -> io::Result<bool> {
+        let prefix = format!("{name}/");
+        Ok(self.files.lock().unwrap_or_else(|e| e.into_inner()).keys().any(|k| k.starts_with(&prefix)))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)

@@ -220,10 +220,17 @@ pub struct SidecarData {
     /// [`merge_into`] puts boxes drawn on the photo as stored where the upright photo has them (#2674).
     pub regions_drawn_on: Option<(f64, f64)>,
     pub orientation: Option<lcc_meta::Orientation>,
+    /// The packet's `tiff:Orientation` when it carries another editor's develop settings (`crs:`): how that editor
+    /// turns the stored pixels upright, the file's own orientation and the user's rotation together. The import
+    /// turns the photo by what it adds to the file's orientation ([`SidecarData::turn_from`]).
+    pub turned_to: Option<lcc_meta::Orientation>,
     /// Capture time (ISO 8601) from `exif:DateTimeOriginal`, `photoshop:DateCreated` or
     /// `xmp:CreateDate` (first found). Used only when the file itself has no capture time.
     pub captured: Option<String>,
     pub develop: Option<DevelopPatch>,
+    /// The flat-field map our own settings (`lc:settings`, portable) carried; whoever applies the settings stores it
+    /// first ([`SidecarData::vignetting_calibration_ops`]).
+    pub vignetting_maps: Vec<(lcc_develop::VignettingMapId, lcc_develop::EmbeddedVignettingMap)>,
     /// A video clip's trim (`lcvid:trimIn`, `lcvid:trimOut`; seconds, `None` out = the end), when stated.
     pub video_trim: Option<(f64, Option<f64>)>,
     /// A video clip's poster frame time (`lcvid:posterTime`), when stated.
@@ -320,8 +327,11 @@ pub fn parse_sidecar(xmp: &str, target: crate::crs::Target) -> std::result::Resu
         out.label = Some(ColorLabel::parse(l.trim()));
         out.label_text = Some(l.trim().to_string());
     }
-    let full =
-        d.lc_settings.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok()).and_then(|v| DevelopSettings::from_untrusted_json(&v).ok());
+    let full = d.lc_settings.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok()).and_then(|mut v| {
+        // (a flat-field map comes with them: taken out, the settings reference it)
+        out.vignetting_maps.extend(lcc_develop::absorb_portable(&mut v));
+        DevelopSettings::from_untrusted_json(&v).ok()
+    });
     out.develop = match full {
         Some(s) => Some(DevelopPatch::Full(Box::new(s))),
         None if crate::crs::has_adjustments(&d.properties) => {
@@ -361,8 +371,10 @@ pub fn parse_sidecar(xmp: &str, target: crate::crs::Target) -> std::result::Resu
                     })
                     .unwrap_or(crate::import::ImportUprightMode::Unknown);
                 // Lightroom keeps its Upright analysis when Upright is Off but doesn't apply it:
-                // nothing is lost then
-                if mode != crate::import::ImportUprightMode::Off {
+                // nothing is lost then; Auto, Level, Vertical and Full apply Lightroom's own matrix
+                // (`geometry.lrc_upright`), so only a mode without a usable one is redone here
+                let applied = partial.pointer("/geometry/lrc_upright").is_some_and(|v| !v.is_null());
+                if mode != crate::import::ImportUprightMode::Off && !applied {
                     out.warnings.push(crate::import::ImportWarning {
                         path: String::new(),
                         code: crate::import::ImportWarningCode::UprightGeometry,
@@ -396,6 +408,9 @@ pub fn parse_sidecar(xmp: &str, target: crate::crs::Target) -> std::result::Resu
         }
         None => None,
     };
+    if matches!(out.develop, Some(DevelopPatch::Partial(_))) {
+        out.turned_to = m.orientation;
+    }
     Ok(out)
 }
 
@@ -512,6 +527,63 @@ pub fn merge_into(p: &mut Photo, sc: &SidecarData, now: &str) -> bool {
     p.develop = Arc::new(develop);
     p.edited = Some(now.to_string());
     true
+}
+
+impl SidecarData {
+    /// The ops that store the flat-field map these settings carried in `cat` (none when it has it already): ahead of
+    /// the ops that apply them. The map links to no photo; the catalog finds its reference by the raw's SHA-1.
+    pub fn vignetting_calibration_ops(&self, cat: &lcc_catalog::Catalog, now: &str) -> Vec<Op> {
+        crate::vignetting_calibration_io::add_ops(cat, &self.vignetting_maps, now)
+    }
+
+    /// The patch with the rotation [`SidecarData::turned_to`] adds to `file` (the orientation the photo file states,
+    /// which the decode applies): Lightroom writes a photo turned in it as the whole orientation. Only another
+    /// editor's settings take it; the app's own (`lc:settings`) carry their rotation already.
+    pub fn turn_from(mut self, file: Option<lcc_meta::Orientation>) -> Self {
+        if let (Some(to), Some(DevelopPatch::Partial(v))) = (self.turned_to, self.develop.as_mut())
+            && let Some(o) = v.as_object_mut()
+            && let Ok(turn) = serde_json::to_value(file.unwrap_or_default().inverse().then(to))
+        {
+            o.insert("orientation".into(), turn);
+        }
+        self
+    }
+
+    /// The patch with a Lightroom crop, spots and mask shapes put in the app's frame: `crs:CropLeft` … `CropBottom` are two opposite corners
+    /// of the straightened crop on the stored image, before its orientation (the sidecar's whole orientation, else
+    /// the file's) and the straighten turn, as in a Lightroom catalog
+    /// ([`crate::lightroom_catalog::catalog_crop`]). `upright` is the photo's size turned by the file's orientation.
+    /// Only another editor's settings take it; the app's own (`lc:settings`) are in its frame already.
+    pub fn crop_from(mut self, file: Option<lcc_meta::Orientation>, upright: (u32, u32)) -> Self {
+        let file = file.unwrap_or_default();
+        let (w, h) = if file.swaps_axes() { (upright.1, upright.0) } else { upright };
+        if let Some(DevelopPatch::Partial(v)) = self.develop.as_mut()
+            && w > 0
+            && h > 0
+        {
+            let o = self.turned_to.unwrap_or(file);
+            orient_lightroom_patch(v, o, f64::from(w) / f64::from(h), f64::from(upright.0) / f64::from(upright.1));
+        }
+        self
+    }
+}
+
+/// Put a Lightroom patch's crop, spots and mask shapes (on the stored image, of aspect `stored`) in the app's frame
+/// for orientation `o`. `photo_aspect` is the photo record's width / height: [`merge_into`] refits radials from
+/// [`crate::crs_masks::DEFAULT_ASPECT`] to it, so they are left in those terms, fitted to the turned image once it has.
+pub(crate) fn orient_lightroom_patch(v: &mut Value, o: lcc_meta::Orientation, stored: f64, photo_aspect: f64) {
+    if !(stored.is_finite() && stored > 0.0) {
+        return;
+    }
+    crate::lightroom_catalog::catalog_crop(v, o, stored);
+    if o != lcc_meta::Orientation::Normal {
+        use crate::crs_masks::{DEFAULT_ASPECT, orient_geometry, refit_radials};
+        refit_radials(v, DEFAULT_ASPECT, stored);
+        orient_geometry(v, o, stored);
+        if photo_aspect.is_finite() && photo_aspect > 0.0 {
+            refit_radials(v, photo_aspect, DEFAULT_ASPECT);
+        }
+    }
 }
 
 impl SidecarData {
@@ -757,6 +829,16 @@ fn packet(p: &Photo, cat: &lcc_catalog::Catalog, remove_location: bool, gps: boo
         d.optics.lens = None;
         serde_json::to_string(&d).unwrap_or_default()
     };
+    // portable: the flat-field map goes with the settings (another catalog reads it back); settings without one are
+    // written exactly as before
+    let settings = match p.develop.optics.vignetting_calibration.as_ref().and_then(|id| cat.vignetting_map(id)) {
+        Some(r) => {
+            let mut v: Value = serde_json::from_str(&settings).unwrap_or(Value::Null);
+            lcc_develop::embed_portable(&mut v, |_| Some(r.map.clone()));
+            serde_json::to_string(&v).unwrap_or(settings)
+        }
+        None => settings,
+    };
     let flag = match p.flag {
         Flag::None => "none",
         Flag::Pick => "pick",
@@ -908,7 +990,7 @@ impl Packets {
 /// in `photoshop:DateCreated` only, so an `exif:DateTimeOriginal` already there (an earlier full time) is removed
 /// rather than left to outrank it on the next read.
 fn merged_contents(path: &Path, p: &Photo, packets: &Packets, stamp: &str) -> std::io::Result<(String, bool, Option<PathBuf>)> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_capped(path, SIDECAR_READ_MAX) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((packets.with_gps.clone(), false, None)),
         // can't see what is there: never overwrite it blindly
@@ -917,21 +999,35 @@ fn merged_contents(path: &Path, p: &Photo, packets: &Packets, stamp: &str) -> st
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok((packets.with_gps.clone(), false, None));
     }
-    match std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(|old| {
-        let gps = GpsOnSave::of(p, old);
-        let partial_capture = p.captured.as_deref().and_then(lcc_catalog::dates::partial_capture).is_some();
-        let owned: Vec<&str> = OWNED.iter().chain(gps.owned_tags()).copied().chain(partial_capture.then_some("exif:DateTimeOriginal")).collect();
-        let rules = lcc_meta::MergeRules { owned: &owned, owned_if_present: OWNED_IF_STATED };
-        let fresh = if gps.write() { &packets.with_gps } else { &packets.without_gps };
-        lcc_meta::merge_xmp(old, fresh, rules).map_err(|e| e.to_string())
-    }) {
-        Ok(merged) => Ok((merged, true, None)),
-        Err(why) => {
-            let b = backup(path, stamp)?;
-            log::warn!("{}: not readable as XMP ({why}); kept a copy as {} before replacing it", path.display(), b.display());
-            Ok((packets.with_gps.clone(), false, Some(b)))
+    let why = match std::str::from_utf8(&bytes) {
+        Ok(old) => {
+            let gps = GpsOnSave::of(p, old);
+            let partial_capture = p.captured.as_deref().and_then(lcc_catalog::dates::partial_capture).is_some();
+            let owned: Vec<&str> = OWNED.iter().chain(gps.owned_tags()).copied().chain(partial_capture.then_some("exif:DateTimeOriginal")).collect();
+            let rules = lcc_meta::MergeRules { owned: &owned, owned_if_present: OWNED_IF_STATED };
+            let fresh = if gps.write() { &packets.with_gps } else { &packets.without_gps };
+            match lcc_meta::merge_xmp(old, fresh, rules) {
+                Ok(merged) => return Ok((merged, true, None)),
+                // a readable sidecar whose merge fails (e.g. the merged packet exceeds the XMP limits), or one
+                // that is valid but over the parser's complexity limits: fail the save and keep the file as it
+                // is, rather than replace metadata that could be read (upstream #3696). Text with no `rdf:RDF`
+                // element parses as empty metadata but holds nothing to keep: it is replaced after a backup,
+                // as any sidecar that is not XMP.
+                Err(why)
+                    if why == lcc_meta::XmpError::TooComplex
+                        || (lcc_meta::parse_xmp(old.strip_prefix('\u{feff}').unwrap_or(old)).is_ok()
+                            && !matches!(&why, lcc_meta::XmpError::Xml(m) if m.contains("no rdf:RDF element"))) =>
+                {
+                    return Err(std::io::Error::other(format!("the sidecar is readable but could not be merged ({why}); it was left unchanged")));
+                }
+                Err(why) => why.to_string(),
+            }
         }
-    }
+        Err(why) => why.to_string(),
+    };
+    let b = backup(path, stamp)?;
+    log::warn!("{}: not readable as XMP ({why}); kept a copy as {} before replacing it", path.display(), b.display());
+    Ok((packets.with_gps.clone(), false, Some(b)))
 }
 
 /// Make a background sidecar write ([`crate::sidecar_writer`]): the packet merged into an existing one and written
@@ -1032,14 +1128,26 @@ pub(crate) fn jpeg_header_xmp(bytes: &[u8]) -> Option<String> {
     read_jpeg_xmp(&mut std::io::Cursor::new(bytes), JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS)
 }
 
+/// Most bytes of a sidecar read whole (it must be a regular file).
+const SIDECAR_READ_MAX: u64 = 256 << 20;
+
+/// [`crate::bounded_read::read_bounded`] as an `io::Result`, keeping `NotFound` distinguishable.
+fn read_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use crate::bounded_read::ReadError;
+    crate::bounded_read::read_bounded(path, max).map_err(|e| match e {
+        ReadError::Io(e) => e,
+        other => std::io::Error::other(other.to_string()),
+    })
+}
+
 /// The XMP packet that describes a photo on disk: its sidecar, else embedded raw/DNG or JPEG XMP.
 pub fn read_packet(original: &str, kind: MediaKind, naming: SidecarNaming) -> Option<(String, PathBuf)> {
     if let Some(sc) = find_sidecar(original, naming) {
         // A discovered sidecar keeps precedence even when reading it fails.
-        return std::fs::read_to_string(&sc).ok().map(|s| (s, sc));
+        return read_capped(&sc, SIDECAR_READ_MAX).ok().and_then(|b| String::from_utf8(b).ok()).map(|s| (s, sc));
     }
     if kind == MediaKind::Raw {
-        let bytes = std::fs::read(original).ok()?;
+        let bytes = read_capped(original.as_ref(), crate::bounded_read::MAX_MEDIA_BYTES).ok()?;
         let x = lcc_meta::embedded(&bytes).xmp?;
         return Some((x, PathBuf::from(original)));
     }
@@ -1351,7 +1459,7 @@ impl Session {
     fn sidecar_paths(&self, id: PhotoId, owners: &StemOwners) -> Result<(PathBuf, Vec<PathBuf>)> {
         let p = self.catalog.photo(id).ok_or(lcc_catalog::CatalogError::NoPhoto(id))?;
         if p.copy_of.is_some() {
-            return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the library", p.file_name)));
+            return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the catalog", p.file_name)));
         }
         let orig = file_path(p).ok_or_else(|| EngineError::Other(format!("{} is not a file on disk", p.file_name)))?;
         // A relative path would be taken from the working directory.
@@ -1432,12 +1540,13 @@ impl Session {
         let sc = sc.resolve_label(&self.catalog);
         let mut q = (**p).clone();
         let develop_changed = merge_into(&mut q, &sc, &(self.clock)());
-        let mut ops = vec![
+        let mut ops = sc.vignetting_calibration_ops(&self.catalog, &(self.clock)());
+        ops.extend([
             Op::SetRating { id, rating: q.rating },
             Op::SetFlag { id, flag: q.flag },
             Op::SetLabel { id, label: q.label },
             Op::SetMeta { id, meta: Box::new(q.meta.clone()) },
-        ];
+        ]);
         if q.captured != p.captured {
             ops.push(Op::SetCaptured { id, captured: q.captured.clone() });
         }
@@ -1955,6 +2064,7 @@ mod tests {
         list.push(lcc_raw::dcp::Calibrated {
             make: "LOOKTEST".into(),
             names: vec!["LOOKTEST ONE".into()],
+            lens: None,
             looks: vec![("cal:adobe-vivid".into(), dcp)],
             default: Some("cal:adobe-vivid".into()),
         });

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::about::About;
 use crate::{Error, Result};
 
 /// Longest manifest the host reads.
@@ -100,6 +101,12 @@ pub struct Manifest {
     /// v1.1 proposal; hosts without it use their base tone). Unknown values mean the camera's.
     #[serde(default, deserialize_with = "lenient_base_tone", skip_serializing_if = "BaseTone::is_camera")]
     pub base_tone: BaseTone,
+    /// How the host cuts the image into bands (`"bands": "rows" | "tiles"`, an ABI v1.1 proposal):
+    /// full-width rows, or near-square tiles when the filter has an `overlap`, which repeat less of the
+    /// image in the margins and keep a long feature (a hair, a scratch) in one band more often. Hosts
+    /// without it cut rows. Unknown values mean rows.
+    #[serde(default, deserialize_with = "lenient_bands", skip_serializing_if = "Bands::is_rows")]
+    pub bands: Bands,
     /// Display labels of parameters that declare one (`{"type": …, "label": "Dynamic range"}`), by
     /// parameter name. Read by [`Manifest::parse`]; labels that aren't 1-64 printable characters are dropped.
     #[serde(skip)]
@@ -110,17 +117,82 @@ pub struct Manifest {
     /// is dropped (the menu stays flat).
     #[serde(skip)]
     pub groups: Vec<(String, Vec<String>)>,
+    /// Parameters that declare `"remember": true` (an ABI v1.1 proposal): the host may start a
+    /// newly added copy of the filter with the values last set for them (the film type, say)
+    /// instead of their defaults. Read by [`Manifest::parse`]; hosts without it ignore the key.
+    #[serde(skip)]
+    pub remember: Vec<String>,
     /// A header picture the host may show at the top of the filter's controls (`"header": "<svg…>"`,
     /// or `{"dark": "<svg…>", "light": "<svg…>"}` for dark and light interface themes). Read by
     /// [`Manifest::parse`]; a picture that isn't an SVG document of at most [`MAX_HEADER_BYTES`]
     /// is dropped (no header).
     #[serde(skip)]
     pub header: Option<Header>,
+    /// Headings the host shows the parameters under (`"sections": [{"label": "Tone", "params":
+    /// ["exposure", …], "collapsed": false}, …]`, an ABI v1.1 proposal), in order. Read by
+    /// [`Manifest::parse`]; a section without a printable 1-64 character label or without a
+    /// parameter of the manifest is dropped, a parameter named twice stays in the first section,
+    /// and parameters in no section come first. Hosts without the field show a flat list.
+    #[serde(skip)]
+    pub sections: Vec<ParamSection>,
+    /// The key the host may offer for adding the filter to the selected photos (`"shortcut":
+    /// "Ctrl+Alt+N"`, an ABI v1.1 proposal: modifiers `Cmd`, `Ctrl`, `Alt`, `Shift` and a key, joined
+    /// with `+`). Read by [`Manifest::parse`]; a value that isn't 1-32 printable characters is
+    /// dropped, and the host decides whether it can bind the key; the user may change it like any
+    /// shortcut. Hosts without the field ignore it.
+    #[serde(skip)]
+    pub shortcut: Option<String>,
     /// A square icon the host may show for the filter (`"icon": "<svg…>"`, drawn on the host's own
     /// background, so it suits dark and light themes). Read by [`Manifest::parse`]; a picture that
     /// isn't an SVG document of at most [`MAX_HEADER_BYTES`] is dropped (the host draws its own).
     #[serde(skip)]
     pub icon: Option<String>,
+    /// Where the filter comes from (`homepage`, `repository`, `changelog`, `license`, an ABI v1.1
+    /// proposal; hosts without the fields ignore them). Read by [`Manifest::parse`]; a value the
+    /// host can't use is dropped and named in [`Manifest::dropped`].
+    #[serde(skip)]
+    pub about: About,
+    /// Manifest values [`Manifest::parse`] dropped, each with why (`"homepage: not an https://
+    /// link"`).
+    #[serde(skip)]
+    pub dropped: Vec<String>,
+}
+
+/// Most parameter sections a manifest may declare (see [`Manifest::sections`]).
+pub const MAX_SECTIONS: usize = 16;
+
+/// A heading and the parameters under it (see [`Manifest::sections`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParamSection {
+    pub label: String,
+    pub params: Vec<String>,
+    /// Shown folded until the user opens it.
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// `v` as the parameter sections of a manifest with parameters `params` (see [`Manifest::sections`]).
+fn param_sections(v: Option<&Value>, params: &[(String, ParamSpec)]) -> Vec<ParamSection> {
+    let Some(list) = v.and_then(Value::as_array) else { return Vec::new() };
+    let printable = |l: &str| l.chars().count() <= 64 && l.chars().all(|c| !c.is_control() && !hidden_format(c)) && l.chars().any(visible);
+    let mut placed: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for sec in list.iter().take(MAX_SECTIONS) {
+        let Some(label) = sec.get("label").and_then(Value::as_str).map(str::trim).filter(|l| printable(l)) else { continue };
+        let Some(names) = sec.get("params").and_then(Value::as_array) else { continue };
+        let mut mine = Vec::new();
+        for n in names.iter().filter_map(Value::as_str) {
+            if params.iter().any(|(k, _)| k == n) && !placed.contains(&n) {
+                placed.push(n);
+                mine.push(n.to_string());
+            }
+        }
+        if mine.is_empty() {
+            continue;
+        }
+        out.push(ParamSection { label: label.to_string(), params: mine, collapsed: sec.get("collapsed").and_then(Value::as_bool).unwrap_or(false) });
+    }
+    out
 }
 
 /// The largest header SVG kept (a logo drawn as paths is a few kilobytes).
@@ -179,6 +251,28 @@ pub enum AnalyzeArea {
     Crop,
 }
 
+/// How the image is cut into bands (see [`Manifest::bands`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Bands {
+    /// Full-width rows (a very wide image is also cut across).
+    #[default]
+    Rows,
+    /// Near-square tiles, when the filter has an `overlap` (rows otherwise: nothing to save).
+    Tiles,
+}
+
+impl Bands {
+    pub fn is_rows(&self) -> bool {
+        *self == Bands::Rows
+    }
+}
+
+fn lenient_bands<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Bands, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(if v.as_str() == Some("tiles") { Bands::Tiles } else { Bands::Rows })
+}
+
 /// The base tone a raw gets after a Source filter (see [`Manifest::base_tone`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,6 +329,14 @@ impl Manifest {
         let raw: Value = serde_json::from_str(text).map_err(|e| Error::Manifest(format!("manifest: {e}")))?;
         man.header = raw.get("header").and_then(Header::parse);
         man.icon = svg_document(raw.get("icon"));
+        (man.about, man.dropped) = About::parse(&raw);
+        man.sections = param_sections(raw.get("sections"), &man.params);
+        man.shortcut = raw
+            .get("shortcut")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && t.chars().count() <= 32 && t.chars().all(|c| !c.is_control() && !hidden_format(c)) && t.chars().any(visible))
+            .map(str::to_string);
         if let Some(ps) = raw.get("params").and_then(Value::as_object) {
             man.labels = man
                 .params
@@ -257,6 +359,12 @@ impl Manifest {
                     };
                     (names.len() == options.len() && names.iter().all(printable) && names.iter().any(|g| !g.is_empty())).then(|| (k.clone(), names))
                 })
+                .collect();
+            man.remember = man
+                .params
+                .iter()
+                .filter(|(k, _)| ps.get(k).and_then(|p| p.get("remember")).and_then(Value::as_bool) == Some(true))
+                .map(|(k, _)| k.clone())
                 .collect();
         }
         Ok(man)
@@ -537,6 +645,15 @@ mod tests {
         "overlap":2,"area":"canvas"}"#;
 
     #[test]
+    fn bands_are_rows_unless_a_filter_asks_for_tiles() {
+        let with = |v: &str| format!(r#"{{"id":"a.b","name":"A","kind":"filter"{v}}}"#);
+        assert_eq!(Manifest::parse(with("").as_bytes()).unwrap().bands, Bands::Rows);
+        assert_eq!(Manifest::parse(with(r#","bands":"tiles""#).as_bytes()).unwrap().bands, Bands::Tiles);
+        assert_eq!(Manifest::parse(with(r#","bands":"hexagons""#).as_bytes()).unwrap().bands, Bands::Rows);
+        assert_eq!(Manifest::parse(with(r#","bands":3"#).as_bytes()).unwrap().bands, Bands::Rows);
+    }
+
+    #[test]
     fn analyze_area_is_the_frame_unless_a_filter_asks_for_the_crop() {
         let with = |v: &str| format!(r#"{{"id":"a.b","name":"A","kind":"filter"{v}}}"#);
         assert_eq!(Manifest::parse(with("").as_bytes()).unwrap().analyze_area, AnalyzeArea::Frame);
@@ -643,6 +760,51 @@ mod tests {
         }
         let odd = Manifest::parse(br#"{"id":"a.b","name":"N","kind":"filter","stage":7}"#).unwrap();
         assert_eq!(odd.stage, None, "an unknown stage is ignored, not an error");
+        assert!(odd.sections.is_empty());
+    }
+
+    #[test]
+    fn sections_group_known_parameters_once_and_drop_the_rest() {
+        let m = Manifest::parse(
+            br#"{"id":"a.b","name":"N","kind":"filter",
+                "params":{"a":{"type":"bool"},"b":{"type":"bool"},"c":{"type":"bool"},"d":{"type":"bool"}},
+                "sections":[{"label":"Tone","params":["a","b","nope"]},
+                            {"label":"Again","params":["b"]},
+                            {"label":"\u202Eevil","params":["c"]},
+                            {"label":"Colour","params":["c"],"collapsed":true},
+                            "junk", {"params":["d"]}, {"label":"Empty","params":[]}]}"#,
+        )
+        .unwrap();
+        let got: Vec<(&str, Vec<&str>, bool)> =
+            m.sections.iter().map(|s| (s.label.as_str(), s.params.iter().map(String::as_str).collect(), s.collapsed)).collect();
+        assert_eq!(got, vec![("Tone", vec!["a", "b"], false), ("Colour", vec!["c"], true)]);
+        let none = Manifest::parse(br#"{"id":"a.b","name":"N","kind":"filter","sections":{"label":"x"}}"#).unwrap();
+        assert!(none.sections.is_empty(), "not a list: no sections, not an error");
+    }
+
+    #[test]
+    fn a_shortcut_is_kept_as_text_when_printable() {
+        let m = Manifest::parse(br#"{"id":"a.b","name":"N","kind":"filter","shortcut":" Ctrl+Alt+N "}"#).unwrap();
+        assert_eq!(m.shortcut.as_deref(), Some("Ctrl+Alt+N"));
+        for bad in [r#""shortcut":7"#, r#""shortcut":"""#, r#""shortcut":"\u202EN""#, r#""shortcut":"Ctrl+Alt+NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN""#]
+        {
+            let m = Manifest::parse(format!(r#"{{"id":"a.b","name":"N","kind":"filter",{bad}}}"#).as_bytes()).unwrap();
+            assert_eq!(m.shortcut, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parameters_that_remember_say_so_with_a_true() {
+        let m = Manifest::parse(
+            br#"{"id":"a.b","name":"N","kind":"filter","params":{
+                "film":{"type":"choice","options":["Colour","B&W"],"remember":true},
+                "border":{"type":"number","min":0,"max":25,"default":10,"remember":true},
+                "amount":{"type":"number","min":0,"max":1,"default":0.5},
+                "odd":{"type":"bool","remember":"yes"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.remember, ["film", "border"], "in declaration order, `true` only");
+        assert!(Manifest::parse(br#"{"id":"a.b","name":"N","kind":"filter"}"#).unwrap().remember.is_empty());
     }
 
     #[test]

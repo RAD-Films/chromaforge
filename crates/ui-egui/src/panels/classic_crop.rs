@@ -146,7 +146,7 @@ pub(crate) fn transform_body(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
             if guided {
                 ui.label(
                     egui::RichText::new(crate::i18n::tr_format!(
-                        "{} of 4 guides — drag along lines that should be vertical or horizontal.",
+                        "{} of 4 guides. Drag along lines that should be vertical or horizontal.",
                         d.geometry.guides.len()
                     ))
                     .size(11.0)
@@ -160,6 +160,10 @@ pub(crate) fn transform_body(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
             }
         });
         for spec in lcc_develop::controls::in_section(lcc_develop::Section::Geometry).filter(|c| c.id != "crop.angle") {
+            // (in the Edit panel's Transform: the tool profile in use may hide it)
+            if !super::super::edit::shown_here(app, ui, spec.id) {
+                continue;
+            }
             let v = lcc_develop::controls::get(&d, spec.id).unwrap_or(spec.default);
             let out = slider(ui, spec, v, true, None);
             super::super::edit::apply_slider_out(app, spec, out, |app, v| app.run("develop.set", json!({"control": spec.id, "value": v})));
