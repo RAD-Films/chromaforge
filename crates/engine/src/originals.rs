@@ -42,6 +42,12 @@ impl OriginalGuard {
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         put(format!("{stem}.xmp"), path.with_extension("xmp"), format!("the XMP sidecar of {label}"));
         put(format!("{name}.xmp"), PathBuf::from(format!("{}.xmp", path.to_string_lossy())), format!("the XMP sidecar of {label}"));
+        // every other spelling the reader accepts (`.XMP`, `.Xmp`, a recased photo extension)
+        for c in crate::sidecar::sidecar_candidates(&path.to_string_lossy(), crate::sidecar::SidecarNaming::Stem) {
+            if let Some(file) = c.file_name().map(|n| n.to_string_lossy().to_string()) {
+                put(file, c, format!("the XMP sidecar of {label}"));
+            }
+        }
     }
 
     /// `Err` (a message for the user) when writing `target` would replace a protected file, or
@@ -241,6 +247,91 @@ mod tests {
         assert!(g.check(&d.join("out/other.jpg")).is_ok(), "an ordinary existing file");
         let links = g.links.get().unwrap_or(&HashMap::new()).values().flatten().count();
         assert_eq!(links, 1, "only the symlink is resolved");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The symlink index is built by the first check; an original added after it must still be
+    /// found, so `add` drops the index and the next check builds it again.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_original_added_after_a_check_is_found_by_the_next_one() {
+        let d = std::env::temp_dir().join(format!("lc-originals-symlink-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("lib")).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let real = d.join("out/export.jpg");
+        std::fs::write(&real, b"pixels").unwrap();
+        let plain = d.join("lib/IMG_0.jpg");
+        std::fs::write(&plain, b"plain").unwrap();
+        let link = d.join("lib/IMG_1.jpg");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut g = OriginalGuard::default();
+        g.add(&plain, "IMG_0.jpg");
+        assert!(g.check(&real).is_ok(), "nothing in the library reads this file yet");
+        assert!(g.links.get().is_some(), "the first check built the index");
+        g.add(&link, "IMG_1.jpg");
+        assert!(g.links.get().is_none(), "adding an original drops the index");
+        assert!(g.check(&real).unwrap_err().contains("original of IMG_1.jpg"), "the index built again sees the new link");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A symlinked original whose file is gone has nothing a write could replace through it: an
+    /// export over an ordinary file next to where it pointed goes ahead, and nothing panics.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_original_refuses_nothing() {
+        let d = std::env::temp_dir().join(format!("lc-originals-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("lib")).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let other = d.join("out/other.jpg");
+        std::fs::write(&other, b"other").unwrap();
+        let link = d.join("lib/IMG_1.jpg");
+        std::os::unix::fs::symlink(d.join("out/missing.jpg"), &link).unwrap();
+        let mut g = OriginalGuard::default();
+        g.add(&link, "IMG_1.jpg");
+        assert!(g.check(&other).is_ok(), "an ordinary existing file");
+        assert!(g.check(&d.join("out/missing.jpg")).is_ok(), "the link's missing file is a free name");
+        let links = g.links.get().expect("built by the first existing target");
+        assert!(links.is_empty(), "a dangling link resolves to no file: {links:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A hard link with another name shares no name with its original, and the write check looks
+    /// up only the target's own names (it never compares the target with every original), so it
+    /// lets such a link through; the original itself is still refused. This guard has no
+    /// identity check that scans every original.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_under_another_name_is_not_scanned_for_by_the_write_check() {
+        let d = std::env::temp_dir().join(format!("lc-originals-hard-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("lib")).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let original = d.join("lib/IMG_1.jpg");
+        std::fs::write(&original, b"original").unwrap();
+        let linked = d.join("out/export.jpg");
+        std::fs::hard_link(&original, &linked).unwrap();
+        let mut g = OriginalGuard::default();
+        g.add(&original, "IMG_1.jpg");
+        assert!(g.check(&linked).is_ok(), "an export overwrite looks up only the target's own names");
+        assert!(g.check(&original).unwrap_err().contains("original of IMG_1.jpg"), "the original itself is still refused");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sidecars_the_reader_accepts_in_other_cases_are_protected() {
+        let d = std::env::temp_dir().join(format!("lc-originals-case-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let orig = d.join("IMG_1.jpg");
+        std::fs::write(&orig, b"original").unwrap();
+        let mut g = OriginalGuard::default();
+        g.add(&orig, "IMG_1.jpg");
+        for name in ["IMG_1.XMP", "IMG_1.Xmp", "IMG_1.JPG.xmp", "IMG_1.jpg.XMP"] {
+            std::fs::write(d.join(name), b"<x/>").unwrap();
+            assert!(g.check(&d.join(name)).unwrap_err().contains("sidecar"), "{name}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

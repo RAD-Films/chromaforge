@@ -148,6 +148,20 @@ const FIELDS: &[(&str, usize)] = &[
     // the HSL curves (`HslK`): the hue, saturation and luminance LUTs over the hue circle
     ("HSL", 1),
     ("HSL_LUT", HSL_WORDS),
+    // Levels (`LevelsK`) on the encoded values before the curves: the master stage, then red, green, blue,
+    // each 8 words (active, black, 1/range, out black, span, slope at 0, slope at 1, has a midtone table)
+    ("LEVELS", 1),
+    // Levels run in process V9's Tone Curve stage (`FinishParams::levels_pp`)
+    ("LEVELS_PP", 1),
+    ("LEVELS_M", 8),
+    ("LEVELS_R", 8),
+    ("LEVELS_G", 8),
+    ("LEVELS_B", 8),
+    // where each stage's midtone table starts in `aux` (`MIDTONE_SAMPLES` floats; unused without a midtone)
+    ("LEVELS_OFF_M", 1),
+    ("LEVELS_OFF_R", 1),
+    ("LEVELS_OFF_G", 1),
+    ("LEVELS_OFF_B", 1),
     ("VIG", 1),
     ("VIG_AMOUNT", 1),
     ("VIG_START", 1),
@@ -230,6 +244,10 @@ const FIELDS: &[(&str, usize)] = &[
     ("LUT_AMT", 1),
     ("LUT_MIN", 3),
     ("LUT_MAX", 3),
+    // per-channel RGB Contrast/Blacks LUT (`FinishParams::rgb_contrast`), `RGB_CONTRAST_N` floats in `aux`
+    ("RGB_CONTRAST", 1),
+    ("RGB_CONTRAST_OFF", 1),
+    ("RGB_CONTRAST_ZERO", 1),
     // first row of a band dispatch (the kernel runs over rows Y0.., see `render`)
     ("Y0", 1),
     // the mask planes' stride (0: the whole image's, `w × h`) and the band's first pixel in them
@@ -396,6 +414,14 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     if let Some(l) = negev {
         aux.extend_from_slice(&l.table);
     }
+    let rgb_contrast_off = aux.len();
+    if let Some(rc) = &fp.rgb_contrast {
+        if rc.lut().len() != lcc_pipeline::tone::RGB_CONTRAST_N {
+            fail(FailKind::Fatal, format!("rgb_contrast table has {} entries, expected {}", rc.lut().len(), lcc_pipeline::tone::RGB_CONTRAST_N));
+            return (Vec::new(), aux);
+        }
+        aux.extend_from_slice(rc.lut());
+    }
     // local Color Mixer and Point Color: one record per mask (each list used only when it lines up
     // with the masks, as on the CPU)
     let points_ok = fp.local_points.len() == masks.len();
@@ -445,6 +471,19 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         }
     }
 
+    // Levels: the midtone tables of the stages that have one (`MIDTONE_SAMPLES` floats each), after everything else
+    let mut levels_off = [0u32; 4];
+    if let Some(lv) = &fp.levels {
+        for (slot, st) in [&lv.master, &lv.channels[0], &lv.channels[1], &lv.channels[2]].into_iter().enumerate() {
+            if let Some(mid) = st.as_ref().and_then(|k| k.mid.as_ref()) {
+                if let Some(o) = levels_off.get_mut(slot) {
+                    *o = aux.len() as u32;
+                }
+                aux.extend_from_slice(&mid.y);
+            }
+        }
+    }
+
     let mut p = Block::new();
     p.u("W", fp.w as u32);
     p.u("H", fp.h as u32);
@@ -453,9 +492,11 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.u("SRGB_OFF", srgb_off as u32);
     p.u("CURVE_OFF", curve_off as u32);
     p.b("CURVES", fp.curves.is_some());
-    if fp.curves_pp.is_some() {
+    let levels_pp = fp.levels_pp && fp.levels.is_some();
+    if fp.curves_pp.is_some() || levels_pp {
         let (to_pp, from_pp) = lcc_pipeline::finish::prophoto_matrices();
-        p.b("PPCURVES", true);
+        p.b("PPCURVES", fp.curves_pp.is_some());
+        p.b("LEVELS_PP", levels_pp);
         p.u("PPCURVE_OFF", ppcurve_off as u32);
         p.fs("PP_M", to_pp.as_flattened());
         p.fs("PP_INV", from_pp.as_flattened());
@@ -528,6 +569,22 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         }
         p.f("PRIM_LOW", pr.low);
         p.f("PRIM_HIGH", pr.high);
+    }
+    if let Some(lv) = &fp.levels {
+        p.b("LEVELS", true);
+        let stages = [
+            ("LEVELS_M", "LEVELS_OFF_M", &lv.master),
+            ("LEVELS_R", "LEVELS_OFF_R", &lv.channels[0]),
+            ("LEVELS_G", "LEVELS_OFF_G", &lv.channels[1]),
+            ("LEVELS_B", "LEVELS_OFF_B", &lv.channels[2]),
+        ];
+        for (slot, (name, off, st)) in stages.into_iter().enumerate() {
+            if let Some(k) = st {
+                let (s0, s1, has) = k.mid.as_ref().map_or((1.0, 1.0, 0.0), |m| (m.s0, m.s1, 1.0));
+                p.fs(name, &[1.0, k.black, k.inv_range, k.out_black, k.span, s0, s1, has]);
+                p.u(off, levels_off.get(slot).copied().unwrap_or(0));
+            }
+        }
     }
     if let Some(hsl) = &ops.hsl {
         p.b("HSL", true);
@@ -637,6 +694,11 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
         p.u("NEGEV_GAPS", lcc_pipeline::negev_lift::GAPS as u32);
         p.f("NEGEV_GAP_STEP", lcc_pipeline::negev_lift::GAP_STEP);
     }
+    if let Some(rc) = &fp.rgb_contrast {
+        p.b("RGB_CONTRAST", true);
+        p.u("RGB_CONTRAST_OFF", rgb_contrast_off as u32);
+        p.f("RGB_CONTRAST_ZERO", rc.zero());
+    }
     let grain_on = fp.grain.is_some() || fp.particles.is_some();
     if let Some((amt, cell, rough, seed)) = fp.grain {
         p.f("GRAIN_AMT", amt);
@@ -689,3 +751,6 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     }
     (p.0, aux)
 }
+
+// the kernel's `MIDTONE_N` (finish.wgsl) is the number of samples of a midtone table
+const _: () = assert!(lcc_develop::levels_curve::MIDTONE_SAMPLES == 257);

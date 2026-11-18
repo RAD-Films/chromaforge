@@ -21,6 +21,22 @@ fn tone_apply(y: f32) -> f32 {
     return v;
 }
 
+fn rgb_contrast_apply(v: f32, base: u32, zero: f32, peak: f32) -> f32 {
+    if (v <= 0.0) {
+        return zero;
+    }
+    if (v >= peak) {
+        return aux[base + RGB_CONTRAST_N - 1u] + (v - peak);
+    }
+    let u = sqrt(v / peak);
+    let f = u * f32(RGB_CONTRAST_N - 1u);
+    let i = min(u32(f), RGB_CONTRAST_N - 2u);
+    let t = f - f32(i);
+    let a = aux[base + i];
+    let b = aux[base + i + 1u];
+    return a + (b - a) * t;
+}
+
 // The camera chroma curve follows the tone LUT in `aux` (`ToneMap::chroma_scale`).
 fn chroma_scale(o: f32) -> f32 {
     let f = clamp(o, 0.0, 1.0) * f32(CHROMA_N - 1u);
@@ -256,20 +272,27 @@ fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
         let c = clamp(q, vec3<f32>(0.0), vec3<f32>(1.0));
         e0 = vec3<f32>(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
     }
-    let hi = max(e0.x, max(e0.y, e0.z));
-    let lo = min(e0.x, min(e0.y, e0.z));
-    let fhi = lut_hdr(o, hi, hdr);
-    let flo = lut_hdr(o, lo, hdr);
-    var k: vec3<f32>;
-    if (hi - lo <= 1e-7) {
-        k = vec3<f32>(fhi);
-    } else {
-        k = vec3<f32>(flo) + (e0 - vec3<f32>(lo)) * ((fhi - flo) / (hi - lo));
+    // process V9's Levels, just before the curves (`FinishParams::levels_pp`)
+    if (pu(F_LEVELS_PP) != 0u) {
+        e0 = levels3(e0, hdr);
     }
-    var e = vec3<f32>(lut_hdr(o + CURVE_N, k.x, hdr), lut_hdr(o + 2u * CURVE_N, k.y, hdr), lut_hdr(o + 3u * CURVE_N, k.z, hdr));
-    let rs = pf(F_REFINE_SAT);
-    if (rs < 1.0) {
-        e = refine_saturation(e0, e, rs);
+    var e = e0;
+    if (pu(F_PPCURVES) != 0u) {
+        let hi = max(e0.x, max(e0.y, e0.z));
+        let lo = min(e0.x, min(e0.y, e0.z));
+        let fhi = lut_hdr(o, hi, hdr);
+        let flo = lut_hdr(o, lo, hdr);
+        var k: vec3<f32>;
+        if (hi - lo <= 1e-7) {
+            k = vec3<f32>(fhi);
+        } else {
+            k = vec3<f32>(flo) + (e0 - vec3<f32>(lo)) * ((fhi - flo) / (hi - lo));
+        }
+        e = vec3<f32>(lut_hdr(o + CURVE_N, k.x, hdr), lut_hdr(o + 2u * CURVE_N, k.y, hdr), lut_hdr(o + 3u * CURVE_N, k.z, hdr));
+        let rs = pf(F_REFINE_SAT);
+        if (rs < 1.0) {
+            e = refine_saturation(e0, e, rs);
+        }
     }
     var l: vec3<f32>;
     for (var c = 0u; c < 3u; c++) {
@@ -281,6 +304,48 @@ fn curves_in_prophoto(d: vec3<f32>, hdr: bool) -> vec3<f32> {
         }
     }
     return mul3(mat_at(F_PP_INV), l);
+}
+
+// `levels::StageK::eval` on one value: the stage record at word `o` of the parameters (active, black, 1/range,
+// out black, span, slope at 0, slope at 1, has a midtone table) and the table's place `off` in `aux`. The stretch is not
+// limited: the midtone curve (its samples, then its end slopes beyond 0 and 1) runs on, and the result is limited below
+// at 0, and above at 1 unless the render is HDR.
+const MIDTONE_N: u32 = 257u;
+fn levels_stage(o: u32, off: u32, x: f32, hdr: bool) -> f32 {
+    if (pf(o) == 0.0) {
+        return x;
+    }
+    let t = (x - pf(o + 1u)) * pf(o + 2u);
+    var g = t;
+    if (pf(o + 7u) != 0.0) {
+        if (t <= 0.0) {
+            g = pf(o + 5u) * t;
+        } else if (t >= 1.0) {
+            g = 1.0 + pf(o + 6u) * (t - 1.0);
+        } else {
+            let f = t * f32(MIDTONE_N - 1u);
+            let i = min(u32(f), MIDTONE_N - 2u);
+            g = aux[off + i] + (aux[off + i + 1u] - aux[off + i]) * (f - f32(i));
+        }
+    }
+    var y = max(pf(o + 3u) + pf(o + 4u) * g, 0.0);
+    if (!hdr) {
+        y = min(y, 1.0);
+    }
+    return y;
+}
+
+
+// `levels::LevelsK::apply`: each channel's stage, then the master's.
+fn levels3(e: vec3<f32>, hdr: bool) -> vec3<f32> {
+    let c = vec3<f32>(
+        levels_stage(F_LEVELS_R, pu(F_LEVELS_OFF_R), e.x, hdr),
+        levels_stage(F_LEVELS_G, pu(F_LEVELS_OFF_G), e.y, hdr),
+        levels_stage(F_LEVELS_B, pu(F_LEVELS_OFF_B), e.z, hdr));
+    return vec3<f32>(
+        levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.x, hdr),
+        levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.y, hdr),
+        levels_stage(F_LEVELS_M, pu(F_LEVELS_OFF_M), c.z, hdr));
 }
 
 // The exact sRGB curve (`lcc_color::transfer`), unbounded above 1 as HDR renders encode.
@@ -1421,7 +1486,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // --- process V9's Tone Curve, before the output transform (the same picture in every export space)
-    if (pu(F_PPCURVES) != 0u) {
+    if (pu(F_PPCURVES) != 0u || pu(F_LEVELS_PP) != 0u) {
         d = curves_in_prophoto(d, hdr);
     }
 
@@ -1462,6 +1527,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         e = vec3<f32>(lin_to_srgb(q.x), lin_to_srgb(q.y), lin_to_srgb(q.z));
     } else {
         e = vec3<f32>(encode_srgb(r.x), encode_srgb(r.y), encode_srgb(r.z));
+    }
+    // --- Levels: each channel's own stage first, then the master's (one call site, as `finish_with`)
+    if (pu(F_LEVELS) != 0u && pu(F_LEVELS_PP) == 0u) {
+        e = levels3(e, hdr);
     }
     if (pu(F_CURVES) != 0u) {
         let e0 = e;
@@ -1646,6 +1715,17 @@ fn tone_map(c: vec3<f32>) -> vec3<f32> {
         }
     }
     let peak = pf(F_PEAK);
+    // Contrast Mode RGB (issue #839): Contrast and Blacks on each channel of the toned colour
+    if (pu(F_RGB_CONTRAST) != 0u) {
+        let rc_base = pu(F_RGB_CONTRAST_OFF);
+        let rc_zero = pf(F_RGB_CONTRAST_ZERO);
+        d = vec3<f32>(
+            rgb_contrast_apply(d.x, rc_base, rc_zero, peak),
+            rgb_contrast_apply(d.y, rc_base, rc_zero, peak),
+            rgb_contrast_apply(d.z, rc_base, rc_zero, peak),
+        );
+        o = rgb_contrast_apply(o, rc_base, rc_zero, peak);
+    }
     if (pu(F_TOP_SHOULDER) != 0u) {
         let moved = top_shoulder(d, c, o, peak);
         d = hold_lightness(over_range(d, o, peak), over_range(moved, lum2020(moved), peak), max(c.x, max(c.y, c.z)));

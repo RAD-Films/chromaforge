@@ -60,9 +60,11 @@ use lcc_raw::{
 /// 25: fitted tone curves no steeper than a log-log slope of 4 between knots (upstream #1904 / #2656).
 /// 26: a Sony "12-bit uncompressed" ARW takes the 14-bit scale from its word layout, not its brightest sample, so a
 /// dark frame is no longer fitted on the wrong black and white levels (upstream #3429).
+/// 27 to 30: no fit change. Working builds of process V9 used 27; 30 (with main of 18 Nov 2026 merged in) makes every
+/// smart preview written by an earlier build fit again.
 ///
-/// 23 to 26 are process V9's: a photo on V1 to V8 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
-pub const LOOK_VERSION: u32 = 26;
+/// 23 to 30 are process V9's: a photo on V1 to V8 keeps the fit of 22 ([`FitGen`]), so a saved edit never changes.
+pub const LOOK_VERSION: u32 = 30;
 
 /// The fit of [`LOOK_VERSION`] 22, the last one processes V1 to V8 had.
 pub const LOOK_VERSION_V8: u32 = 22;
@@ -4253,23 +4255,15 @@ mod tests {
     }
 
     #[test]
-    fn corpus_a7cr_uses_the_bundled_profile() {
-        corpus_uses_the_bundled_profile("arw-sony-a7cr-lossless-l.arw", "ILCE-7CR");
-    }
-
-    #[test]
-    fn corpus_d780_uses_the_bundled_profile() {
-        corpus_uses_the_bundled_profile("nef-nikon-d780.nef", "NIKON D780");
-    }
-
-    #[test]
-    fn corpus_d750_uses_the_bundled_profile() {
-        corpus_uses_the_bundled_profile("nef-nikon-d750.nef", "NIKON D750");
-    }
-
-    #[test]
-    fn corpus_d90_uses_the_bundled_profile() {
-        corpus_uses_the_bundled_profile("nef-nikon-d90.nef", "NIKON D90");
+    fn corpus_raws_use_their_bundled_profiles() {
+        for (file, model) in [
+            ("arw-sony-a7cr-lossless-l.arw", "ILCE-7CR"),
+            ("nef-nikon-d780.nef", "NIKON D780"),
+            ("nef-nikon-d750.nef", "NIKON D750"),
+            ("nef-nikon-d90.nef", "NIKON D90"),
+        ] {
+            corpus_uses_the_bundled_profile(file, model);
+        }
     }
     /// A public DC-FZ1000 II RW2 shot at 4:3 on its 3:2 sensor (skipped without the corpus): the default crop is 4:3
     /// while the embedded JPEG shows the whole sensor; the look is still fitted, against the matching part of it.

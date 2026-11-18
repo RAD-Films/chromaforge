@@ -57,7 +57,10 @@ fn edits() -> Vec<(&'static str, DevelopSettings)> {
         ("zero", d()),
         (
             "basic",
-            DevelopSettings { light: Light { exposure: 0.6, contrast: 45.0, highlights: -85.0, shadows: 17.0, whites: 19.0, blacks: 9.0 }, ..d() },
+            DevelopSettings {
+                light: Light { exposure: 0.6, contrast: 45.0, highlights: -85.0, shadows: 17.0, whites: 19.0, blacks: 9.0, ..Light::default() },
+                ..d()
+            },
         ),
         ("sh-up", DevelopSettings { light: Light { shadows: -60.0, highlights: 80.0, ..l() }, ..d() }),
         ("regions", DevelopSettings { curve: ToneCurve { shadows: 40.0, darks: -100.0, lights: 100.0, highlights: -50.0, ..c() }, ..d() }),
