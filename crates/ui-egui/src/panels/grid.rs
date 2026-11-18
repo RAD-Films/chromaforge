@@ -2048,13 +2048,29 @@ pub fn context_menu(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
     if ui.add_enabled(app.session.clipboard.is_some(), egui::Button::new(crate::i18n::tr("Paste Edit Settings"))).clicked() {
         let _ = app.run("develop.paste", json!({}));
     }
-    crate::widgets::menu_button(ui, crate::i18n::tr("Develop Settings"), |ui| {
+    let develop = crate::widgets::menu_button(ui, crate::i18n::tr("Develop Settings"), |ui| {
         if ui.add_enabled(app.session.clipboard.is_some(), egui::Button::new(crate::i18n::tr("Paste Selected Settings…"))).clicked() {
             let _ = app.run("dialog.pasteSettings", json!({}));
         }
         if ui.button(crate::i18n::tr("Reset Edits")).clicked() {
             let _ = app.run("develop.reset", json!({}));
         }
+        ui.separator();
+        // as in Photo ▸ Develop Settings, on every selected photo (each from its own pixels) as one
+        // undo step
+        for (label, wid, params) in [
+            ("Auto White Balance", "button:contextAutoWhiteBalance", json!({"wb": "auto"})),
+            ("Auto Settings", "button:contextAutoSettings", json!({"autoTone": true})),
+        ] {
+            let b = ui.button(crate::i18n::tr(label));
+            register(ui.ctx(), wid, b.rect);
+            if b.clicked()
+                && let Err(e) = app.run("develop.quickSet", params)
+            {
+                app.toast(ui.ctx(), e);
+            }
+        }
+        ui.separator();
         let live = super::compare::live(app, id);
         let set_reference = ui
             .add_enabled(live, egui::Button::new(crate::i18n::tr("Set as Reference Photo")))
@@ -2065,6 +2081,7 @@ pub fn context_menu(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
             app.toast(ui.ctx(), e);
         }
     });
+    register(ui.ctx(), "button:contextDevelopSettings", develop.response.rect);
     crate::widgets::menu_button(ui, crate::i18n::tr("Photo Merge"), |ui| {
         let n = app.session.selected().len();
         for (id, label) in [

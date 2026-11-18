@@ -2629,6 +2629,56 @@ fn local_photos_cannot_be_added_to_albums_until_they_join_my_photos() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Right-click ▸ Develop Settings offers Auto White Balance and Auto Settings, as Photo ▸ Develop
+/// Settings does: each acts on every selected photo, each photo worked out from its own pixels, as
+/// one undo step.
+#[test]
+fn right_click_develop_settings_runs_auto_on_every_selected_photo_in_one_step() {
+    let mut h = demo([1400.0, 900.0], json!({"view": "photoGrid", "leftPanel": true}));
+    let ids: Vec<lcc_catalog::PhotoId> = h.app.session.visible_cloned().into_iter().take(3).collect();
+    h.app.run("library.select", json!({"ids": ids.iter().map(|i| i.0).collect::<Vec<_>>()})).unwrap();
+    h.settle(SETTLE);
+    let settings = |h: &Headless| ids.iter().map(|id| (*h.app.session.develop_of(*id).unwrap_or_default()).clone()).collect::<Vec<_>>();
+    let before = settings(&h);
+    let menu_item = |h: &mut Headless, item: &str| {
+        let thumb = widget(h, &format!("thumb:{}", ids[1].0));
+        let r = h.request("ui.click", json!({"x": thumb.center().x, "y": thumb.center().y, "button": "right"}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        let r = h.request("ui.hoverWidget", json!({"id": "button:contextDevelopSettings"}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        let r = h.request("ui.clickWidget", json!({"id": item}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+    };
+
+    let undo = h.app.session.undo.len();
+    menu_item(&mut h, "button:contextAutoWhiteBalance");
+    assert_eq!(h.app.session.selection.ids.len(), 3, "right-clicking a selected photo keeps the selection");
+    for (i, d) in settings(&h).iter().enumerate() {
+        assert_eq!(d.wb.mode, lcc_develop::WbMode::Auto, "photo {i}");
+    }
+    assert_eq!(h.app.session.undo.len(), undo + 1, "one undo step");
+
+    menu_item(&mut h, "button:contextAutoSettings");
+    let auto = settings(&h);
+    for (i, (a, b)) in auto.iter().zip(&before).enumerate() {
+        assert_ne!(a.light, b.light, "photo {i}: Auto set its tone");
+    }
+    assert_eq!(h.app.session.undo.len(), undo + 2, "one undo step");
+
+    // one undo takes Auto Settings off all three, the next the white balance
+    h.app.run("edit.undo", json!({})).unwrap();
+    h.app.run("edit.undo", json!({})).unwrap();
+    h.settle(SETTLE);
+    for (i, (a, b)) in settings(&h).iter().zip(&before).enumerate() {
+        assert_eq!((&a.light, a.wb.mode), (&b.light, b.wb.mode), "photo {i}: back as it was");
+    }
+}
+
 /// Issue #676: right-click ▸ Add to Album offers New Album… like the Photo menu does, also when
 /// the library has no album yet (the submenu used to come up empty); the new album holds the photo.
 #[test]
