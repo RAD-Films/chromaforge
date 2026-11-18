@@ -490,6 +490,9 @@ impl ToneMap {
         // Neutral sliders are the identity up to white (issue #1945): the SDR shoulder below would
         // pull 1.0 down to 0.9875 (8-bit 255 to 254), so it only shapes an edited curve.
         let neutral = c == 0.0 && w == 0.0 && b == 0.0;
+        // V9: a negative Blacks follows Lightroom Classic's measured response ([`lrc_blacks_down`]); the older
+        // table below scales its −100 shape with the amount, so −25 reached as far up the tones as a quarter of −100
+        let (b_table, b_lrc) = if lrc && b < 0.0 { (0.0, blacks) } else { (b, 0.0) };
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
@@ -499,9 +502,9 @@ impl ToneMap {
                     // S-curve anchored at 0, grey and 1 (V9: Lightroom's, pivoting a third of a stop higher)
                     p = if lrc { lrc_contrast(p, c) } else { p + c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2)) };
                     // whites and blacks: broad tonal responses fitted to Lightroom's
-                    p += w_b_shift(p, w, b);
+                    p += w_b_shift(p, w, b_table) + lrc_blacks_down(p, b_lrc);
                 } else {
-                    p += w_b_shift(p, w, b);
+                    p += w_b_shift(p, w, b_table);
                 }
                 let mut o = p.max(0.0).powf(2.2);
                 // short shoulder (SDR, edited curves): slope 1 at 0.95, reaching 1.0 at 1.05
@@ -734,6 +737,21 @@ fn lrc_w_b(p: f32, w: f64, b: f64) -> f32 {
         }
     };
     (p as f64 + shift(0, w) + shift(1, b)) as f32
+}
+
+/// Shift of display value `p` (gamma 2.2, 0..1) by Lightroom Classic's negative Blacks `b` (−100..0) on a raw, process
+/// V9: the response measured on our grey wedge ([`lrc_tables::WB_SHIFT`], as [`ToneMap::display_lrc`] applies it to a
+/// JPEG or TIFF). On Lightroom Classic exports of 63 of our own Canon EOS R5 C raws (rounds 7, 8 and 9b, Blacks −100,
+/// 18 Nov 2026) the raw response at −100 is one curve for every frame (its tone curve explains 97 % of the per-pixel
+/// shift; a frame's surroundings under 1 %), and the wedge's −100 lies within 1.8 L* of it at every tone. The amount
+/// changes the shape: at −50 Lightroom crushes the deepest tones and moves L* 30–50 by 3–5, where a −100 shape scaled
+/// by half moved them by 9–12. 0 or above: no shift.
+fn lrc_blacks_down(p: f32, b: f64) -> f32 {
+    if b.is_nan() || b >= 0.0 {
+        return 0.0;
+    }
+    let p = p.clamp(0.0, 1.0);
+    lrc_w_b(p, 0.0, b.max(-100.0)) - p
 }
 
 /// Running maximum: strong Whites lift the upper tones past white, which must not fold back.
@@ -1116,6 +1134,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Process V9's raw tone ([`ToneMap::lrc_default`]): the display value (gamma 2.2) of the scene tone shown at `p0`
+    /// with Blacks 0, after Blacks `b`.
+    fn raw_blacks(p0: f32, b: f64) -> f32 {
+        let base = ToneMap::lrc_default(0.0, 0.0, 0.0, 1.0);
+        let edited = ToneMap::lrc_default(0.0, 0.0, b, 1.0);
+        let target = p0.powf(2.2);
+        let (mut lo, mut hi) = (1e-7f32, 256.0f32);
+        for _ in 0..80 {
+            let mid = (lo * hi).sqrt();
+            if base.apply(mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        edited.apply((lo * hi).sqrt()).max(0.0).powf(1.0 / 2.2)
+    }
+
+    /// A raw's negative Blacks under V9 follows Lightroom Classic's measured amounts (issue #1120): −100 its raw curve,
+    /// −50 the wedge's, −25 half of that; the old shape (the −100 table scaled by the amount) moved the shadows at −50
+    /// by about 2.5 times as much. A positive Blacks keeps its table.
+    #[test]
+    fn v9_raw_blacks_follow_lightroom_classics_amounts() {
+        // Lightroom Classic's raw Blacks −100: median shift over 63 Canon EOS R5 C frames (rounds 7, 8, 9b)
+        let raw_m100 = [
+            (0.25, -0.191),
+            (0.30, -0.183),
+            (0.35, -0.169),
+            (0.40, -0.155),
+            (0.45, -0.142),
+            (0.50, -0.131),
+            (0.60, -0.103),
+            (0.70, -0.068),
+            (0.80, -0.038),
+            (0.90, -0.015),
+        ];
+        // in L*: next to black a small difference of display value is no visible difference
+        let l = |p: f32| lstar(p.max(0.0).powf(2.2));
+        for (p, want) in raw_m100 {
+            let got = raw_blacks(p, -100.0);
+            assert!((l(got) - l(p + want)).abs() < 2.0, "Blacks -100 at {p}: L* {} vs Lightroom {}", l(got), l(p + want));
+        }
+        for i in 1..23 {
+            let p = lrc_tables::WB_P[i];
+            let want = lrc_tables::WB_SHIFT[1][1][i];
+            let got = raw_blacks(p, -50.0) - p;
+            assert!((got - want).abs() < 0.006, "Blacks -50 at {p}: {got} vs Lightroom {want}");
+            let got = raw_blacks(p, -25.0) - p;
+            assert!((got - want / 2.0).abs() < 0.006, "Blacks -25 at {p}: {got} vs {}", want / 2.0);
+            let got = raw_blacks(p, 50.0) - p;
+            let old = 0.5 * wb_at(&BLACKS_UP, p);
+            assert!((got - old).abs() < 0.006, "Blacks +50 at {p}: {got}, its table {old}");
+        }
+        // the old shape at −50 in the shadows (patch 16, L* 36): proves the test can fail
+        let (p, want) = (lrc_tables::WB_P[16], lrc_tables::WB_SHIFT[1][1][16]);
+        assert!((0.5 * wb_at(&BLACKS_DOWN, p) - want).abs() > 0.04);
+        // V8's raw tone keeps the old shape
+        let v8 = |b: f64| ToneMap::display(0.0, 0.0, b).apply(p.powf(2.2)).powf(1.0 / 2.2);
+        assert!((v8(-50.0) - p - 0.5 * wb_at(&BLACKS_DOWN, p)).abs() < 0.006, "V8 at -50: {}", v8(-50.0) - p);
     }
 
     fn lstar(y: f32) -> f32 {
