@@ -260,6 +260,11 @@ pub struct Merged {
     /// didn't take them: the next import takes them, once).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_profiles: Option<usize>,
+    /// The camera bodies bound to those camera profiles (`None`: merged by a build that didn't keep
+    /// the bindings in the store, so they were gone at the next start: the next import binds them
+    /// once more, a body with a profile of its own keeping it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_bodies: Option<usize>,
 }
 
 /// `shared.json`.
@@ -311,7 +316,12 @@ pub(crate) struct Content {
     pub favorites: Vec<String>,
     pub profile_favorites: Vec<String>,
     pub profile_recent: Vec<String>,
+    /// Each camera body's camera profile (body key → profile id), kept in `presets.json`.
+    pub body_profiles: BTreeMap<String, String>,
 }
+
+/// Most camera bodies kept with a profile of their own.
+const MAX_BODY_PROFILES: usize = 10_000;
 
 impl Content {
     fn from_files(prefs: LibraryPrefs, presets: Option<PresetsFile>) -> Content {
@@ -328,6 +338,7 @@ impl Content {
             favorites: p.favorites,
             profile_favorites: p.profile_favorites,
             profile_recent: p.profile_recent,
+            body_profiles: p.body_profiles.into_iter().take(MAX_BODY_PROFILES).collect(),
         }
     }
 }
@@ -405,6 +416,16 @@ impl AppStore {
     /// Older install `store` was merged already, its camera profiles too.
     fn has_merged_cameras(&self, store: &Path) -> bool {
         self.merged.iter().any(|m| m.camera_profiles.is_some() && same_path(Path::new(&m.library), store))
+    }
+
+    /// Older install `store` was merged already, its camera profiles and their bodies too.
+    fn has_bound_cameras(&self, store: &Path) -> bool {
+        self.merged.iter().any(|m| m.camera_profiles.is_some() && m.camera_bodies.is_some() && same_path(Path::new(&m.library), store))
+    }
+
+    /// The merge record of `store` (a library or older install folder).
+    fn merged_mut(&mut self, store: &Path) -> Option<&mut Merged> {
+        self.merged.iter_mut().find(|m| same_path(Path::new(&m.library), store))
     }
 
     /// A store file, parsed; `None` when missing or damaged. A damaged file is kept as
@@ -918,6 +939,13 @@ pub(crate) fn merge_content(
     union(&mut recent, theirs.profile_recent, &remap);
     recent.truncate(crate::presets::RECENT_PROFILES);
     mine.profile_recent = recent;
+    // camera bodies: one the store has a profile for keeps it
+    for (body, id) in theirs.body_profiles {
+        if mine.body_profiles.len() >= MAX_BODY_PROFILES {
+            break;
+        }
+        mine.body_profiles.entry(body).or_insert(id);
+    }
     (report, remap)
 }
 
@@ -1002,6 +1030,7 @@ impl Session {
             favorites: presets.favorites,
             profile_favorites: presets.profile_favorites,
             profile_recent: presets.profile_recent,
+            body_profiles: presets.body_profiles.into_iter().take(MAX_BODY_PROFILES).collect(),
         }
     }
 
@@ -1021,6 +1050,7 @@ impl Session {
             favorites: self.presets.iter().filter(|p| p.builtin && p.favorite).map(|p| p.id.clone()).collect(),
             profile_favorites: self.profile_favorites.clone(),
             profile_recent: self.profile_recent.clone(),
+            body_profiles: self.body_profiles.clone(),
         }
     }
 
@@ -1118,6 +1148,8 @@ impl Session {
         let recent: Vec<String> = c.profile_recent.into_iter().filter(|id| known(self, id)).take(crate::presets::RECENT_PROFILES).collect();
         self.profile_favorites = favs;
         self.profile_recent = recent;
+        // (a profile id this build doesn't know is kept: the body's profile may be installed later)
+        self.body_profiles = c.body_profiles.into_iter().take(MAX_BODY_PROFILES).collect();
         self.refresh_view();
     }
 
@@ -1227,6 +1259,7 @@ impl Session {
             remap,
             remapped: false,
             camera_profiles: None,
+            camera_bodies: None,
         });
         for p in &r.problems {
             log::warn!("store: merging {}: {p}", dir.display());
@@ -1294,15 +1327,25 @@ impl Session {
             let mut r = MergeReport { library: dir.display().to_string(), ..Default::default() };
             if own.as_deref().is_some_and(|o| same_path(o, dir)) {
                 r.problems.push(format!("{} is this app's own store", dir.display()));
-            } else if !force && self.app_store.as_ref().is_some_and(|s| s.has_merged_cameras(dir)) {
+            } else if !force && self.app_store.as_ref().is_some_and(|s| s.has_bound_cameras(dir)) {
                 r.skipped = true;
+            } else if !force && self.app_store.as_ref().is_some_and(|s| s.has_merged_cameras(dir)) {
+                // merged by a build whose body bindings didn't last: the bindings only, once (to the
+                // profiles installed now; nothing is installed again)
+                let cams = crate::cmd::dcp_profiles::bind_older(self, dir, camera);
+                (r.camera_bodies, r.problems) = (cams.bound, cams.problems);
+                bound += cams.bound;
+                if let Some(m) = self.app_store.as_mut().and_then(|s| s.merged_mut(dir)) {
+                    m.camera_bodies = Some(cams.bound);
+                }
             } else if !force && self.app_store.as_ref().is_some_and(|s| s.has_merged(dir)) {
                 // merged by a build that left the camera profiles: those only, once
                 let cams = crate::cmd::dcp_profiles::import_older(self, dir, camera);
                 (r.camera_profiles, r.camera_already, r.camera_bodies, r.problems) = (cams.added, cams.already, cams.bound, cams.problems);
                 bound += cams.bound;
-                if let Some(m) = self.app_store.as_mut().and_then(|s| s.merged.iter_mut().find(|m| same_path(Path::new(&m.library), dir))) {
+                if let Some(m) = self.app_store.as_mut().and_then(|s| s.merged_mut(dir)) {
                     m.camera_profiles = Some(cams.added);
+                    m.camera_bodies = Some(cams.bound);
                 }
             } else if !is_store_folder(dir) {
                 r.problems.push(format!("{} holds no presets ({PRESETS} or {SHARED})", dir.display()));
@@ -1323,10 +1366,18 @@ impl Session {
                 self.record_merge(dir, &rr, remap);
                 if let Some(m) = self.app_store.as_mut().and_then(|s| s.merged.last_mut()) {
                     m.camera_profiles = Some(rr.camera_profiles);
+                    m.camera_bodies = Some(rr.camera_bodies);
                 }
                 r = rr;
             }
             out.push(r);
+        }
+        // the bodies bound above (`mine` was taken before): the session's, those of the older
+        // stores' presets.json where the session has none
+        for (body, id) in std::mem::take(&mut self.body_profiles) {
+            if mine.body_profiles.len() < MAX_BODY_PROFILES || mine.body_profiles.contains_key(&body) {
+                mine.body_profiles.insert(body, id);
+            }
         }
         self.set_content(mine);
         crate::profile_refs::refresh(self);

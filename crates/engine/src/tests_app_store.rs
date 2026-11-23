@@ -612,3 +612,142 @@ fn a_damaged_older_install_camera_profile_is_reported() {
     assert!(s.body_profiles.is_empty(), "an over-long body isn't kept");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The two camera profiles of an older install's store, each the default of one camera body
+/// (`bodyDefaults`, as the older install writes them), one also listing its body in `bodies`.
+fn older_bodies_store(older: &Path, a: &[u8], b: &[u8]) {
+    older_camera_store(
+        older,
+        &[("canon-eos-r5-c-071-r5-c.dcp", a.to_vec()), ("canon-eos-r5-c-074-r5-c.dcp", b.to_vec())],
+        json!([
+            {"id": "dcp:canon-eos-r5-c-071-r5-c", "name": "071 R5 C", "cameraModel": "Canon EOS R5 C",
+             "file": "C:/gone/Library Store/Profiles/canon-eos-r5-c-071-r5-c.dcp", "bodyDefaults": ["653499300171"]},
+            {"id": "dcp:canon-eos-r5-c-074-r5-c", "name": "074 R5 C", "cameraModel": "Canon EOS R5 C",
+             "file": "C:/gone/Library Store/Profiles/canon-eos-r5-c-074-r5-c.dcp", "bodies": ["653499300174"], "bodyDefaults": ["653499300174"]},
+        ]),
+    );
+}
+
+fn stored_bodies(store: &Path) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(store.join("presets.json")).unwrap()).unwrap();
+    v.get("bodyProfiles").cloned().unwrap_or(serde_json::Value::Null)
+}
+
+/// An older install's camera bodies come over even when every one of its profiles is installed
+/// already (nothing new to add), and they are still there after a restart: the store keeps them in
+/// its presets.json and reads them back (a build that only wrote them lost them at the next start).
+#[test]
+fn older_install_body_bindings_carry_over_with_profiles_already_installed_and_last() {
+    let _reg = Registries::hold();
+    let root = temp("older-dcp-bodies");
+    let (store, lib, older) = (root.join("store"), root.join("lib"), root.join("Earlier").join(crate::app_store::DIR_NAME));
+    let (active, library) = camera_dirs(&root);
+    std::fs::create_dir_all(&library).unwrap();
+    let (a, b) = (tiny_dcp("Canon EOS R5 C", "071 R5 C", 0.0), tiny_dcp("Canon EOS R5 C", "074 R5 C", 0.02));
+    // installed already (by an earlier Import Profiles & Presets…), under the same names
+    std::fs::write(library.join("canon-eos-r5-c-071-r5-c.dcp"), &a).unwrap();
+    std::fs::write(library.join("canon-eos-r5-c-074-r5-c.dcp"), &b).unwrap();
+    older_bodies_store(&older, &a, &b);
+    let mut s = with_store(&store, &lib);
+    let r = s.merge_older_installs_in(std::slice::from_ref(&older), false, Some((&active, &library))).unwrap();
+    assert_eq!((r[0].camera_profiles, r[0].camera_already.len(), r[0].camera_bodies), (0, 2, 2), "{r:?}");
+    let want = json!({"Canon EOS R5 C|653499300171": "dcp:canon-eos-r5-c-071-r5-c", "Canon EOS R5 C|653499300174": "dcp:canon-eos-r5-c-074-r5-c"});
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want);
+    assert_eq!(stored_bodies(&store), want, "the store's presets.json keeps them");
+    assert_eq!(dcps_in(&library).len(), 2, "nothing installed twice");
+    drop(s);
+    // the next start: the library has no bindings of its own; the store's are the session's, and
+    // saving keeps them
+    let mut s = with_store(&store, &lib);
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want, "the bindings last a restart");
+    s.save_prefs().unwrap();
+    assert_eq!(stored_bodies(&store), want);
+    // another library opened with the same store: the same bodies
+    drop(s);
+    let s = with_store(&store, &root.join("lib2"));
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A store merged by a build whose body bindings didn't last (its record has the camera profiles but
+/// no camera bodies) gets the bindings once more at the next import, and only those: no preset is
+/// merged again, no profile installed again (one removed since stays removed), and a body given a
+/// profile of its own since keeps it.
+#[test]
+fn a_store_merged_before_gets_its_older_installs_body_bindings_once_more() {
+    let _reg = Registries::hold();
+    let root = temp("older-dcp-rebind");
+    let (store, lib, older) = (root.join("store"), root.join("lib"), root.join("Earlier").join(crate::app_store::DIR_NAME));
+    let (active, library) = camera_dirs(&root);
+    std::fs::create_dir_all(&library).unwrap();
+    let (a, b) = (tiny_dcp("Canon EOS R5 C", "071 R5 C", 0.0), tiny_dcp("Canon EOS R5 C", "074 R5 C", 0.02));
+    std::fs::write(library.join("canon-eos-r5-c-071-r5-c.dcp"), &a).unwrap();
+    std::fs::write(library.join("canon-eos-r5-c-074-r5-c.dcp"), &b).unwrap();
+    // a third the older install had, removed from this library since
+    let gone = tiny_dcp("Canon EOS R6", "Removed", 0.04);
+    older_bodies_store(&older, &a, &b);
+    std::fs::write(older.join("Profiles").join("canon-eos-r6-removed.dcp"), &gone).unwrap();
+    let mut shared: serde_json::Value = serde_json::from_slice(&std::fs::read(older.join("shared.json")).unwrap()).unwrap();
+    shared["dcpProfiles"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"file": "canon-eos-r6-removed.dcp", "cameraModel": "Canon EOS R6", "bodyDefaults": ["9"]}));
+    std::fs::write(older.join("shared.json"), serde_json::to_vec(&shared).unwrap()).unwrap();
+    // a preset of the older install: merged before (the store has it as the user left it: deleted)
+    std::fs::write(older.join("presets.json"), serde_json::to_vec(&json!({"user": [user_preset("older-warm", "Older Warm")]})).unwrap()).unwrap();
+    // the store as that build left it: the older install recorded with its camera profiles and no
+    // bodies, and a body the user gave a profile of their own since
+    std::fs::create_dir_all(&store).unwrap();
+    let merged = json!({"version": 1, "merged": [{"library": older.display().to_string(), "at": "2026-11-09T18:27:25+10:00", "presets": 0, "profiles": 0, "effects": 0, "cameraProfiles": 0}]});
+    std::fs::write(store.join("shared.json"), serde_json::to_vec(&merged).unwrap()).unwrap();
+    let presets = json!({"user": [], "folders": [], "favorites": [], "profileFavorites": [], "profileRecent": [],
+                         "bodyProfiles": {"Canon EOS R5 C|653499300171": "dcp:my-own-071"}});
+    std::fs::write(store.join("presets.json"), serde_json::to_vec(&presets).unwrap()).unwrap();
+    let mut s = with_store(&store, &lib);
+    let presets_before = s.presets.len();
+    let r = s.merge_older_installs_in(std::slice::from_ref(&older), false, Some((&active, &library))).unwrap();
+    assert!(!r[0].skipped, "{r:?}");
+    assert_eq!((r[0].presets, r[0].camera_profiles, r[0].camera_bodies), (0, 0, 1), "the bindings only: {r:?}");
+    assert_eq!(s.presets.len(), presets_before, "no preset merged again");
+    assert!(!s.presets.iter().any(|p| p.id == "older-warm"));
+    assert_eq!(dcps_in(&library).len(), 2, "nothing installed again");
+    let want = json!({"Canon EOS R5 C|653499300171": "dcp:my-own-071", "Canon EOS R5 C|653499300174": "dcp:canon-eos-r5-c-074-r5-c"});
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want, "the user's own choice is kept");
+    let rec = s.app_store.as_ref().unwrap().merged.iter().find(|m| crate::app_store::same_path(Path::new(&m.library), &older)).cloned().unwrap();
+    assert_eq!((rec.camera_profiles, rec.camera_bodies), (Some(0), Some(1)), "{rec:?}");
+    // once: the next start's import skips the folder, and the bindings are still there
+    drop(s);
+    let mut s = with_store(&store, &lib);
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want);
+    let r = s.merge_older_installs_in(std::slice::from_ref(&older), false, Some((&active, &library))).unwrap();
+    assert!(r[0].skipped, "{r:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A library's own camera bodies join the store the first time it is merged (a body the store has a
+/// profile for keeps the store's); later, the store's are the ones used.
+#[test]
+fn a_librarys_own_body_profiles_join_the_store_once() {
+    let root = temp("lib-bodies");
+    let (store, lib) = (root.join("store"), root.join("lib"));
+    {
+        let mut s = own(&lib);
+        s.body_profiles.insert("ILCE-9|1".into(), "dcp:lib-one".into());
+        s.body_profiles.insert("ILCE-9|2".into(), "dcp:lib-two".into());
+        s.save_prefs().unwrap();
+        s.persist().unwrap();
+    }
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("presets.json"), serde_json::to_vec(&json!({"bodyProfiles": {"ILCE-9|1": "dcp:store-one"}})).unwrap()).unwrap();
+    let mut s = with_store(&store, &lib);
+    let want = json!({"ILCE-9|1": "dcp:store-one", "ILCE-9|2": "dcp:lib-two"});
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), want);
+    assert_eq!(stored_bodies(&store), want);
+    // released in the store: the library's old copy doesn't bring it back
+    s.body_profiles.remove("ILCE-9|2");
+    s.save_prefs().unwrap();
+    drop(s);
+    let s = with_store(&store, &lib);
+    assert_eq!(serde_json::to_value(&s.body_profiles).unwrap(), json!({"ILCE-9|1": "dcp:store-one"}));
+    let _ = std::fs::remove_dir_all(&root);
+}
