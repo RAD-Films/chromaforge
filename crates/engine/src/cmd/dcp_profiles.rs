@@ -150,6 +150,17 @@ fn same_words(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+/// Profile `d` (`bytes`) and a profile (`b`, its UniqueCameraModel `model` and ProfileName `pname`)
+/// are the same: the same bytes, or the same camera and ProfileName.
+fn same_profile(bytes: &[u8], d: &lcc_raw::dcp::Dcp, b: &[u8], model: &str, pname: &str) -> bool {
+    b == bytes || (!d.name.trim().is_empty() && same_words(model, &d.model) && same_words(pname, &d.name))
+}
+
+/// The id of the profile of library `have` ([`library_files`]) that is profile `d` (`bytes`).
+fn installed_as<'a>(have: &'a [(String, Vec<u8>, String, String)], bytes: &[u8], d: &lcc_raw::dcp::Dcp) -> Option<&'a str> {
+    have.iter().find(|(_, b, model, pname)| same_profile(bytes, d, b, model, pname)).map(|(id, ..)| id.as_str())
+}
+
 /// Install camera profiles `files` (`(file name, bytes)`) into the library `how` names: the path of
 /// `camera.importDcp`, Import Profiles & Presets… and the older installs' import. `failed` are the
 /// files that couldn't be read; one that doesn't parse joins them.
@@ -161,13 +172,11 @@ pub(crate) fn install_in(c: &str, files: Vec<(String, Vec<u8>)>, mut failed: Vec
     for (name, bytes) in files {
         match lcc_raw::dcp::parse(&bytes) {
             Ok(d) => {
-                let same = |b: &[u8], model: &str, pname: &str| {
-                    b == bytes.as_slice() || (!d.name.trim().is_empty() && same_words(model, &d.model) && same_words(pname, &d.name))
-                };
-                if let Some((id, ..)) = have.iter().find(|(_, b, model, pname)| same(b, model, pname)) {
-                    done.already.push((name.clone(), id.clone()));
-                    done.ids.push((name, id.clone()));
-                } else if let Some((first, ..)) = parsed.iter().find(|(_, q, b)| how.keep_existing && same(b, &q.model, &q.name)) {
+                if let Some(id) = installed_as(&have, &bytes, &d) {
+                    done.already.push((name.clone(), id.to_string()));
+                    done.ids.push((name, id.to_string()));
+                } else if let Some((first, ..)) = parsed.iter().find(|(_, q, b)| how.keep_existing && same_profile(&bytes, &d, b, &q.model, &q.name))
+                {
                     // the same profile twice in one batch: once (its bindings follow the first's)
                     twice.push((name, first.clone()));
                 } else {
@@ -302,17 +311,10 @@ fn refresh_installed(active_dir: &Path, library: &Path) {
     lcc_raw::dcp::install(active);
 }
 
-/// The camera profiles of an older install's store folder `store` (the `.dcp` files of its
-/// `Profiles/`, with the camera bodies its `shared.json` bound them to) installed the way Import
-/// Profiles & Presets… installs them ([`install_in`]): a profile the library has already (the same
-/// bytes, or the same camera and ProfileName) is named in `already`, one that doesn't read in
-/// `problems`. A body the older install started with one of them starts with it here too, unless it
-/// has a profile of its own already; a lone profile for a camera with none becomes the camera's
-/// default. Available at once. `camera`: the camera-profiles folder and its library (`None`: this
-/// computer's). The older folder is only read.
-pub(crate) fn import_older(s: &mut Session, store: &Path, camera: Option<(&Path, &Path)>) -> OlderProfiles {
-    const C: &str = "store.importOlderInstalls";
-    let mut out = OlderProfiles::default();
+/// What an older install's store folder `store` lists of its camera profiles: its `shared.json`
+/// entries and the `.dcp` files of its `Profiles/` (`(file name, bytes)`, those that couldn't be
+/// read in `failed`). Problems go to `out`. Only read.
+fn read_older(store: &Path, out: &mut OlderProfiles) -> (Vec<OlderDcp>, Vec<(String, Vec<u8>)>, Vec<Value>) {
     // the bodies the older store bound its profiles to
     let shared_file = store.join(crate::app_store::SHARED);
     let shared: Value =
@@ -328,11 +330,10 @@ pub(crate) fn import_older(s: &mut Session, store: &Path, camera: Option<(&Path,
     if unread > 0 {
         out.problems.push(format!("dcpProfiles: {unread} camera profile entr{} couldn't be read; left out", if unread == 1 { "y" } else { "ies" }));
     }
-    let file_name = |f: &str| Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let dir = store.join(crate::app_store::PROFILES_DIR);
     let paths = dcp_files_in(&dir);
     for e in &listed {
-        let name = file_name(&e.file);
+        let name = older_file_name(&e.file);
         if !name.is_empty()
             && name.to_ascii_lowercase().ends_with(".dcp")
             && !paths.iter().any(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == name))
@@ -340,58 +341,32 @@ pub(crate) fn import_older(s: &mut Session, store: &Path, camera: Option<(&Path,
             out.problems.push(format!("{name}: the camera profile file is missing; left out"));
         }
     }
-    if paths.is_empty() {
-        return out;
-    }
     let mut files = Vec::new();
     let mut failed = Vec::new();
     for p in &paths {
-        let name = file_name(&p.to_string_lossy());
+        let name = older_file_name(&p.to_string_lossy());
         match crate::bounded_read::read_bounded(p, lcc_raw::dcp::MAX_FILE as u64) {
             Ok(b) => files.push((name, b)),
             Err(e) => failed.push(json!([name, e.to_string()])),
         }
     }
-    let own;
-    let (active_dir, library) = match camera {
-        Some(d) => d,
-        None => match dirs(C) {
-            Ok(d) => {
-                own = d;
-                (own.0.as_path(), own.1.as_path())
-            }
-            Err(e) => {
-                out.problems.push(e.to_string());
-                return out;
-            }
-        },
-    };
-    if let Err(e) = std::fs::create_dir_all(library) {
-        out.problems.push(format!("{}: {e}", library.display()));
-        return out;
-    }
-    let how = Install { active_dir, library, activate: None, keep_existing: true };
-    let done = match install_in(C, files, failed, &how) {
-        Ok(d) => d,
-        Err(e) => {
-            out.problems.push(e.to_string());
-            return out;
-        }
-    };
-    for f in &done.failed {
-        let what = f.get(0).and_then(Value::as_str).unwrap_or_default();
-        let why = f.get(1).and_then(Value::as_str).unwrap_or("couldn't be read");
-        out.problems.push(format!("{what}: {why}; left out"));
-    }
-    out.added = done.imported.len();
-    out.already = done.already.iter().map(|(n, _)| n.clone()).collect();
-    refresh_installed(active_dir, library);
+    (listed, files, failed)
+}
+
+/// The file name of path `f` as an older store wrote it (empty when it has none).
+fn older_file_name(f: &str) -> String {
+    Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Camera bodies `listed` started with a profile (`ids`: each older file name's profile id here)
+/// start with it here too, unless they have a profile of their own already → how many.
+fn bind_listed(s: &mut Session, listed: &[OlderDcp], ids: &[(String, String)]) -> usize {
     // the bodies: those a profile is for, then those it was made the default of explicitly (these win)
     let mut want: Vec<(String, String)> = Vec::new();
     for explicit in [false, true] {
-        for e in &listed {
-            let name = file_name(&e.file);
-            let Some(id) = done.ids.iter().find(|(n, _)| *n == name).map(|(_, id)| id.clone()) else { continue };
+        for e in listed {
+            let name = older_file_name(&e.file);
+            let Some(id) = ids.iter().find(|(n, _)| *n == name).map(|(_, id)| id.clone()) else { continue };
             let model =
                 lcc_raw::dcp::library_get(&id).map(|d| d.model.clone()).filter(|m| !m.trim().is_empty()).unwrap_or_else(|| e.camera_model.clone());
             let bodies: Vec<&String> = if explicit { e.body_defaults.iter().collect() } else { e.serial.iter().chain(e.bodies.iter()).collect() };
@@ -406,12 +381,99 @@ pub(crate) fn import_older(s: &mut Session, store: &Path, camera: Option<(&Path,
             }
         }
     }
+    let mut bound = 0;
     for (key, id) in want {
         if !s.body_profiles.contains_key(&key) && s.body_profiles.len() < 10_000 {
             s.body_profiles.insert(key, id);
-            out.bound += 1;
+            bound += 1;
         }
     }
+    bound
+}
+
+/// The camera-profiles folder and its library `camera` names (`None`: this computer's), or the
+/// problem.
+fn camera_dirs(camera: Option<(&Path, &Path)>) -> std::result::Result<(PathBuf, PathBuf), String> {
+    match camera {
+        Some((a, l)) => Ok((a.to_path_buf(), l.to_path_buf())),
+        None => dirs("store.importOlderInstalls").map_err(|e| e.to_string()),
+    }
+}
+
+/// The camera profiles of an older install's store folder `store` (the `.dcp` files of its
+/// `Profiles/`, with the camera bodies its `shared.json` bound them to) installed the way Import
+/// Profiles & Presets… installs them ([`install_in`]): a profile the library has already (the same
+/// bytes, or the same camera and ProfileName) is named in `already`, one that doesn't read in
+/// `problems`. A body the older install started with one of them starts with it here too, unless it
+/// has a profile of its own already; a lone profile for a camera with none becomes the camera's
+/// default. Available at once. `camera`: the camera-profiles folder and its library (`None`: this
+/// computer's). The older folder is only read.
+pub(crate) fn import_older(s: &mut Session, store: &Path, camera: Option<(&Path, &Path)>) -> OlderProfiles {
+    const C: &str = "store.importOlderInstalls";
+    let mut out = OlderProfiles::default();
+    let (listed, files, failed) = read_older(store, &mut out);
+    if files.is_empty() && failed.is_empty() {
+        return out;
+    }
+    let (active_dir, library) = match camera_dirs(camera) {
+        Ok(d) => d,
+        Err(e) => {
+            out.problems.push(e);
+            return out;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&library) {
+        out.problems.push(format!("{}: {e}", library.display()));
+        return out;
+    }
+    let how = Install { active_dir: &active_dir, library: &library, activate: None, keep_existing: true };
+    let done = match install_in(C, files, failed, &how) {
+        Ok(d) => d,
+        Err(e) => {
+            out.problems.push(e.to_string());
+            return out;
+        }
+    };
+    for f in &done.failed {
+        let what = f.get(0).and_then(Value::as_str).unwrap_or_default();
+        let why = f.get(1).and_then(Value::as_str).unwrap_or("couldn't be read");
+        out.problems.push(format!("{what}: {why}; left out"));
+    }
+    out.added = done.imported.len();
+    out.already = done.already.iter().map(|(n, _)| n.clone()).collect();
+    refresh_installed(&active_dir, &library);
+    out.bound = bind_listed(s, &listed, &done.ids);
+    out
+}
+
+/// The camera bodies an older install's store folder `store` started with one of its camera
+/// profiles start with it here too ([`import_older`]'s bindings alone), to the profile the library
+/// has (the same bytes, or the same camera and ProfileName): for a store whose profiles came over
+/// with a build that didn't keep the bindings. Nothing is installed; a profile the library doesn't
+/// have (removed since) binds nothing, and a body with a profile of its own keeps it. Only reads.
+pub(crate) fn bind_older(s: &mut Session, store: &Path, camera: Option<(&Path, &Path)>) -> OlderProfiles {
+    let mut out = OlderProfiles::default();
+    let (listed, files, _) = read_older(store, &mut out);
+    if listed.is_empty() || files.is_empty() {
+        return out;
+    }
+    let library = match camera_dirs(camera) {
+        Ok((_, l)) => l,
+        Err(e) => {
+            out.problems.push(e);
+            return out;
+        }
+    };
+    let have = library_files(&library);
+    let mut ids = Vec::new();
+    for (name, bytes) in files {
+        // (one that doesn't read was reported when it came over)
+        let Ok(d) = lcc_raw::dcp::parse(&bytes) else { continue };
+        if let Some(id) = installed_as(&have, &bytes, &d) {
+            ids.push((name, id.to_string()));
+        }
+    }
+    out.bound = bind_listed(s, &listed, &ids);
     out
 }
 
