@@ -47,6 +47,11 @@ enum Profile {
 /// A headless app with `n` browsed raws (not imported) of one Canon body with a camera profile as
 /// `profile` says: their camera JPEGs read at once, a raw decode taking `delay` ms.
 fn browsed(n: u64, delay: Arc<AtomicU64>, profile: Profile) -> Headless {
+    browsed_of(n, delay, profile, (600, 400))
+}
+
+/// [`browsed`] with raws that decode to `size` pixels.
+fn browsed_of(n: u64, delay: Arc<AtomicU64>, profile: Profile, size: (usize, usize)) -> Headless {
     let mut s = lcc_engine::Session::new();
     s.media.preview_loader = Some(Arc::new(|_: &str, edge: usize| {
         let w = edge.clamp(1, 300);
@@ -55,7 +60,7 @@ fn browsed(n: u64, delay: Arc<AtomicU64>, profile: Profile) -> Headless {
     }));
     s.media.file_loader = Some(Arc::new(move |_, _, _| {
         std::thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
-        let mut img = lcc_raster::Rgb32f::new(600, 400);
+        let mut img = lcc_raster::Rgb32f::new(size.0, size.1);
         img.data.fill([0.18, 0.18, 0.18]);
         Ok((img, Default::default()))
     }));
@@ -205,7 +210,67 @@ fn built_at_once(profile: Profile) {
     delay.store(SLOW_MS, Ordering::Relaxed);
     for id in 2..=5 {
         let seen = step_to(&mut h, id, Duration::from_millis(1000));
-        assert!(at_once(&seen, |w| w == "cached"), "{profile:?}, photo {id}: its built preview at once: {seen:?}");
+        // (the stand-in, or the loupe's own picture taken from the built preview: on screen within
+        // AT_ONCE of the step, it was not decoded for it, a decode takes SLOW_MS)
+        assert!(at_once(&seen, |w| matches!(w, "cached" | "render")), "{profile:?}, photo {id}: its built preview at once: {seen:?}");
     }
     delay.store(0, Ordering::Relaxed);
+}
+
+/// Use a wide-gamut monitor profile, as Settings ▸ Display does (the user's monitor has one of its own).
+fn use_monitor_profile(h: &mut Headless) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lcc-cull-monitor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("monitor.icc");
+    std::fs::write(&path, lcc_codecs::icc::write_named(lcc_codecs::NamedSpace::DisplayP3)).unwrap();
+    h.app.ui.settings.display_profile = path.to_string_lossy().into_owned();
+    h.step();
+    assert!(h.app.renderer.display().is_some(), "the monitor profile is in use");
+    dir
+}
+
+/// Half a raw decode ([`SLOW_MS`]): the loupe's own picture of a photo on screen this soon after the
+/// step was not decoded for it. (Longer than [`AT_ONCE`]: the neighbours' and the histogram's jobs
+/// share the workers with it, and tests run side by side.)
+const NO_RENDER: Duration = Duration::from_millis(SLOW_MS / 2);
+
+/// Step to photo `id`: whether the loupe's own picture of it (not a stand-in) is on screen within
+/// [`NO_RENDER`], with no render of it still out.
+fn loupe_has_it_at_once(h: &mut Headless, id: u64) -> bool {
+    exec(h, "library.select", json!({"ids": [id]}));
+    frames(
+        h,
+        NO_RENDER,
+        |_| {},
+        |h| !h.app.renderer.is_pending(Slot::Main) && h.app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == PhotoId(id)),
+    )
+}
+
+/// Rules 2 and 1 on a monitor with its own colour profile: once the previews are built, and going
+/// back over photos already seen, the loupe's picture of each photo is the one it has (a built
+/// preview, a render kept from the visit), made the monitor's as every cached picture is; nothing
+/// is decoded or rendered for the step. Before (2026-11-23), a profiled monitor made the loupe
+/// refuse every kept picture: behind the stand-in, each step decoded and rendered the raw again
+/// (1-4 s of the machine a photo on the user's set-up), forward after the build and back.
+#[test]
+fn on_a_profiled_monitor_the_loupe_renders_nothing_it_already_has() {
+    let delay = Arc::new(AtomicU64::new(0));
+    // (raws bigger than the loupe draws them: a built preview serves it only when it is as big)
+    let mut h = browsed_of(6, delay.clone(), Profile::BodyDefault, (1800, 1200));
+    let profile_dir = use_monitor_profile(&mut h);
+    visit(&mut h, 1);
+    let r = h.app.session.execute("library.buildPreviews", &json!({"size": "standard", "ids": [2, 3, 4, 5, 6], "wait": true}));
+    assert!(r.is_ok(), "{r:?}");
+    delay.store(SLOW_MS, Ordering::Relaxed);
+    for id in [2, 3, 4, 5, 6, 5, 4, 3, 2, 1] {
+        assert!(
+            loupe_has_it_at_once(&mut h, id),
+            "photo {id}: the loupe's picture at once, nothing rendered: {:?}, waiting for {:?}, {} running",
+            h.app.loupe_shown,
+            h.app.renderer.pending_slots(),
+            h.app.renderer.in_flight()
+        );
+    }
+    delay.store(0, Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(profile_dir);
 }

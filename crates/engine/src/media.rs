@@ -1379,6 +1379,13 @@ impl RenderJob {
     /// OneSlips 199204550. (Refusing it made every step of a culling pass on a profiled monitor
     /// render the raw again, after the preview build and going back to a photo already seen.)
     pub fn cached_view(&self) -> Option<Rgba8> {
+        self.cached_view_parts().map(|(img, _)| img)
+    }
+
+    /// [`Self::cached_view`] and the whole cached picture it was fitted from, whose histogram is the
+    /// result's (the size a render would have had before a display fit, as a render's histogram is;
+    /// as in OneSlips' `cached_view_with_histogram`).
+    fn cached_view_parts(&self) -> Option<(Rgba8, Arc<Rgba8>)> {
         let (cache, key) = self.view_cache.as_ref()?;
         if self.request.quality != Quality::Full
             || self.request.depth != lcc_pipeline::OutputDepth::U8
@@ -1391,7 +1398,12 @@ impl RenderJob {
             return None;
         }
         let img = cache.get_at(self.cache_generation, *key)?;
-        fit_cached(&img, self.request.max_w, self.request.max_h)
+        // the loupe at rest asks for at least the preview level (2560 px) and shrinks the result to
+        // the drawn size ([`Self::display_fit`]): a cached view as big as the drawn size serves it (a
+        // 2048 px built preview for a ~1 300 px canvas), as in OneSlips (PERF-PREVIEW-REUSE). Measured
+        // against the asked-for size instead, no built preview ever served the loupe at rest.
+        let (w, h) = self.display_fit.unwrap_or((self.request.max_w, self.request.max_h));
+        Some((fit_cached(&img, w, h)?, img))
     }
 
     /// See [`Self::drawn_view_cache`].
@@ -1552,13 +1564,13 @@ impl RenderJob {
     fn run_photo(self) -> RenderResult {
         // the loupe: a cached view render of these settings at least this big is the render (a
         // built preview, or the render kept from an earlier visit, is not rendered again)
-        if let Some(mut image) = self.cached_view() {
+        if let Some((mut image, full)) = self.cached_view_parts() {
             if let Some((fw, fh)) = self.display_fit
                 && (image.width > fw.max(1) || image.height > fh.max(1))
             {
                 image = fit_for_display(&image, fw, fh);
             }
-            let histogram = Histogram::of_srgb8(&image);
+            let histogram = Histogram::of_srgb8(&full);
             return RenderResult {
                 request_id: self.request_id,
                 source_key: self.source_key,
@@ -3894,6 +3906,34 @@ mod tests {
         assert_eq!(at_rest.clone().with_drawn_view_cache().key, at_rest.key);
     }
 
+    // Given a photo whose kept view render (a built preview) is smaller than the loupe asks for at
+    // rest (at least the 2560 px preview level) but as big as the loupe draws it, when the loupe asks
+    // for it, then the kept picture, shrunk to the drawn size, is the result: nothing is rendered
+    #[test]
+    fn the_loupe_at_rest_uses_a_kept_view_as_big_as_it_is_drawn() {
+        let _keys = crate::sensor_maps::keep_generation();
+        let mut s = crate::Session::with_demo();
+        let id = s.active().unwrap();
+        let built = s.loupe_job(id, 640, 640, true).unwrap();
+        let (cache, key) = built.view_cache.clone().expect("a loupe job keeps the view preview");
+        let kept = built.run().rendered.unwrap().image;
+        let t0 = std::time::Instant::now();
+        while cache.get_in_memory(key).is_none() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (kw, kh) = (kept.width, kept.height);
+        // at rest: a bigger render box, drawn smaller than the kept picture
+        let at_rest = s.loupe_job(id, 2560, 2560, true).unwrap().with_display_fit(kw * 3 / 4, kh * 3 / 4);
+        let shown = at_rest.cached_view().expect("the kept picture serves the drawn size");
+        assert!(shown.width <= kw * 3 / 4 && shown.height <= kh * 3 / 4, "shrunk to the drawn size: {}x{}", shown.width, shown.height);
+        let r = s.loupe_job(id, 2560, 2560, true).unwrap().with_display_fit(kw * 3 / 4, kh * 3 / 4).run();
+        assert!(r.loaded.is_none(), "nothing decoded or rendered");
+        // drawn bigger than the kept picture: rendered
+        assert!(s.loupe_job(id, 2560, 2560, true).unwrap().with_display_fit(kw * 2, kh * 2).cached_view().is_none());
+        // with no drawn size, the asked-for size decides, as before
+        assert!(s.loupe_job(id, 2560, 2560, true).unwrap().cached_view().is_none() || kw.max(kh) >= 2560);
+    }
+
     // Given a photo whose view render is kept and a monitor profile in use, when the loupe asks for
     // it again (the next step of a culling pass back onto it, or onto a built preview), then the kept
     // sRGB picture is the result, not a new render of the raw: the frontend converts it for the
@@ -3920,8 +3960,9 @@ mod tests {
         assert_eq!(shown.display, None, "the kept picture is sRGB");
         crate::display::present(&mut shown, &monitor);
         assert_eq!(shown.display, Some(monitor.id()), "and the frontend makes it the monitor's");
-        let (a, b) = (first.rendered.unwrap().image, shown.rendered.unwrap().image);
-        assert_eq!((a.width, a.height), (b.width, b.height));
+        let (a, b) = (first.rendered.unwrap(), shown.rendered.unwrap());
+        assert_eq!((a.image.width, a.image.height), (b.image.width, b.image.height));
+        assert_eq!(b.histogram.total, a.histogram.total, "the histogram is the whole picture's, as the render's");
     }
 
     // Given a photo whose view render of these settings is kept (a built preview, an earlier
