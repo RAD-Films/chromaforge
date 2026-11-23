@@ -2477,8 +2477,11 @@ impl crate::Session {
 
     /// Where a render of photo `id` with its current settings lies in it, and its look
     /// ([`crate::placement::Placement`]; `apply_crop`: cropped, as the loupe and grid show it).
+    /// The photo as it renders ([`Self::rendered_photo_of`]): a browsed raw of a body with a default
+    /// profile renders with it (OneSlips keeps that profile in the record), so its previews and
+    /// stand-ins carry that look and the view asks for the same one.
     pub fn placement_of(&mut self, id: PhotoId, apply_crop: bool) -> Option<crate::placement::Placement> {
-        let p = self.catalog.photo(id)?.clone();
+        let p = self.rendered_photo_of(id)?;
         let settings = p.develop.clone();
         Some(self.placement_with(&p, &settings, apply_crop))
     }
