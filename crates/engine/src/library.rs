@@ -193,7 +193,7 @@ pub(crate) struct PresetsFile {
     profile_edits: crate::profile_edits::ProfileEdits,
     /// Each camera body's camera profile.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    body_profiles: std::collections::BTreeMap<String, String>,
+    pub body_profiles: std::collections::BTreeMap<String, String>,
 }
 
 /// The state presets.json was last written (or read) from. Saving checks the preset list's
