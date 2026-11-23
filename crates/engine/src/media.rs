@@ -1373,16 +1373,17 @@ impl RenderJob {
 
     /// The view render kept for this job's photo and settings ([`Self::view_cache`]), fitted to the
     /// size asked for, when it is at least that big (else `None`: render). Only for what the cached
-    /// view is: a full-quality, 8-bit, whole-frame sRGB render of the photo (no HDR, display
-    /// profile, transparency or slide).
+    /// view is: a full-quality, 8-bit, whole-frame sRGB render of the photo (no HDR, transparency or
+    /// slide). A monitor profile doesn't stop it: the kept picture is sRGB, and the frontend converts
+    /// it for the monitor as it does every cached picture ([`crate::display::present`]), as in
+    /// OneSlips 199204550. (Refusing it made every step of a culling pass on a profiled monitor
+    /// render the raw again, after the preview build and going back to a photo already seen.)
     pub fn cached_view(&self) -> Option<Rgba8> {
         let (cache, key) = self.view_cache.as_ref()?;
         if self.request.quality != Quality::Full
             || self.request.depth != lcc_pipeline::OutputDepth::U8
             || self.request.window.is_some()
             || self.request.alpha
-            || self.request.display.is_some()
-            || self.display.is_some()
             || self.hdr_texels.is_some()
             || self.settings.hdr.enabled
             || self.slide.is_some()
@@ -3888,6 +3889,36 @@ mod tests {
         // release finds the drag's last render)
         let at_rest = s.loupe_job(id, 1024, 1024, true).unwrap().with_display_fit(400, 400);
         assert_eq!(at_rest.clone().with_drawn_view_cache().key, at_rest.key);
+    }
+
+    // Given a photo whose view render is kept and a monitor profile in use, when the loupe asks for
+    // it again (the next step of a culling pass back onto it, or onto a built preview), then the kept
+    // sRGB picture is the result, not a new render of the raw: the frontend converts it for the
+    // monitor as it does every cached picture
+    #[test]
+    fn the_loupe_uses_a_kept_view_render_on_a_profiled_monitor() {
+        let _keys = crate::sensor_maps::keep_generation();
+        let mut s = crate::Session::with_demo();
+        let id = s.active().unwrap();
+        let monitor =
+            Arc::new(crate::display::Display::from_bytes("p3.icc", &lcc_codecs::icc::write_named(lcc_codecs::NamedSpace::DisplayP3)).unwrap());
+        let job = s.loupe_job(id, 1024, 1024, true).unwrap().with_display(Some(monitor.clone()));
+        let (cache, key) = job.view_cache.clone().expect("a loupe job keeps the view preview");
+        let first = job.run();
+        assert_eq!(first.display, Some(monitor.id()), "the first visit renders for the monitor");
+        let t0 = std::time::Instant::now();
+        while cache.get_in_memory(key).is_none() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let again = s.loupe_job(id, 1024, 1024, true).unwrap().with_display(Some(monitor.clone()));
+        assert!(again.cached_view().is_some(), "the kept render serves the profiled loupe");
+        let mut shown = again.run();
+        assert!(shown.loaded.is_none(), "nothing was decoded or rendered");
+        assert_eq!(shown.display, None, "the kept picture is sRGB");
+        crate::display::present(&mut shown, &monitor);
+        assert_eq!(shown.display, Some(monitor.id()), "and the frontend makes it the monitor's");
+        let (a, b) = (first.rendered.unwrap().image, shown.rendered.unwrap().image);
+        assert_eq!((a.width, a.height), (b.width, b.height));
     }
 
     // Given a photo whose view render of these settings is kept (a built preview, an earlier
