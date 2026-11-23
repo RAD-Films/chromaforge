@@ -278,22 +278,47 @@ impl<T: Copy + Default> Image<T> {
         }
         out
     }
+}
+
+impl<T: Copy + Default + Send + Sync> Image<T> {
     /// Apply an EXIF orientation (stored → displayed).
     /// [`Self::oriented`] without a copy when `o` is the identity.
     pub fn into_oriented(self, o: lcc_geom::Orientation) -> Self {
         if o == lcc_geom::Orientation::Normal { self } else { self.oriented(o) }
     }
 
+    /// Apply an EXIF orientation (stored → displayed) in one pass over the output rows, in parallel: a flip and
+    /// quarter turns done one after another copied the picture up to three times on one thread (~50 ms of a
+    /// 2560 px raw preview's load, CULL-SPEED-ORIENT). The pixels are those of [`Self::flip_h`], then
+    /// [`Self::rotate_180`] / [`Self::rotate_cw`].
     pub fn oriented(&self, o: lcc_geom::Orientation) -> Self {
         let (flip, turns) = o.to_parts();
-        let mut img = if flip { self.flip_h() } else { self.clone() };
-        match turns {
-            1 => img = img.rotate_cw(),
-            2 => img = img.rotate_180(),
-            3 => img = img.rotate_180().rotate_cw(),
-            _ => {}
+        let (w, h) = (self.width, self.height);
+        if w == 0 || h == 0 || w.checked_mul(h) != Some(self.data.len()) {
+            return self.clone();
         }
-        img
+        let (ow, oh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+        // the stored pixel each displayed pixel (x, y) shows
+        let at = |x: usize, y: usize| -> (usize, usize) {
+            match (flip, turns % 4) {
+                (false, 0) => (x, y),
+                (false, 1) => (y, h - 1 - x),
+                (false, 2) => (w - 1 - x, h - 1 - y),
+                (false, _) => (w - 1 - y, x),
+                (true, 0) => (w - 1 - x, y),
+                (true, 1) => (w - 1 - y, h - 1 - x),
+                (true, 2) => (x, h - 1 - y),
+                (true, _) => (y, x),
+            }
+        };
+        let mut data = vec![T::default(); ow * oh];
+        par_rows(&mut data, ow, |y, row| {
+            for (x, p) in row.iter_mut().enumerate() {
+                let (sx, sy) = at(x, y);
+                *p = self.data.get(sy * w + sx).copied().unwrap_or_default();
+            }
+        });
+        Self { width: ow, height: oh, data }
     }
 }
 
@@ -507,5 +532,33 @@ mod tests {
         let img = Rgba8::from_fn(16, 16, |x, y| [(x * 16) as u8, (y * 16) as u8, 7, 255]);
         assert_eq!(img.to_linear().to_srgb8(), img);
         assert_eq!(Rgba8::from_bytes(16, 16, &img.as_bytes()).unwrap(), img);
+    }
+}
+
+#[cfg(test)]
+mod oriented_tests {
+    use super::*;
+
+    /// The one-pass orientation gives the pixels of the flip and turns done one after another, for all eight.
+    #[test]
+    fn one_pass_orientation_matches_the_flip_and_turns() {
+        use lcc_geom::Orientation::*;
+        let img: Image<u32> = Image::from_fn(7, 4, |x, y| (y * 7 + x) as u32);
+        for o in [Normal, Rotate90, Rotate180, Rotate270, FlipH, Transverse, FlipV, Transpose] {
+            let (flip, turns) = o.to_parts();
+            let mut want = if flip { img.flip_h() } else { img.clone() };
+            match turns {
+                1 => want = want.rotate_cw(),
+                2 => want = want.rotate_180(),
+                3 => want = want.rotate_180().rotate_cw(),
+                _ => {}
+            }
+            let got = img.oriented(o);
+            assert_eq!((got.width, got.height, &got.data), (want.width, want.height, &want.data), "{o:?}");
+            assert_eq!(img.clone().into_oriented(o).data, want.data, "{o:?}");
+        }
+        // an empty or inconsistent image comes back as it is
+        let empty: Image<u32> = Image { width: 0, height: 3, data: Vec::new() };
+        assert_eq!(empty.oriented(Rotate90).data, Vec::<u32>::new());
     }
 }
