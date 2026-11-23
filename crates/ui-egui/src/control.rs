@@ -122,7 +122,7 @@ pub fn inspect(app: &LccApp, ctx: &egui::Context) -> Value {
     let r = ctx.content_rect();
     // (its own object: one more level of fields in the reply below passes `json!`'s recursion limit)
     let frame_gaps = json!({"hostFrameMs": app.perf.host_frame_ms, "gapMs": app.perf.gap_ms, "maxGapMs": app.perf.max_gap_ms, "maxGapHostMs": app.perf.max_gap_host_ms});
-    json!({
+    let mut v = json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
         "window": [r.width(), r.height()],
         "pixelsPerPoint": ctx.pixels_per_point(),
@@ -165,7 +165,12 @@ pub fn inspect(app: &LccApp, ctx: &egui::Context) -> Value {
         // commands waiting on a native file dialog shown off the UI thread (`pick`)
         "fileDialogs": app.pending_picks.iter().map(|p| p.command.clone()).collect::<Vec<_>>(),
         "memory": memory(app),
-    })
+    });
+    // (outside the macro: the object is at its recursion limit)
+    if let Some(perf) = v.get_mut("perf").and_then(Value::as_object_mut) {
+        perf.insert("thumbFirst".into(), serde_json::to_value(app.thumb_first.summary()).unwrap_or_default());
+    }
+    v
 }
 
 /// Bytes held by the engine's caches and the renderer's (`ui.inspect` → `memory`).
@@ -309,6 +314,14 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             ok(brand_filled(tree))
         }
         "ui.inspect" => ok(inspect(app, ctx)),
+        // grid and filmstrip cells' time to first pixels since the last reset ([`crate::thumb_first`])
+        "ui.thumbFirst" => {
+            let summary = app.thumb_first.summary();
+            if p.get("reset").and_then(Value::as_bool).unwrap_or(false) {
+                app.thumb_first.reset();
+            }
+            ok(serde_json::to_value(summary).unwrap_or_default())
+        }
         "ui.widgets" => {
             let filter = s("filter").unwrap_or("");
             ok(Value::Array(
