@@ -82,8 +82,16 @@ fn zeroed(count: usize) -> Result<Vec<i32>> {
     Ok(v)
 }
 
+/// Columns of a level the vertical pass synthesises together ([`inverse_level`]).
+const COLUMN_BLOCK: usize = 32;
+
 /// One inverse level. `HL` is horizontally high-pass, `LH` vertically high-pass.
+///
+/// The horizontal pass runs on the rows in parallel and the vertical one on blocks of [`COLUMN_BLOCK`] columns, each
+/// gathered row by row (CULL-SPEED-CRX: on one thread, each 4176 × 2793 plane of a 45 MP C-RAW CR3 took 170-220 ms of
+/// its 300-370 ms decode; 120-130 ms now). Integer lifting: the samples are those of the one-thread synthesis.
 pub(crate) fn inverse_level(ll: &Band, hl: &Band, lh: &Band, hh: &Band, width: usize, height: usize, edges: TileEdges) -> Result<Band> {
+    use rayon::prelude::*;
     let count = width.checked_mul(height).filter(|n| *n > 0).ok_or_else(corrupt)?;
     if count > crate::MAX_SAMPLES {
         return Err(RawError::Limit("CRX wavelet image size"));
@@ -97,32 +105,59 @@ pub(crate) fn inverse_level(ll: &Band, hl: &Band, lh: &Band, hh: &Band, width: u
     let mut temporary = zeroed(intermediate_count)?;
     // CRX analysis is vertical then horizontal. Integer rounding means that
     // synthesis must reverse that order, including for quantized subbands.
-    for y in 0..lhgt + hhgt {
+    temporary.par_chunks_mut(width).enumerate().try_for_each(|(y, out)| {
         let (lo, hi, by) = if y < lhgt { (ll, hl, y) } else { (lh, hh, y - lhgt) };
         inverse_line(
             lo.data.get(by * lw..(by + 1) * lw).ok_or_else(corrupt)?,
             hi.data.get(by * hw..(by + 1) * hw).ok_or_else(corrupt)?,
-            temporary.get_mut(y * width..(y + 1) * width).ok_or_else(corrupt)?,
+            out,
             edges.left,
             edges.right,
-        )?;
-    }
+        )
+    })?;
+    // each block of columns: its low and high halves gathered column by column, synthesised, kept column by column
+    let blocks = (0..width.div_ceil(COLUMN_BLOCK))
+        .into_par_iter()
+        .map(|b| -> Result<Vec<i32>> {
+            let x0 = b * COLUMN_BLOCK;
+            let bw = COLUMN_BLOCK.min(width - x0);
+            let mut low = zeroed(bw * lhgt)?;
+            let mut high = zeroed(bw * hhgt)?;
+            for y in 0..lhgt + hhgt {
+                let row = temporary.get(y * width + x0..y * width + x0 + bw).ok_or_else(corrupt)?;
+                let (into, at, rows) = if y < lhgt { (&mut low, y, lhgt) } else { (&mut high, y - lhgt, hhgt) };
+                for (c, &value) in row.iter().enumerate() {
+                    *into.get_mut(c * rows + at).ok_or_else(corrupt)? = value;
+                }
+            }
+            let mut out = zeroed(bw * height)?;
+            for c in 0..bw {
+                inverse_line(
+                    low.get(c * lhgt..(c + 1) * lhgt).ok_or_else(corrupt)?,
+                    high.get(c * hhgt..(c + 1) * hhgt).ok_or_else(corrupt)?,
+                    out.get_mut(c * height..(c + 1) * height).ok_or_else(corrupt)?,
+                    edges.top,
+                    edges.bottom,
+                )?;
+            }
+            Ok(out)
+        })
+        .collect::<Vec<Result<Vec<i32>>>>()
+        // (the first failure in block order, whichever thread met it first)
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    drop(temporary);
     let mut data = zeroed(count)?;
-    let mut low = zeroed(lhgt)?;
-    let mut high = zeroed(hhgt)?;
-    let mut column = zeroed(height)?;
-    for x in 0..width {
-        for (y, value) in low.iter_mut().enumerate() {
-            *value = temporary.get(y * width + x).copied().ok_or_else(corrupt)?;
+    data.par_chunks_mut(width).enumerate().try_for_each(|(y, row)| -> Result<()> {
+        for (b, block) in blocks.iter().enumerate() {
+            let x0 = b * COLUMN_BLOCK;
+            let bw = COLUMN_BLOCK.min(width - x0);
+            for c in 0..bw {
+                *row.get_mut(x0 + c).ok_or_else(corrupt)? = *block.get(c * height + y).ok_or_else(corrupt)?;
+            }
         }
-        for (y, value) in high.iter_mut().enumerate() {
-            *value = temporary.get((y + lhgt) * width + x).copied().ok_or_else(corrupt)?;
-        }
-        inverse_line(&low, &high, &mut column, edges.top, edges.bottom)?;
-        for (y, &value) in column.iter().enumerate() {
-            *data.get_mut(y * width + x).ok_or_else(corrupt)? = value;
-        }
-    }
+        Ok(())
+    })?;
     Ok(Band { width, height, data })
 }
 
@@ -167,6 +202,75 @@ pub(crate) fn reconstruct(bands: &[Band], width: usize, height: usize, levels: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`inverse_level`] as it was, on one thread: the reference the parallel one must equal.
+    fn inverse_level_serial(ll: &Band, hl: &Band, lh: &Band, hh: &Band, width: usize, height: usize, edges: TileEdges) -> Result<Band> {
+        let count = width.checked_mul(height).filter(|n| *n > 0).ok_or_else(corrupt)?;
+        if count > crate::MAX_SAMPLES {
+            return Err(RawError::Limit("CRX wavelet image size"));
+        }
+        let (lw, hw) = sizes(width, edges.left, edges.right);
+        let (lhgt, hhgt) = sizes(height, edges.top, edges.bottom);
+        if !valid_band(ll, lw, lhgt) || !valid_band(hl, hw, lhgt) || !valid_band(lh, lw, hhgt) || !valid_band(hh, hw, hhgt) {
+            return Err(corrupt());
+        }
+        let intermediate_count =
+            width.checked_mul(lhgt + hhgt).filter(|n| *n <= crate::MAX_SAMPLES).ok_or(RawError::Limit("CRX wavelet image size"))?;
+        let mut temporary = zeroed(intermediate_count)?;
+        // CRX analysis is vertical then horizontal. Integer rounding means that
+        // synthesis must reverse that order, including for quantized subbands.
+        for y in 0..lhgt + hhgt {
+            let (lo, hi, by) = if y < lhgt { (ll, hl, y) } else { (lh, hh, y - lhgt) };
+            inverse_line(
+                lo.data.get(by * lw..(by + 1) * lw).ok_or_else(corrupt)?,
+                hi.data.get(by * hw..(by + 1) * hw).ok_or_else(corrupt)?,
+                temporary.get_mut(y * width..(y + 1) * width).ok_or_else(corrupt)?,
+                edges.left,
+                edges.right,
+            )?;
+        }
+        let mut data = zeroed(count)?;
+        let mut low = zeroed(lhgt)?;
+        let mut high = zeroed(hhgt)?;
+        let mut column = zeroed(height)?;
+        for x in 0..width {
+            for (y, value) in low.iter_mut().enumerate() {
+                *value = temporary.get(y * width + x).copied().ok_or_else(corrupt)?;
+            }
+            for (y, value) in high.iter_mut().enumerate() {
+                *value = temporary.get((y + lhgt) * width + x).copied().ok_or_else(corrupt)?;
+            }
+            inverse_line(&low, &high, &mut column, edges.top, edges.bottom)?;
+            for (y, &value) in column.iter().enumerate() {
+                *data.get_mut(y * width + x).ok_or_else(corrupt)? = value;
+            }
+        }
+        Ok(Band { width, height, data })
+    }
+
+    /// The parallel synthesis gives the one-thread synthesis' samples: every size around the column block, every
+    /// tile edge, signed coefficients.
+    #[test]
+    fn the_parallel_level_equals_the_one_thread_level() {
+        let band = |w: usize, h: usize, seed: usize| Band {
+            width: w,
+            height: h,
+            data: (0..w * h).map(|i| (((i + seed) * 7919 + (i * i) % 997) % 4001) as i32 - 2000).collect(),
+        };
+        for width in [1usize, 2, 3, 31, 32, 33, 64, 65, 97] {
+            for height in [1usize, 2, 5, 33, 40] {
+                for e in 0..16u8 {
+                    let edges = TileEdges { left: e & 1 != 0, right: e & 2 != 0, top: e & 4 != 0, bottom: e & 8 != 0 };
+                    let (lw, hw) = sizes(width, edges.left, edges.right);
+                    let (lh, hh) = sizes(height, edges.top, edges.bottom);
+                    let (a, b, c, d) = (band(lw, lh, 1), band(hw, lh, 2), band(lw, hh, 3), band(hw, hh, 4));
+                    let want = inverse_level_serial(&a, &b, &c, &d, width, height, edges).map(|b| b.data).map_err(|e| e.to_string());
+                    let got = inverse_level(&a, &b, &c, &d, width, height, edges).map(|b| b.data).map_err(|e| e.to_string());
+                    assert_eq!(got, want, "{width}x{height} edges {e}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn integer_lifting_preserves_signed_rounding_and_symmetric_ends() {
