@@ -80,22 +80,43 @@ fn a_body_default_set_after_browsing_applies_to_photos_already_browsed() {
     assert_eq!(rendered_camera(&mut s, id), "");
 }
 
+/// The Import panel's camera profile is for the import: a browsed raw renders, and is prepared and
+/// cached, with its body's own profile whatever the panel says (as in OneSlips), so a change
+/// there neither changes nor invalidates what the browse view shows.
 #[test]
-fn the_import_panel_choice_previews_on_browsed_photos_as_the_import_applies_it() {
+fn the_import_panel_choice_never_changes_how_a_browsed_photo_renders() {
     let mut s = Session::new();
     s.body_profiles.insert(BODY.into(), "lc".into());
     let id = browsed(&mut s, "/nonexistent/IMG_0005.CR3", "653499300171");
-    // Camera default chosen for this body in the Import panel
-    s.import_profile_choice = ImportProfile::PerBody([(BODY.to_string(), String::new())].into());
-    assert_eq!(rendered_camera(&mut s, id), "");
-    s.import_profile_choice = ImportProfile::PerBody(Default::default());
-    assert_eq!(rendered_camera(&mut s, id), "lc");
-    // added to the library as shown, the record now holds it
-    s.execute("photo.addToLibrary", &json!({"ids": [id.0]})).unwrap();
-    let p = s.catalog.photo(id).unwrap();
-    assert!(!p.local);
-    assert_eq!(p.develop.profile.camera, "lc");
-    assert_eq!(rendered_camera(&mut s, id), "lc");
+    let plain = browsed(&mut s, "/nonexistent/IMG_0006.CR3", "653499300174");
+    let seen = |s: &mut Session| {
+        let (r, t) = (s.render_job(id, 64, 64, false, true).unwrap(), s.thumb_job(id, 256).unwrap());
+        let (q, pl) = (s.quick_view_job(id, 64, true).unwrap(), s.placement_of(id, true).unwrap());
+        (r.settings.profile.camera.clone(), r.key, t.key, q.key, pl, s.render_job(plain, 64, 64, false, true).unwrap().key)
+    };
+    let before = seen(&mut s);
+    assert_eq!(before.0, "lc", "the body's own profile");
+    for choice in [
+        ImportProfile::PerBody([(BODY.to_string(), String::new())].into()),
+        ImportProfile::All(String::new()),
+        ImportProfile::All("lc".into()),
+        ImportProfile::PerBody(Default::default()),
+        ImportProfile::Auto,
+    ] {
+        s.import_profile_choice = choice.clone();
+        assert_eq!(seen(&mut s), before, "{choice:?}: the same picture, the same cache keys");
+    }
+    s.import_profile_choice = ImportProfile::All("lc".into());
+    assert_eq!(rendered_camera(&mut s, plain), "", "a body with no default: the camera's, whatever the panel says");
+    // the import applies the panel's choice: added to the library, the record holds it
+    s.execute("photo.addToLibrary", &json!({"ids": [id.0, plain.0]})).unwrap();
+    for i in [id, plain] {
+        let p = s.catalog.photo(i).unwrap();
+        assert!(!p.local);
+        assert_eq!(p.develop.profile.camera, "lc");
+        assert_eq!(rendered_camera(&mut s, i), "lc");
+    }
+    s.import_profile_choice = ImportProfile::Auto;
 
     // a browsed photo given its own profile keeps it: the user picks the camera's default for
     // this photo: an edit, kept over the body's

@@ -277,15 +277,23 @@ impl crate::Session {
         choice.for_photo(self, p, wait).or_else(|| self.body_default_of(p, wait).map(str::to_string)).filter(|id| *id != p.develop.profile.camera)
     }
 
-    /// The camera profile a browsed (Local) photo renders with in place of its own: what importing
-    /// it now would give it ([`Self::import_profile_for`] with the Import panel's choice). Worked
-    /// out at render time and never stored: the photo is not edited and no sidecar is written,
-    /// and a body default set (or changed) after the folder was browsed shows at once.
+    /// The camera profile a browsed (Local) photo renders with in place of its own: its camera
+    /// body's default profile, set in the app ([`Self::body_default_of`]). Worked out at render time
+    /// and never stored: the photo is not edited and no sidecar is written, and a body default set
+    /// (or changed) after the folder was browsed shows at once.
+    ///
+    /// Never the Import panel's choice: that is applied by the import itself
+    /// ([`Self::import_profile_for`]), as in OneSlips LR-IMP-PROFILE (21c4b5644). A browsed raw is
+    /// the raw as it came in, so the browse view, its previews and its stand-ins show the same
+    /// picture whatever the panel says, and a change there invalidates none of them. (With the
+    /// panel's profile in the render, each picture of a browsed raw had a look other than the
+    /// record's, the loupe took none of them as a stand-in, and every step showed an empty frame
+    /// until the photo's own render came back, forward and back.)
     pub fn browse_profile(&self, p: &Photo) -> Option<String> {
         if !p.local || p.deleted {
             return None;
         }
-        self.import_profile_for(p, &self.import_profile_choice, false)
+        self.import_profile_for(p, &ImportProfile::Auto, false)
     }
 
     /// Photo `p` as it renders: a browsed photo with [`Self::browse_profile`] in its settings, else
