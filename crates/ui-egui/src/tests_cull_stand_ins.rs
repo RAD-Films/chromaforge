@@ -274,3 +274,43 @@ fn on_a_profiled_monitor_the_loupe_renders_nothing_it_already_has() {
     delay.store(0, Ordering::Relaxed);
     let _ = std::fs::remove_dir_all(profile_dir);
 }
+
+/// While the loupe shows only a photo's thumbnail and its full-size camera JPEG is on its way,
+/// background work waits for it (OneSlips PERF-CULL-TIERS: the photo on screen comes first, at its
+/// cheapest first). Before (2026-11-23), only an empty loupe held it back: the first photos after
+/// the loupe opened decoded their camera JPEG beside the background build's raw decodes, 0.13-1.8 s
+/// instead of 28 ms, and a step went without its full-size picture.
+#[test]
+fn a_thumbnail_on_screen_holds_background_work_until_the_camera_jpeg_is_in() {
+    let delay = Arc::new(AtomicU64::new(SLOW_MS));
+    // (the raw decodes slowly: no render overtakes the stand-ins)
+    let mut h = browsed(3, delay, Profile::BodyDefault);
+    // the full-size camera JPEG takes a while; the small one a thumbnail is made from comes at once
+    h.app.session.media.preview_loader = Some(Arc::new(|_: &str, edge: usize| {
+        if edge > 512 {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        let w = edge.clamp(1, 2000);
+        let h = (w * 2 / 3).max(1);
+        Some(lcc_raster::Rgba8 { width: w, height: h, data: vec![[200, 60, 200, 255]; w * h] })
+    }));
+    // its thumbnail first (the Import tab's grid and the filmstrip make them before the loupe opens)
+    exec(&mut h, "library.select", json!({"ids": [1]}));
+    let t0 = Instant::now();
+    while h.app.renderer.thumb(PhotoId(1)).is_none() && t0.elapsed() < T {
+        crate::panels::grid::request_thumb(&mut h.app, PhotoId(1), 256, 97);
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(h.app.renderer.thumb(PhotoId(1)).is_some(), "the thumbnail is made");
+    let r = h.request("ui.set", json!({"view": "detail"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    // the thumbnail up in the loupe, its camera JPEG still coming
+    let thumb_up = |h: &Headless| shown(h, 1) == Some("thumb") && h.app.renderer.is_pending(Slot::Preview);
+    assert!(frames(&mut h, T, |_| {}, thumb_up), "the thumbnail first: {:?}", h.app.loupe_shown);
+    // (whatever held it back so far: from here, the loupe alone)
+    h.app.pictures_missing_pass = None;
+    let mut held = false;
+    frames(&mut h, Duration::from_millis(300), |h| held |= thumb_up(h) && h.app.pictures_missing_pass.is_some(), |_| false);
+    assert!(held, "background work waits while only the thumbnail is on screen");
+}
