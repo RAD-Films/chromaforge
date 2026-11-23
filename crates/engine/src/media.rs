@@ -2005,6 +2005,27 @@ pub struct QuickJob {
     pub kept: Option<KeptThumb>,
 }
 
+/// Threads of their own for the camera JPEG a stand-in decodes ([`QuickJob`]): the decoder and the
+/// resize run their parallel parts on the pool they are called from. On the shared pool those parts
+/// queued behind the raw decodes of the photo on screen, the photos ahead and the background build
+/// (each one keeps every core busy for a second or two), so the 1,620 px camera JPEG of a 45 MP CR3,
+/// a 28 ms decode, took 0.13-1.8 s when the loupe opened, and a step went without a picture.
+const STAND_IN_THREADS: usize = 4;
+
+fn stand_in_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(STAND_IN_THREADS).thread_name(|i| format!("lc-stand-in-{i}")).build().ok())
+        .as_ref()
+}
+
+/// Run `f` (a stand-in's decode) on [`stand_in_pool`], or where it is when that pool can't start.
+fn on_stand_in_threads<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match stand_in_pool() {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
 impl QuickJob {
     /// The stand-in, from the first source that has one. A panic inside is this job's failure
     /// (see [`RenderJob::run`]).
@@ -2109,7 +2130,7 @@ impl QuickJob {
                 }
                 return done(rendered(Arc::unwrap_or_clone(img)), Some(QuickSource::Embedded), want);
             }
-            if let Some(image) = loader(path, *edge) {
+            if let Some(image) = on_stand_in_threads(|| loader(path, *edge)) {
                 if let Some((cache, k)) = &self.embedded_cache {
                     if self.embedded_on_disk {
                         let img = Arc::new(image.clone());
@@ -3748,6 +3769,41 @@ mod tests {
         // release finds the drag's last render)
         let at_rest = s.loupe_job(id, 1024, 1024, true).unwrap().with_display_fit(400, 400);
         assert_eq!(at_rest.clone().with_drawn_view_cache().key, at_rest.key);
+    }
+
+    // Given every thread of the shared pool busy with long work (raw decodes), when a stand-in decodes
+    // a camera JPEG whose decoder works in parallel, then it finishes in its own time, not after them
+    #[test]
+    fn a_stand_ins_camera_jpeg_never_waits_for_the_shared_pool() {
+        let mut s = crate::Session::new();
+        s.media.preview_loader = Some(Arc::new(|_: &str, edge: usize| {
+            // (a decoder with parallel parts, as the JPEG decoder and the resize are)
+            let (a, b) = rayon::join(|| edge.min(64), || 2);
+            Some(Rgba8 { width: a, height: b, data: vec![[9, 8, 7, 255]; a * b] })
+        }));
+        let mut raw = Photo::new(PhotoId(1), Source::File { path: "a.cr3".into() }, "a.cr3", "CR3", 6000, 4000, "2026-01-01");
+        raw.kind = MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(raw) }).unwrap();
+        let q = s.quick_view_job(PhotoId(1), 48, true).unwrap();
+        // every shared thread busy for 3 s
+        let busy = rayon::current_num_threads();
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..busy {
+            let started = started.clone();
+            rayon::spawn(move || {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            });
+        }
+        let t0 = std::time::Instant::now();
+        while started.load(std::sync::atomic::Ordering::SeqCst) < busy && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let t = std::time::Instant::now();
+        let r = q.run();
+        assert_eq!(r.quick, Some(QuickSource::Embedded), "the camera JPEG");
+        assert!(t.elapsed() < std::time::Duration::from_millis(1500), "it waited {:?} for the shared pool", t.elapsed());
     }
 
     // Given a photo whose kept view render (a built preview) is smaller than the loupe asks for at
