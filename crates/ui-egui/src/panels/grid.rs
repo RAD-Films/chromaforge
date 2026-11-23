@@ -1045,7 +1045,9 @@ fn retry_found_original(app: &mut LccApp, id: PhotoId) {
 /// A grid or filmstrip cell of photo `id` is on screen: while its first picture is on its way,
 /// every background job waits ([`LccApp::pictures_missing`]; not for a cell whose picture failed).
 pub(crate) fn note_cell(app: &mut LccApp, id: PhotoId) {
-    if app.renderer.thumb(id).is_none() && (app.renderer.is_pending(Slot::ThumbQuick(id)) || app.renderer.is_pending(Slot::Thumb(id))) {
+    let has = app.renderer.thumb(id).is_some();
+    app.thumb_first.note(app.renderer.frame(), id, has, crate::now_ms());
+    if !has && (app.renderer.is_pending(Slot::ThumbQuick(id)) || app.renderer.is_pending(Slot::Thumb(id))) {
         app.pictures_missing(app.renderer.frame());
     }
 }

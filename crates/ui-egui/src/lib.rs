@@ -132,6 +132,7 @@ pub mod tasks;
 pub mod template_browser;
 pub mod text_field;
 pub mod theme;
+pub mod thumb_first;
 pub mod timelapse_ui;
 pub mod titlebar;
 pub mod video_ui;
@@ -917,6 +918,8 @@ pub struct LccApp {
     pub loupe_shown: Option<(lcc_catalog::PhotoId, &'static str)>,
     /// When each photo stepped to in the loupe first showed (`ui.inspect` → `perf.loupeSteps`).
     pub loupe_timing: loupe_timing::LoupeTiming,
+    /// How long grid and filmstrip cells wait for their first pixels (`ui.inspect` → `perf.thumbFirst`).
+    pub thumb_first: thumb_first::ThumbFirst,
     /// How the loupe drew its picture last frame ([`panels::detail::LoupeDrawn`]): where the
     /// picture's corners went and the rect it fills (tests check that no part of it is empty).
     pub loupe_drawn: Option<panels::detail::LoupeDrawn>,
@@ -1280,6 +1283,7 @@ impl LccApp {
             brush_live: None,
             loupe_shown: None,
             loupe_timing: Default::default(),
+            thumb_first: Default::default(),
             loupe_drawn: None,
             look_ahead_made_for: None,
             pictures_missing_pass: None,
