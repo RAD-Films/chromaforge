@@ -267,6 +267,33 @@ fn a_camera_profile_without_a_tone_curve_keeps_the_photos_own_tone() {
     assert!(v9 > v7 + 2.0, "process 9 renders the kept tone lighter: {v9} vs {v7}");
 }
 
+/// The tone a matrix-only profile keeps is fitted beside the development (CULL-SPEED-TONE-BESIDE, about 0.3 s of a
+/// 45 MP raw's 1.3 s load): the picture, the tone and the colour are the same as with the fit before the development.
+#[test]
+fn the_kept_tone_fitted_beside_the_development_changes_nothing() {
+    use std::sync::atomic::Ordering;
+    let _lock = install();
+    let bytes = dng_with_camera_jpeg();
+    let load = |off: bool| {
+        crate::files::TONE_BESIDE_OFF.store(off, Ordering::Relaxed);
+        let options = LoadOptions { camera: PLAIN.into(), ..Default::default() };
+        let before = crate::files::TONE_BESIDE.load(Ordering::Relaxed);
+        let r = crate::files::load_bytes_with(&bytes, 384, options).unwrap();
+        let beside = crate::files::TONE_BESIDE.load(Ordering::Relaxed) > before;
+        crate::files::TONE_BESIDE_OFF.store(false, Ordering::Relaxed);
+        (r, beside)
+    };
+    let ((before, info_before), beside_before) = load(true);
+    let ((after, info_after), beside_after) = load(false);
+    assert!(!beside_before, "the old order");
+    assert!(beside_after, "a matrix-only profile's tone is fitted beside the development");
+    assert!(info_after.camera_tone.is_some(), "the photo's tone is kept");
+    assert_eq!(info_after.camera_tone, info_before.camera_tone, "the same tone");
+    assert_eq!(info_after.camera_color.map(|c| c.tags.color_matrix), info_before.camera_color.map(|c| c.tags.color_matrix), "the same colour");
+    assert_eq!((after.width, after.height), (before.width, before.height));
+    assert!(after.data == before.data, "the same pixels");
+}
+
 /// An imported photo carries its camera profile in its settings (`develop.profile.camera`, from the import's
 /// camera-profile choice); its grid and loupe renders decode with the photo's own tone under a matrix-only profile.
 #[test]
