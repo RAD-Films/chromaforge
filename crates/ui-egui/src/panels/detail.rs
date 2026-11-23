@@ -1718,9 +1718,13 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     if shown == "embedded" || (shown == "thumb" && app.session.embedded_thumb_is_final(&photo)) {
         camera_preview_badge(ui, canvas, img_rect.intersect(canvas));
     }
-    // no picture of this photo yet, its first one on its way: background work waits (the photo on
-    // screen comes first, at its cheapest first)
-    if shown == "none" && (app.renderer.is_pending(Slot::Preview) || app.renderer.is_pending(Slot::Main)) {
+    // no picture of this photo yet, or only a small one (its thumbnail) while its full-size stand-in
+    // is on its way: background work waits (the photo on screen comes first, at its cheapest first),
+    // as in OneSlips (PERF-CULL-TIERS). Holding back only for an empty loupe left the camera JPEG of
+    // the first photos after the loupe opened decoding beside the background build's and the photos
+    // ahead's raw decodes: 0.13-1.8 s for a 28 ms decode, the full-size picture missed for a step.
+    let coming = app.renderer.is_pending(Slot::Preview);
+    if (shown == "none" && (coming || app.renderer.is_pending(Slot::Main))) || (!crate::loupe_timing::is_full_size(shown) && coming) {
         app.pictures_missing(app.renderer.frame());
     }
     // the colour under the pointer, for the readout under the histogram (the After render only)
