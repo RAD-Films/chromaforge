@@ -729,6 +729,23 @@ fn denoised_camera_rgb(raw: &lcc_raw::RawImage, spec: &DenoiseSpec, factor: usiz
     }
 }
 
+/// Loads that fitted a kept photo tone beside the development (`load_bytes_now`, tests).
+#[cfg(test)]
+pub(crate) static TONE_BESIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Tests: fit the kept photo tone before the development, as before CULL-SPEED-TONE-BESIDE.
+#[cfg(test)]
+pub(crate) static TONE_BESIDE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn tone_beside_off() -> bool {
+    TONE_BESIDE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn tone_beside_off() -> bool {
+    false
+}
+
 fn load_bytes_now(
     bytes: std::borrow::Cow<'_, [u8]>,
     max_edge: usize,
@@ -806,6 +823,15 @@ fn load_bytes_now(
         let colorimetric = crate::camera_preview::colorimetric_camera(&raw).is_some();
         // (a DNG of rendered RGB: no camera profile describes it, so the Profiles panel offers none)
         let rendered_rgb = lcc_raw::color::is_rendered_rgb(&raw.color);
+        // The tone a profile without a curve of its own keeps (`own_colour`) is fitted to the camera JPEG (~0.3 s on a
+        // 45 MP raw). Only `camera_tone` reads it, not the development below, so it is fitted beside the development,
+        // on a copy of the mosaic as it is now (CULL-SPEED-TONE-BESIDE). The fit and the starting colour leave each
+        // other's results as they are in either order (they only set the camera database's level overrides, the same
+        // values each time, and put the colour tags back). A DNG whose lens opcodes are put back for the fit keeps the
+        // fit before the starting colour.
+        let tone_beside = own_colour.is_some() && dng_lens_ops.is_none() && !tone_beside_off();
+        let (own_beside, own_colour) = if tone_beside { (own_colour, None) } else { (None, own_colour) };
+        let mut fit_copy = own_beside.as_ref().map(|_| raw.clone());
         let t_colour = web_time::Instant::now();
         // the source's segmentation mattes (DNG semantic masks), read while the starting colour is fitted
         let (((xy, t, camera_look), kept_tone), mattes) = rayon::join(
@@ -825,7 +851,6 @@ fn load_bytes_now(
             },
             || dng_mattes(&bytes, &info),
         );
-        drop(bytes);
         if lcc_pipeline::profiling() {
             eprintln!(
                 "[profile] raw load: decode {decode_ms:.1} ms, repair + outliers + profile {:.1} ms, starting colour {:.1} ms",
@@ -835,70 +860,95 @@ fn load_bytes_now(
         }
         // Previews and thumbnails bin the mosaic straight to (about) the size they need; only
         // larger levels (exports, 1:1) demosaic the whole sensor.
-        let t0 = web_time::Instant::now();
-        let bin = bin_factor(&raw, max_edge);
-        // (binned: block means, and which colours had a clipped sample in each block)
-        let binned = match bin {
-            Some(k) => raw.develop_binned_masked(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
-            None => None,
-        };
-        let factor = if binned.is_some() { bin.unwrap_or(1) } else { 1 };
-        let (img, clip_mask) = match binned {
-            Some((img, mask)) => (img, Some(mask)),
-            None => {
-                let method = if max_edge <= 600 { lcc_raw::Method::Bilinear } else { lcc_raw::Method::Ahd };
-                (raw.develop(method).map_err(|e| e.to_string())?, None)
+        let mut develop = || -> Result<_, String> {
+            let t0 = web_time::Instant::now();
+            let bin = bin_factor(&raw, max_edge);
+            // (binned: block means, and which colours had a clipped sample in each block)
+            let binned = match bin {
+                Some(k) => raw.develop_binned_masked(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
+                None => None,
+            };
+            let factor = if binned.is_some() { bin.unwrap_or(1) } else { 1 };
+            let (img, clip_mask) = match binned {
+                Some((img, mask)) => (img, Some(mask)),
+                None => {
+                    let method = if max_edge <= 600 { lcc_raw::Method::Bilinear } else { lcc_raw::Method::Ahd };
+                    (raw.develop(method).map_err(|e| e.to_string())?, None)
+                }
+            };
+            // the same development from the denoised mosaic, when the photo has been denoised
+            let twin = denoise.and_then(|spec| denoised_camera_rgb(&raw, spec, factor)).filter(|d| d.width == img.width && d.height == img.height);
+            // the samples aren't needed any more (the colour model below reads only the tags)
+            let raw_float = matches!(raw.data, lcc_raw::RawData::F32(_));
+            let raw_bits = u8::try_from(raw.bits).unwrap_or(16);
+            raw.data = lcc_raw::RawData::U16(Vec::new());
+            let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
+            // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
+            let tables = lcc_raw::profile::ProfileTables::new(&raw.color.profile, lcc_raw::color::illuminant_weight(&raw.color, xy));
+            let colour = CameraColourModel {
+                wb: t.wb,
+                matrix: camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix),
+                gain: 2f32.powf(t.baseline_exposure as f32),
+                tables: tables.as_ref(),
+                hue_sat: hue_sat.as_ref(),
+            };
+            // camera RGB → what the pipeline takes: clipped highlights rebuilt, white balance and the colour model applied,
+            // fitted to `max_edge` and upright (the same for the plain and the denoised picture)
+            let finish = |mut img: Rgb32f| {
+                let mut stages = vec![("develop", t0.elapsed())];
+                stages.push(("transform", t0.elapsed()));
+                match &clip_mask {
+                    Some(mask) => colour.rebuild_highlights_masked(&mut img, mask),
+                    None => colour.rebuild_highlights(&mut img),
+                }
+                stages.push(("highlights", t0.elapsed()));
+                colour.apply(&mut img);
+                stages.push(("colour", t0.elapsed()));
+                // a full-size render keeps the picture (fitting it to its own size would copy it, ~390 MB at 33 MP)
+                let img = if img.width.max(img.height) > max_edge { fit(&img, max_edge, max_edge, Filter::Box) } else { img };
+                stages.push(("fit", t0.elapsed()));
+                let img = img.into_oriented(raw.orientation);
+                stages.push(("orient", t0.elapsed()));
+                (img, stages)
+            };
+            let (img, stages) = finish(img);
+            if lcc_pipeline::profiling() {
+                let mut prev = std::time::Duration::ZERO;
+                let parts: Vec<String> = stages
+                    .iter()
+                    .map(|(n, t)| {
+                        let d = *t - prev;
+                        prev = *t;
+                        format!("{n} {:.1}", d.as_secs_f64() * 1e3)
+                    })
+                    .collect();
+                eprintln!("[profile] raw source {}×{} (max {max_edge}, ms after decode): {}", img.width, img.height, parts.join(", "));
             }
+            let twin = twin.map(|picture| finish(picture).0);
+            Ok((img, twin, raw_float, raw_bits))
         };
-        // the same development from the denoised mosaic, when the photo has been denoised
-        let twin = denoise.and_then(|spec| denoised_camera_rgb(&raw, spec, factor)).filter(|d| d.width == img.width && d.height == img.height);
-        // the samples aren't needed any more (the colour model below reads only the tags)
-        let raw_float = matches!(raw.data, lcc_raw::RawData::F32(_));
-        let raw_bits = u8::try_from(raw.bits).unwrap_or(16);
-        raw.data = lcc_raw::RawData::U16(Vec::new());
-        let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
-        // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
-        let tables = lcc_raw::profile::ProfileTables::new(&raw.color.profile, lcc_raw::color::illuminant_weight(&raw.color, xy));
-        let colour = CameraColourModel {
-            wb: t.wb,
-            matrix: camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix),
-            gain: 2f32.powf(t.baseline_exposure as f32),
-            tables: tables.as_ref(),
-            hue_sat: hue_sat.as_ref(),
-        };
-        // camera RGB → what the pipeline takes: clipped highlights rebuilt, white balance and the colour model applied,
-        // fitted to `max_edge` and upright (the same for the plain and the denoised picture)
-        let finish = |mut img: Rgb32f| {
-            let mut stages = vec![("develop", t0.elapsed())];
-            stages.push(("transform", t0.elapsed()));
-            match &clip_mask {
-                Some(mask) => colour.rebuild_highlights_masked(&mut img, mask),
-                None => colour.rebuild_highlights(&mut img),
+        let fit_kept_tone = || {
+            let (own, copy) = (own_beside?, fit_copy.as_mut()?);
+            let t = web_time::Instant::now();
+            let mut trace = crate::camera_preview::StartTrace::default();
+            let tone =
+                crate::camera_preview::tone_without_profile(copy, own, &bytes, lens_geometry.as_ref(), lens.as_ref(), options.colour, &mut trace);
+            if lcc_pipeline::profiling() {
+                eprintln!("[profile] kept photo tone fitted beside the development in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
-            stages.push(("highlights", t0.elapsed()));
-            colour.apply(&mut img);
-            stages.push(("colour", t0.elapsed()));
-            // a full-size render keeps the picture (fitting it to its own size would copy it, ~390 MB at 33 MP)
-            let img = if img.width.max(img.height) > max_edge { fit(&img, max_edge, max_edge, Filter::Box) } else { img };
-            stages.push(("fit", t0.elapsed()));
-            let img = img.into_oriented(raw.orientation);
-            stages.push(("orient", t0.elapsed()));
-            (img, stages)
+            tone
         };
-        let (img, stages) = finish(img);
-        if lcc_pipeline::profiling() {
-            let mut prev = std::time::Duration::ZERO;
-            let parts: Vec<String> = stages
-                .iter()
-                .map(|(n, t)| {
-                    let d = *t - prev;
-                    prev = *t;
-                    format!("{n} {:.1}", d.as_secs_f64() * 1e3)
-                })
-                .collect();
-            eprintln!("[profile] raw source {}×{} (max {max_edge}, ms after decode): {}", img.width, img.height, parts.join(", "));
-        }
-        let twin = twin.map(|picture| finish(picture).0);
+        let (developed, kept_beside) = if tone_beside {
+            #[cfg(test)]
+            TONE_BESIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rayon::join(develop, fit_kept_tone)
+        } else {
+            (develop(), None)
+        };
+        drop(fit_copy);
+        drop(bytes);
+        let (img, twin, raw_float, raw_bits) = developed?;
+        let kept_tone = kept_tone.or(kept_beside);
         // White balance re-evaluates the file's own colour model (when it has one and no file-local look matrix sits
         // on top of it). A model's measured matrices never do: they only give the Kelvin scale its numbers, and the
         // picture is adapted from the as-shot white as every fitted look is (so settings from before that scale
