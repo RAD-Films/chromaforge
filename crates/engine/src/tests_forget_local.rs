@@ -264,6 +264,46 @@ fn browsing_again_forgets_untouched_records_of_deleted_files() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Reading a folder looks on disk only for a file its listing left out (CULL-SPEED-FORGET-GONE): checking every
+/// Local photo's smart preview first held the UI 0.75-1.2 s at each read of a 1,155-raw folder in a 3,400-photo
+/// library. What is forgotten stays the same.
+#[test]
+fn reading_a_folder_checks_no_listed_file_on_disk() {
+    let root = temp_dir("listed");
+    let (a, lib) = (root.join("a"), root.join("lib"));
+    for (i, n) in ["a1.png", "a2.png", "a3.png"].iter().enumerate() {
+        png(&a.join(n), i as u8);
+    }
+    let clock = Arc::new(Mutex::new("2026-08-01T10:00:00".to_string()));
+    let mut s = open(&lib, &clock);
+    s.execute("library.browse", &json!({"path": a.to_string_lossy()})).unwrap();
+    assert!(s.media.smart_dir.is_some(), "a library on disk has a smart preview folder");
+    look_elsewhere(&mut s);
+    let mut listed: Vec<String> = s
+        .catalog
+        .photos()
+        .filter_map(|p| match &p.source {
+            lcc_catalog::Source::File { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(listed.len(), 3);
+    let checks = |s: &mut Session, files: &[String]| {
+        crate::cmd::browse::DISK_CHECKS.with(|c| c.set(0));
+        let forgotten = s.forget_gone_from(&a.to_string_lossy(), false, files);
+        (forgotten, crate::cmd::browse::DISK_CHECKS.with(std::cell::Cell::get))
+    };
+    assert_eq!(checks(&mut s, &listed), (0, 0), "every file listed: nothing looked for on disk");
+    // a file the listing missed is checked on disk, and kept while it is there
+    assert_eq!(checks(&mut s, &listed[1..]), (0, 1));
+    // one that is gone is forgotten (its smart preview looked for too)
+    std::fs::remove_file(&listed[0]).unwrap();
+    assert_eq!(checks(&mut s, &listed[1..]), (1, 2));
+    assert_eq!(local_paths(&s), vec!["a2.png", "a3.png"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Opens `lib` with a probe that counts the originals it checks.
 fn open_counting(lib: &Path, clock: &Arc<Mutex<String>>) -> (Session, Arc<std::sync::atomic::AtomicUsize>) {
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
