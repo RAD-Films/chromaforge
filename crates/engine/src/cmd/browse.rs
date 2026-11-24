@@ -79,6 +79,19 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The files [`forget_gone`] looked for on disk on this thread (tests).
+    pub(crate) static DISK_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `p` exists on disk, counted for tests ([`DISK_CHECKS`]).
+fn on_disk(p: &Path) -> bool {
+    #[cfg(test)]
+    DISK_CHECKS.with(|c| c.set(c.get() + 1));
+    p.exists()
+}
+
 /// Local records in the browsed folder whose files are no longer on disk (deleted or moved by
 /// another app) and that nothing was changed on are forgotten, as `library.forgetLocal` forgets
 /// them: the folder shows what is on disk, not photos that fail to load (and log an error) on
@@ -89,18 +102,22 @@ fn forget_gone(s: &mut Session, dir: &str, subfolders: bool, files: &[String]) -
     let listed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
     let held = held(s);
     let smart = s.media.smart_dir.clone();
+    // (the folder and the listing first, the disk only for a file the listing left out: a smart preview checked on
+    // disk for every Local photo of the library held the UI 0.75-1.2 s at each read of a folder in a 3,400-photo
+    // library, CULL-SPEED-FORGET-GONE)
     let gone: Vec<PhotoId> = s
         .catalog
         .photos()
         .filter(|p| p.local && !p.deleted && !held.contains(&p.id))
-        // a smart preview may be all that is left of the picture
-        .filter(|p| !smart.as_ref().is_some_and(|d| crate::smart::file_path(d, p).exists()))
         .filter(|p| match &p.source {
-            // a file left out of the listing is checked on disk: another spelling of its path, or
-            // a listing that missed it, keeps it
-            Source::File { path } => in_folder(path, dir, subfolders) && !listed.contains(path.as_str()) && !Path::new(path).exists(),
+            Source::File { path } => in_folder(path, dir, subfolders) && !listed.contains(path.as_str()),
             Source::Demo { .. } => false,
         })
+        // a file left out of the listing is checked on disk: another spelling of its path, or a listing that missed it,
+        // keeps it
+        .filter(|p| matches!(&p.source, Source::File { path } if !on_disk(Path::new(path))))
+        // a smart preview may be all that is left of the picture
+        .filter(|p| !smart.as_ref().is_some_and(|d| on_disk(&crate::smart::file_path(d, p))))
         .map(|p| p.id)
         .collect();
     if gone.is_empty() {
