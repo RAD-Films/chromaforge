@@ -481,8 +481,11 @@ fn lanes(n: usize, full: bool) -> usize {
 
 /// Build every photo of `jobs` on `lanes` threads, nearest the build's focus first. `force`:
 /// render even the photos whose previews are there. `activity`: what the background preparation
-/// gives way to (the user's own work).
-fn run_all(state: &PreviewBuild, task: &TaskGuard, lanes: usize, force: bool, activity: &crate::activity::Activity) {
+/// gives way to (the user's own work). `old`: 1:1 previews past their time, discarded first.
+fn run_all(state: &PreviewBuild, task: &TaskGuard, lanes: usize, force: bool, activity: &crate::activity::Activity, old: Option<&OldFullPreviews>) {
+    if let Some(old) = old {
+        old.discard();
+    }
     let total = state.total;
     let queue = &state.queue;
     // `steady`: the lane that keeps building while the user steps ([`crate::prep::STEADY_WAIT_MS`])
@@ -619,12 +622,10 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
             return enqueue(s, C, "library.buildPreviews", p);
         }
     }
-    // 1:1 previews past their time go first (the build may need the room). The background
-    // preparation starts a build at every folder and stretch the user moves to: it looks at the
-    // dates on disk at most every few minutes (110 ms on the UI thread for 2,597 photos)
-    if !background || discard_due() {
-        auto_discard(s);
-    }
+    // 1:1 previews past their time go first (the build may need the room), on the build's own thread before its
+    // renders ([`OldFullPreviews`]). The background preparation starts a build at every folder and stretch the user
+    // moves to: it looks at the dates on disk at most every few minutes
+    let old = if !background || discard_due() { old_full_previews(s) } else { None };
     // explicit ids, else the selection, else everything in view
     let ids = if p.get("ids").is_some() || p.get("id").is_some() || !s.selection.ids.is_empty() { s.targets(p)? } else { s.visible_cloned() };
     let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false) || cfg!(target_arch = "wasm32");
@@ -650,7 +651,7 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
     // the background preparation leaves most of the machine to the photo on screen and the user
     let lanes = if background { crate::prep::background_lanes() } else { lanes(state.total, edge.is_none()) };
     if wait {
-        run_all(&state, &task, lanes, force, &s.activity);
+        run_all(&state, &task, lanes, force, &s.activity, old.as_ref());
         return Ok(state.json());
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -660,7 +661,7 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
         let activity = s.activity.clone();
         std::thread::Builder::new()
             .name("lc-build-previews".into())
-            .spawn(move || run_all(&st, &task, lanes, force, &activity))
+            .spawn(move || run_all(&st, &task, lanes, force, &activity, old.as_ref()))
             .map_err(|e| bad(C, format!("could not start: {e}")))?;
     }
     Ok(state.json())
@@ -744,12 +745,15 @@ pub struct Discarded {
 /// those not built or shown for that long. A preview held only in memory (no library on disk) has
 /// no age and is kept unless all go.
 pub fn discard_full(s: &Session, ids: &[lcc_catalog::PhotoId], older_than: Option<std::time::Duration>) -> Discarded {
-    let cache = &s.media.rendered;
+    let keys: Vec<_> = ids.iter().filter_map(|id| s.catalog.photo(*id)).map(|p| Session::full_view_key(p)).collect();
+    discard_keys(&s.media.rendered, &keys, older_than)
+}
+
+/// [`discard_full`] of the 1:1 previews under `keys` in `cache`: the part that looks on disk.
+fn discard_keys(cache: &lcc_preview::PreviewCache, keys: &[lcc_preview::Hash128], older_than: Option<std::time::Duration>) -> Discarded {
     let now = std::time::SystemTime::now();
     let mut d = Discarded::default();
-    for id in ids {
-        let Some(p) = s.catalog.photo(*id) else { continue };
-        let key = Session::full_view_key(p);
+    for &key in keys {
         if !cache.contains(key) {
             continue;
         }
@@ -766,11 +770,40 @@ pub fn discard_full(s: &Session, ids: &[lcc_catalog::PhotoId], older_than: Optio
     d
 }
 
+/// The automatic discard's 1:1 previews ([`auto_discard`]): their keys taken from the catalog on the UI thread, their
+/// dates looked at on disk where the build runs ([`run_all`]). On the UI thread that took 600 ms of the frame the loupe
+/// opened in, one file checked per photo of a 3,400-photo library, and again whenever the background build started
+/// after five minutes of culling (CULL-SPEED-DISCARD-OFF-UI).
+pub(crate) struct OldFullPreviews {
+    cache: Arc<lcc_preview::PreviewCache>,
+    keys: Vec<lcc_preview::Hash128>,
+    age: std::time::Duration,
+}
+
+/// What [`auto_discard`] would look at, or `None` when 1:1 previews never expire.
+fn old_full_previews(s: &Session) -> Option<OldFullPreviews> {
+    let age = s.preview_prefs.discard_full.max_age()?;
+    Some(OldFullPreviews { cache: s.media.rendered.clone(), keys: s.catalog.photos().map(|p| Session::full_view_key(p)).collect(), age })
+}
+
+/// The caches [`OldFullPreviews::discard`] ran for, and the thread it ran on (tests).
+#[cfg(test)]
+pub(crate) static DISCARDED_ON: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+impl OldFullPreviews {
+    fn discard(&self) -> Discarded {
+        #[cfg(test)]
+        DISCARDED_ON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((Arc::as_ptr(&self.cache) as usize, std::thread::current().name().unwrap_or_default().to_string()));
+        discard_keys(&self.cache, &self.keys, Some(self.age))
+    }
+}
+
 /// Apply the library's "discard 1:1 previews after" setting to every photo.
 pub fn auto_discard(s: &Session) -> Discarded {
-    let Some(age) = s.preview_prefs.discard_full.max_age() else { return Discarded::default() };
-    let ids: Vec<_> = s.catalog.photos().map(|p| p.id).collect();
-    discard_full(s, &ids, Some(age))
+    old_full_previews(s).map(|o| o.discard()).unwrap_or_default()
 }
 
 fn discard(s: &mut Session, p: &Value) -> Result<Value> {
