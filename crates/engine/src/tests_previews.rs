@@ -129,6 +129,26 @@ fn one_to_one_previews_are_discarded_on_their_own() {
     assert_eq!(r["removed"], 0, "nothing left to discard");
 }
 
+/// A build's discard of 1:1 previews past their time looks at the dates on disk on the build's own thread, not on the
+/// thread that started it (the UI's): 600 ms of the frame the loupe opened in on a 3,400-photo library
+/// (CULL-SPEED-DISCARD-OFF-UI). It still runs, before the build's renders.
+#[test]
+fn a_builds_discard_of_old_full_previews_runs_on_the_builds_thread() {
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    assert!(s.preview_prefs.discard_full.max_age().is_some(), "1:1 previews expire by default");
+    let cache = std::sync::Arc::as_ptr(&s.media.rendered) as usize;
+    s.execute("library.buildPreviews", &json!({"size": "standard", "edge": 256, "ids": [id.0]})).unwrap();
+    let b = s.preview_build.clone().unwrap();
+    let t0 = std::time::Instant::now();
+    while b.running() && t0.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!b.running(), "the build ended");
+    let ran: Vec<String> = crate::cmd::previews::DISCARDED_ON.lock().unwrap().iter().filter(|(c, _)| *c == cache).map(|(_, t)| t.clone()).collect();
+    assert_eq!(ran, vec!["lc-build-previews".to_string()], "discarded once, on the build's thread");
+}
+
 // Given the preview settings, they are validated, applied and reported
 #[test]
 fn preview_settings_are_validated_and_applied() {
